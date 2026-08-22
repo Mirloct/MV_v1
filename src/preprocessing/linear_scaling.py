@@ -42,9 +42,8 @@ Leakage
 **The one-shot helpers estimate their constants from whatever rows they are
 given.** Calling ``robust_scale(df)`` on a full panel therefore lets test-period
 rows influence the median and IQR applied to training rows -- the exact leak
-``docs/leakage_free_pipeline.md`` (Phase 3) forbids and
-``tests/test_preprocessing.py`` asserts against. For any chronologically split
-run, use the two-step form instead, which is still fit-free in the sense
+``docs/leakage_free_pipeline.md`` (Phase 3) forbids. For any chronologically
+split run, use the two-step form instead, which is still fit-free in the sense
 required (a plain dict of numbers, not a stateful object)::
 
     params = robust_scale_params(df[train_mask])   # constants from train only

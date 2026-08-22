@@ -36,7 +36,6 @@ Modelo-v0.1/
 │   ├── interpretability/   # SHAP, path length, latent space, per-feature recon
 │   ├── reporting/          # HTML/MD report builder (no PDF)
 │   └── utils/              # paths.py (all artifact locations) + logging_config.py
-├── tests/                  # 184 tests, 6 suites + conftest sandbox
 ├── docs/                   # *.md sources + generated documentation.html
 └── artifacts/              # EVERYTHING the pipeline writes (gitignored)
     ├── data/               # data.csv + ground_truth.parquet (hidden labels)
@@ -182,11 +181,12 @@ adding a figure.
   choices. Verified end-to-end multiple times, incl. a 30,000-row
   (3,000 x 10) run: 2.09% imbalanced anomaly rate, iForest OOT ROC-AUC 0.71,
   VAE OOT ROC-AUC 0.74, both OOT Excels + all three report formats produced.
-- [x] `tests/` — test suite (135 tests via `C:\...\Python313\python.exe -m
-  pytest tests/ -q`): `tests/test_data_module.py` (61), `tests/test_preprocessing.py`
-  (33), `tests/test_iforest.py` (14), `tests/test_vae.py` (12),
-  `tests/test_evaluation.py` (8), `tests/test_interpretability_reporting.py`
-  (7), plus `tests/conftest.py` (session sandbox).
+- [removed] `tests/` — the project carried a pytest suite (peaked at 319 tests
+  across 11 files: data, preprocessing, both models, evaluation,
+  interpretability/reporting, tuning budget, linear scaling, Optuna storage)
+  used throughout development to verify every fix in this log. Removed by
+  explicit decision (2026-08-22): not needed to run the project, so not
+  shipped. `pytest` and `pytest.ini` were removed alongside it.
 - [x] `docs/documentation.html` — all project docs (README, CONTEXT, the
   `docs/*.md` model/evaluation/interpretability docs, and the GeeksforGeeks
   reference notes) consolidated into one offline, sidebar-navigable HTML
@@ -1043,10 +1043,7 @@ Measured on the synthetic generator (`generate_synthetic_panel`):
 - **Environment setup**: run `python setup_validator.py` before doing
   anything else in a new environment; it checks Python version and
   dependencies and attempts to auto-install anything missing. `pyarrow`
-  (parquet engine for ground truth) and `pytest` (test runner) are now in
-  `requirements.txt` and validated too.
-- **Testing**: the suite runs inside a `tests/conftest.py` session sandbox
-  that `chdir`s into a throwaway tmp dir before any logger or generator
-  runs, so tests never pollute the real `data/` or `artifacts/logs/`. Follow that
-  pattern in new suites — route all filesystem output through pytest tmp
-  dirs. Run with `python -m pytest tests/ -q`.
+  (parquet engine for ground truth) is in `requirements.txt` and validated too.
+- **Testing**: removed from the project (2026-08-22) — not needed to run it.
+  See the `tests/` entry in the checklist above for what the suite covered
+  while it existed.

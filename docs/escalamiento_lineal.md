@@ -1,6 +1,6 @@
 # Escalamiento lineal sin estado (`linear_scaling`)
 
-Módulo: `src/preprocessing/linear_scaling.py` · Pruebas: `tests/test_linear_scaling.py`
+Módulo: `src/preprocessing/linear_scaling.py`
 
 Reescalado afín (`y = a·x + b`) del bloque continuo de un panel, con
 numpy/pandas puro: sin scikit-learn, sin clases estimadoras y sin `.fit()`.

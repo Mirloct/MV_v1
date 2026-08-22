@@ -42,7 +42,7 @@ Store que no hace nada útil. Si los comandos parecen no ejecutarse o abren la
 Store, llama al intérprete real por su ruta completa:
 
 ```
-C:\Users\<usuario>\AppData\Local\Programs\Python\Python313\python.exe -m pytest tests/ -q
+C:\Users\<usuario>\AppData\Local\Programs\Python\Python313\python.exe main.py --quick
 ```
 
 ## Cómo ejecutarlo
@@ -327,19 +327,6 @@ detalle, `d` todas las fases, `o` abrir la vista web, `p` pausa.
 Se desactiva solo si la salida no es un terminal (redirigida, CI) o si falta
 `rich`, para no corromper un log capturado. `--no-console-ui` lo fuerza off.
 
-### Ejecutar la suite de tests
-
-292 tests cubren `src/data`, `src/preprocessing`, ambos modelos, evaluación,
-interpretabilidad y reportería. Desde la raíz del proyecto:
-
-```
-python -m pytest tests/ -q
-```
-
-`tests/conftest.py` corre toda la sesión dentro de un sandbox descartable (hace
-`chdir` antes de que arranque cualquier logger o generador), así que los tests
-nunca tocan el `artifacts/` real.
-
 ### Ejecutar `main.py` — el pipeline completo
 
 ```bash
@@ -442,7 +429,6 @@ Modelo-v0.1/
 │   ├── interpretability/   # SHAP, largo de camino, espacio latente, reconstrucción por feature
 │   ├── reporting/          # constructor de reportes + visualización de flujo
 │   └── utils/              # rutas, logging, observabilidad, supuestos, escritura atómica
-├── tests/                  # 292 tests + sandbox de sesión
 ├── docs/                   # fuentes *.md + documentation.html generado
 └── artifacts/              # TODO lo que el pipeline escribe (fuera de control de versiones)
 ```

@@ -43,8 +43,6 @@ PACKAGES: dict[str, str] = {
     "pyarrow": "pyarrow",
     # Excel engine for the OOT top-decile deliverable (pandas .to_excel).
     "openpyxl": "openpyxl",
-    # Test suite runner (tests/).
-    "pytest": "pytest",
 }
 
 

@@ -317,6 +317,22 @@ Incluye la evaluación de desempeño medida: tiempos por fase, costo real de
 pasar el reporte a 100% Plotly, y dónde está el cuello de botella (la
 evaluación del bosque, no el tuneo).
 
+### Marco de validación no supervisada
+
+[`docs/validacion_no_supervisada.md`](docs/validacion_no_supervisada.md) es el
+marco metodológico para validar ambos detectores **sin ground truth**:
+estabilidad ante semillas e hiperparámetros, curvas Excess-Mass / Mass-Volume
+(Goix et al. 2015; Clémençon & Thomas 2018), rareza estructural y consenso
+entre detectores, validación específica para datos panel, y diagnósticos del
+VAE (posterior collapse con el umbral δ=0.01 de Burda et al. 2016).
+
+Cada sección está etiquetada **[IMPLEMENTADO] / [PARCIAL] / [PROPUESTO]** con
+la ruta del módulo correspondiente, así que el documento sirve tanto de mapa de
+lo que ya hace el proyecto como de backlog de lo que falta. Incluye la tabla de
+fuentes primarias verificadas y una limitación declarada explícitamente: el
+diseño *leave-one-period-out* aplicado a ranking no supervisado es una
+construcción metodológica propia, no un método publicado con ese nombre.
+
 ### Dashboard de consola
 
 Durante la corrida, `main.py` muestra un panel en vivo (barra de progreso

@@ -1,0 +1,25 @@
+# Everything the pipeline writes lives under artifacts/ and is reproducible
+# from `python main.py`. Keeping it out of version control is what stops the
+# 57 per-trial VAE checkpoint directories (41 MB) from reappearing.
+artifacts/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Generated documentation. Regenerate with `python docs/build_docs.py`;
+# never hand-edit.
+docs/documentation.html
+
+# OS noise
+Thumbs.db
+.DS_Store

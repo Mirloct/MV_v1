@@ -49,6 +49,8 @@ Tres hallazgos 🔴/🟠 se refuerzan entre sí y explican por qué nadie lo not
 | A-9 | Rampa de KL más larga que el presupuesto de épocas del trial | 🟠 | **CORREGIDO** |
 | A-10 | `--quick` no alcanza para entrenar el VAE; el trial ganador colapsa | 🟠 | **PENDIENTE** (decisión abierta) |
 | A-11 | Artefactos de corridas sintéticas sobrescribían los oficiales | 🟠 | **CORREGIDO** |
+| A-12 | Marcador de procedencia por carpeta: marcaba datos reales como sintéticos | 🔴 | **CORREGIDO** (regresión de A-11) |
+| A-13 | Ground truth sintético residual capturado por corrida real | 🟡 | **CORREGIDO** (mensaje explicativo) |
 | A-5 | 53 bloques `except Exception` que degradan en silencio | 🟡 | Abierto |
 | A-6 | Suite de tests eliminada | 🟠 | Decisión del usuario, con consecuencia registrada |
 | A-7 | Reporte HTML de 6 MB por el bundle de Plotly | 🔵 | Abierto |
@@ -294,6 +296,58 @@ qué tipo de datos provenía.
 `artifacts/tuning/` y `artifacts/models/` quedan **vacíos** y todo lo ajustable
 aparece bajo `_dev/`. El reporte y los entregables Excel sí se generan
 normalmente.
+
+---
+
+## 🔴 A-12. El marcador de procedencia era por carpeta, no por archivo — CORREGIDO
+
+**Regresión introducida por la propia corrección A-11**, detectada al usarla
+con datos reales.
+
+El marcador se escribía como `.synthetic.json` **en el directorio** del panel,
+y la lectura solo comprobaba su existencia. Consecuencia: cualquier CSV en esa
+carpeta quedaba marcado como sintético — incluidos **datos reales colocados en
+`artifacts/data/`**, que es justamente la ubicación por defecto para ambos. Una
+corrida oficial se clasificaba como desarrollo y sus parámetros ajustados
+terminaban en `_dev/` en vez de la ubicación definitiva.
+
+**Corregido con dos comprobaciones independientes**, porque equivocarse en
+cualquiera de las dos direcciones cuesta caro:
+
+1. El marcador se nombra por el panel: `data.csv` → `data.csv.synthetic.json`.
+2. Su campo `panel` debe nombrar ese mismo archivo, lo que cubre el caso de un
+   marcador copiado o renombrado junto a otro CSV.
+
+Un marcador ilegible se resuelve como **datos reales**, que es la dirección
+conservadora: protege los artefactos oficiales de ser evitados en silencio, y
+es ruidosa, así que se nota.
+
+*Verificado:* panel generado → sintético; recarga del mismo → sintético; panel
+real en la misma carpeta → **real**; marcador copiado junto a otro panel →
+ignorado.
+
+---
+
+## 🟡 A-13. Ground truth sintético residual capturado por una corrida real
+
+**Síntoma:** `WARNING ... Ground-truth file ... missing expected columns`.
+
+`_discover_ground_truth` busca `ground_truth.parquet` / `.csv` **por
+convención de nombre** junto al panel. Un archivo dejado por una corrida
+sintética anterior se encuentra igual, pero sus columnas clave llevan los
+nombres del esquema generado (`entity_id`, `period`), no los del panel real
+(p. ej. `id`, `codmes`).
+
+**No es un fallo:** la comprobación de columnas es la red de seguridad
+funcionando — detecta el desajuste y continúa **sin etiquetas** (no supervisado),
+en vez de cruzar mal las claves y producir métricas falsas.
+
+Lo que faltaba era que el mensaje dijera *por qué*. Ahora nombra la causa
+probable y la acción concreta, en lugar de solo listar columnas.
+
+**Acción del usuario:** borrar el `ground_truth.*` sintético residual de la
+carpeta del panel, o renombrar el propio para que sus columnas clave coincidan
+con las del panel.
 
 ---
 

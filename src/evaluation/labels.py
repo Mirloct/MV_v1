@@ -92,10 +92,21 @@ def _join_ground_truth(
 
     gt = _read_ground_truth(path, log)
     if entity_col not in gt.columns or time_col not in gt.columns or _LABEL_COL not in gt.columns:
+        missing = [c for c in (entity_col, time_col, _LABEL_COL) if c not in gt.columns]
+        # Name the likely cause, not just the mismatch. By far the most common
+        # one is a leftover ground-truth file from a previous *synthetic* run
+        # sitting in the panel's directory: `_discover_ground_truth` picks it
+        # up by filename convention, but its key columns are named for the
+        # generated schema, not this panel's. Listing the columns alone leaves
+        # the reader to work that out.
         log.warning(
-            "Ground-truth file %s missing expected columns "
-            "(need %r, %r, %r; found %s)",
-            path, entity_col, time_col, _LABEL_COL, list(gt.columns),
+            "Ground-truth file %s is missing the column(s) %s "
+            "(need entity=%r, period=%r, label=%r; the file has %s). "
+            "The run continues WITHOUT labels (unsupervised). If this panel is "
+            "your own data, the likely cause is a leftover ground-truth file "
+            "from an earlier synthetic run in the same folder -- delete it, or "
+            "rename your own so its key columns match the panel's.",
+            path, missing, entity_col, time_col, _LABEL_COL, list(gt.columns),
         )
         return None
 

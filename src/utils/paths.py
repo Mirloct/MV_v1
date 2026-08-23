@@ -42,7 +42,7 @@ __all__ = [
     "FIGURES_DIR",
     "DATA_PATH",
     "GROUND_TRUTH_PATH",
-    "SYNTHETIC_MARKER",
+    "SYNTHETIC_MARKER_SUFFIX",
     "synthetic_marker_for",
     "DEV_SEGMENT",
     "dev_variant",
@@ -78,19 +78,23 @@ FIGURES_DIR = os.path.join(REPORTS_DIR, "figures")
 DATA_PATH = os.path.join(DATA_DIR, "data.csv")
 GROUND_TRUTH_PATH = os.path.join(DATA_DIR, "ground_truth.parquet")
 
-#: Basename of the provenance marker the synthetic generator drops next to the
+#: Suffix of the provenance marker the synthetic generator drops beside the
 #: panel it writes. Its presence is what lets a *later* run still recognise a
 #: CSV as generated: without it, the second run onward would load the same
 #: synthetic file from disk and be unable to tell it from real data -- and
 #: would then persist tuned hyperparameters fitted to invented numbers.
-#: Resolved against the panel's own directory, never assumed to be `DATA_DIR`,
-#: because `--data-path` can point anywhere.
-SYNTHETIC_MARKER = ".synthetic.json"
+#:
+#: Named after the panel (``data.csv`` -> ``data.csv.synthetic.json``) rather
+#: than being one marker per directory. A directory-wide marker mislabels a
+#: *real* panel dropped into a folder that once held a generated one -- which
+#: is the normal way this gets used, since `artifacts/data/` is the default
+#: location for both.
+SYNTHETIC_MARKER_SUFFIX = ".synthetic.json"
 
 
 def synthetic_marker_for(data_path: str) -> str:
     """Path of the provenance marker that belongs with ``data_path``."""
-    return os.path.join(os.path.dirname(data_path) or ".", SYNTHETIC_MARKER)
+    return data_path + SYNTHETIC_MARKER_SUFFIX
 
 
 #: Subdirectory that holds artifacts from non-official (synthetic-data) runs.

@@ -307,6 +307,18 @@ def run_pipeline(config: PipelineConfig) -> dict:
     model_latent_diagnostics: dict = {}
     generated_at = datetime.now().isoformat(timespec="seconds")
 
+    # Artifact destinations for THIS run. Locals, not the module constants:
+    # a synthetic run redirects them into `_dev/` (see Phase 2) so it can never
+    # overwrite the official model or tuned parameters. Bound here, before any
+    # read, because assigning them later in the function would make every
+    # earlier read an UnboundLocalError.
+    IFOREST_MODEL = paths.IFOREST_MODEL
+    VAE_MODEL = paths.VAE_MODEL
+    IFOREST_BEST_PARAMS = paths.IFOREST_BEST_PARAMS
+    VAE_BEST_PARAMS = paths.VAE_BEST_PARAMS
+    IFOREST_STUDY_DB = paths.IFOREST_STUDY_DB
+    VAE_STUDY_DB = paths.VAE_STUDY_DB
+
     # -- Phase 2: data ------------------------------------------------------ #
     with log_phase("Phase 2: data load/generate"):
         from src.data import load_or_generate_panel
@@ -329,6 +341,48 @@ def run_pipeline(config: PipelineConfig) -> dict:
         console_ui.set_stat("Filas", f"{df.shape[0]:,}")
         console_ui.set_stat("Entidades", f"{n_entities:,}")
         console_ui.set_stat("Períodos", f"{n_periods:,}")
+
+        # -- official vs development run ------------------------------------ #
+        # A run on generated data is a rehearsal, not the real thing. Its tuned
+        # parameters describe invented structure, so letting it write
+        # `best_params_*.yaml` (or the model checkpoint, or the Optuna study)
+        # would put development output exactly where the deployed artifacts
+        # live -- and the next reader has no way to tell which is which.
+        # Everything writable is redirected under `_dev/` instead; the run
+        # still works end to end, it just cannot contaminate the official tree.
+        official_run = not schema.is_synthetic
+        if not official_run:
+            IFOREST_MODEL = paths.dev_variant(IFOREST_MODEL)
+            VAE_MODEL = paths.dev_variant(VAE_MODEL)
+            IFOREST_BEST_PARAMS = paths.dev_variant(IFOREST_BEST_PARAMS)
+            VAE_BEST_PARAMS = paths.dev_variant(VAE_BEST_PARAMS)
+            IFOREST_STUDY_DB = paths.dev_variant(IFOREST_STUDY_DB)
+            VAE_STUDY_DB = paths.dev_variant(VAE_STUDY_DB)
+            for p in (IFOREST_MODEL, IFOREST_BEST_PARAMS, IFOREST_STUDY_DB):
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+            logger.warning(
+                "CORRIDA DE DESARROLLO (datos sintéticos): los parámetros "
+                "ajustados, los modelos y los estudios de Optuna se escriben "
+                "en '%s/', no en los artefactos oficiales.", paths.DEV_SEGMENT,
+            )
+        else:
+            logger.info("Corrida OFICIAL (datos reales): los artefactos "
+                        "ajustados se persisten en su ubicación definitiva.")
+        console_ui.set_stat("Tipo de corrida",
+                            "oficial" if official_run else "desarrollo (sintética)")
+        observability.check(
+            name="run.official", category="reproducibility",
+            definition="Whether this run used real data, and therefore whether "
+                       "its tuned parameters and model checkpoints are the "
+                       "official ones.",
+            expected="informational; synthetic runs write under _dev/",
+            severity="info", passed=True,
+            observed={"official": official_run,
+                      "is_synthetic": schema.is_synthetic,
+                      "data_path": config.data_path},
+            evidence=config.data_path,
+        )
+
         ctx.set_dataset(observability.DatasetFingerprint.from_path(config.data_path, df=df))
         observability.check(
             name="data.non_empty", category="data",
@@ -555,6 +609,11 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     n_trials=config.iforest_trials,
                     y=(labels_in if supervised else None),
                     random_state=config.seed,
+                    # Passed explicitly, not left to the module defaults: on a
+                    # synthetic run these point under `_dev/`.
+                    best_params_path=IFOREST_BEST_PARAMS,
+                    model_out=IFOREST_MODEL,
+                    storage="sqlite:///" + IFOREST_STUDY_DB.replace("\\", "/"),
                     # Temporal holdout: trials are scored on the validation
                     # MONTHS, which is what deployment looks like. `groups` is
                     # kept as the fallback for callers with no time split.
@@ -672,6 +731,10 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     y=(labels_in if supervised else None),
                     max_epochs=config.vae_epochs,
                     random_state=config.seed,
+                    # Explicit, so a synthetic run writes under `_dev/`.
+                    best_params_path=VAE_BEST_PARAMS,
+                    model_out=VAE_MODEL,
+                    storage="sqlite:///" + VAE_STUDY_DB.replace("\\", "/"),
                     # Same temporal holdout as the iForest: trials, early
                     # stopping and best-epoch selection all judged on the
                     # validation months.

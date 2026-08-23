@@ -295,24 +295,42 @@ def vae_loss(
     wrong here). The KL term uses the closed-form Gaussian divergence
     ``KL(N(mu, sigma^2) || N(0, I)) = -0.5 * sum(1 + logvar - mu^2 - exp(logvar))``.
 
-    Both terms are averaged per-sample (``reduction='mean'``: MSE averaged over
-    all elements, KL summed over latent dims then averaged over the batch) so
-    the scale is independent of batch size. ``reduction='sum'`` returns totals.
+    **Both terms are per-sample sums**, then averaged over the batch: the MSE
+    is summed over features and the KL over latent dimensions. That is the
+    ELBO's own scaling, and it is what makes ``beta`` mean what the beta-VAE
+    literature says it means (Higgins et al., 2017).
+
+    .. warning::
+
+       This was changed on 2026-08-22 and it **alters what every ``beta``
+       value does**. Previously the MSE used ``F.mse_loss(..., 'mean')``,
+       which divides by ``batch x n_features`` while the KL was only averaged
+       over the batch. The KL therefore carried ``n_features`` times its
+       intended weight, making the *effective* beta ``beta * n_features``:
+       with 22 features the default ``beta=1.0`` trained as if it were 22, and
+       the model collapsed (0 of 8 active latent units, measured). Any
+       ``best_params_vae.yaml`` produced before this change encodes a ``beta``
+       on the old scale and must be re-tuned, not reused.
+
+    ``reduction='sum'`` returns batch totals instead of per-sample means; the
+    recon/KL balance is identical either way, only the overall magnitude
+    differs.
 
     Returns:
         ``(total, recon_term, kl_term)`` as scalar tensors, with
         ``total = recon_term + beta * kl_term``.
     """
+    # Per-sample sums for both terms, so their ratio does not depend on the
+    # feature count. `F.mse_loss(..., 'mean')` would divide the recon term by
+    # n_features and silently inflate beta -- see the warning above.
+    recon_per_sample = torch.sum((x_recon - x) ** 2, dim=1)
+    kl_per_sample = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=1)
     if reduction == "mean":
-        recon = F.mse_loss(x_recon, x, reduction="mean")
-        # KL summed over latent dimension, then averaged over the batch.
-        kl_per_sample = -0.5 * torch.sum(
-            1 + logvar - mu.pow(2) - logvar.exp(), dim=1
-        )
+        recon = recon_per_sample.mean()
         kl = kl_per_sample.mean()
     elif reduction == "sum":
-        recon = F.mse_loss(x_recon, x, reduction="sum")
-        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+        recon = recon_per_sample.sum()
+        kl = kl_per_sample.sum()
     else:
         raise ValueError("reduction must be 'mean' or 'sum'.")
     total = recon + float(beta) * kl
@@ -452,6 +470,10 @@ class VAEDetector:
         self.input_dim_: Optional[int] = None
         self.history_: list[dict] = []
         self.best_val_loss_: float = float("inf")
+        # Negative ELBO (beta=1) at the best epoch. Distinct from
+        # `best_val_loss_`, which is weighted by this fit's own `beta` and is
+        # therefore only meaningful within a single fit.
+        self.best_val_elbo_: float = float("inf")
 
     # -- helpers ------------------------------------------------------------ #
     @staticmethod
@@ -613,6 +635,7 @@ class VAEDetector:
 
         start_epoch = 0
         self.best_val_loss_ = float("inf")
+        self.best_val_elbo_ = float("inf")
         self.history_ = []
 
         # -- resume from a compatible checkpoint ---------------------------- #
@@ -631,6 +654,7 @@ class VAEDetector:
                     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
                     start_epoch = int(ckpt["epoch"]) + 1
                     self.best_val_loss_ = float(ckpt.get("best_val_loss", float("inf")))
+                    self.best_val_elbo_ = float(ckpt.get("best_val_elbo", float("inf")))
                     self.history_ = list(ckpt.get("history", []))
                     self._restore_rng_state(ckpt.get("rng_state"))
                     log.info(
@@ -699,7 +723,15 @@ class VAEDetector:
                 train_recon = run_recon / max(n_seen, 1)
                 train_kl = run_kl / max(n_seen, 1)
 
-                val_loss = self._evaluate(val_tensor)
+                val_parts = self._evaluate(val_tensor)
+                if val_parts is None:
+                    val_loss = val_recon = val_kl = None
+                    val_elbo = None
+                else:
+                    val_loss, val_recon, val_kl = val_parts
+                    # Negative ELBO at beta=1: the beta-independent view of
+                    # this model's fit, used for cross-trial comparison.
+                    val_elbo = val_recon + val_kl
                 # Model-selection metric: val loss if available, else train loss.
                 monitor = val_loss if val_loss is not None else train_loss
                 duration = time.perf_counter() - t0
@@ -710,6 +742,9 @@ class VAEDetector:
                     "train_recon": train_recon,
                     "train_kl": train_kl,
                     "val_loss": val_loss,
+                    "val_recon": val_recon,
+                    "val_kl": val_kl,
+                    "val_elbo": val_elbo,
                     "beta": beta_epoch,
                     "duration_s": duration,
                 }
@@ -728,6 +763,13 @@ class VAEDetector:
                 is_best = monitor < self.best_val_loss_
                 if is_best:
                     self.best_val_loss_ = float(monitor)
+                    # Captured at the SAME epoch the weights are saved from, so
+                    # the cross-trial objective describes the model that is
+                    # actually restored -- not whatever the last epoch happened
+                    # to reach.
+                    self.best_val_elbo_ = (
+                        float(val_elbo) if val_elbo is not None else float(monitor)
+                    )
                     self._save_state(best_path, epoch, optimizer)
                     epochs_without_improvement = 0
                 else:
@@ -787,6 +829,7 @@ class VAEDetector:
         payload = {
             "epoch": int(epoch),
             "best_val_loss": float(self.best_val_loss_),
+            "best_val_elbo": float(self.best_val_elbo_),
             "model_state_dict": self.model_.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "config": self._arch_config(),
@@ -822,28 +865,46 @@ class VAEDetector:
                 best = torch.load(best_path, map_location=self.device, weights_only=False)
                 self.model_.load_state_dict(best["model_state_dict"])
                 self.best_val_loss_ = float(best.get("best_val_loss", self.best_val_loss_))
+                self.best_val_elbo_ = float(best.get("best_val_elbo", self.best_val_elbo_))
                 log.info("Restored best VAE weights (val_loss=%.6f) from %s.",
                          self.best_val_loss_, best_path)
             except Exception as exc:  # pragma: no cover
                 log.warning("Could not restore best weights from %s (%s).", best_path, exc)
 
-    def _evaluate(self, val_tensor: Optional[torch.Tensor]) -> Optional[float]:
+    def _evaluate(
+        self, val_tensor: Optional[torch.Tensor]
+    ) -> Optional[tuple[float, float, float]]:
+        """Validation loss, broken into ``(total_at_beta, recon, kl)``.
+
+        The three are returned separately rather than pre-combined because
+        they answer different questions and get used for different things:
+
+        * ``total_at_beta`` -- this model's own training objective. Correct
+          for early stopping and best-epoch selection *within* a fit, where
+          ``beta`` is fixed.
+        * ``recon + kl`` -- the negative ELBO at ``beta = 1``. This is the
+          only one comparable **across** fits with different ``beta``, which
+          is what Optuna needs. See ``best_val_elbo_``.
+        """
         if val_tensor is None or val_tensor.numel() == 0:
             return None
         self.model_.eval()
         with torch.no_grad():
-            total = 0.0
+            tot = rec = kld = 0.0
             n = 0
             for start in range(0, val_tensor.size(0), self.batch_size):
                 xb = val_tensor[start:start + self.batch_size]
                 x_recon, mu, logvar = self.model_(xb)
-                loss, _, _ = vae_loss(
+                loss, recon_t, kl_t = vae_loss(
                     xb, x_recon, mu, logvar, beta=self.beta, reduction="mean"
                 )
                 bs = xb.size(0)
-                total += float(loss.item()) * bs
+                tot += float(loss.item()) * bs
+                rec += float(recon_t.item()) * bs
+                kld += float(kl_t.item()) * bs
                 n += bs
-        return total / max(n, 1)
+        n = max(n, 1)
+        return tot / n, rec / n, kld / n
 
     def _check_fitted(self) -> VAEModel:
         if self.model_ is None:
@@ -1005,6 +1066,7 @@ class VAEDetector:
             "input_dim": self.input_dim_,
             "model_state_dict": self.model_.state_dict(),
             "best_val_loss": float(self.best_val_loss_),
+            "best_val_elbo": float(self.best_val_elbo_),
             "history": self.history_,
         }
         torch.save(payload, path)
@@ -1045,6 +1107,7 @@ class VAEDetector:
         det.model_.load_state_dict(payload["model_state_dict"])
         det.model_.eval()
         det.best_val_loss_ = float(payload.get("best_val_loss", float("inf")))
+        det.best_val_elbo_ = float(payload.get("best_val_elbo", float("inf")))
         det.history_ = list(payload.get("history", []))
         return det
 
@@ -1159,9 +1222,13 @@ def tune_vae(
             ``None`` falls back to a shuffled 10% split.
 
     Objective modes: a supervised metric when ``y`` is given, otherwise
-    ``best_val_loss_``. ``objective_metric="recon_p50"`` selects the median
-    validation reconstruction error (minimised) even when labels exist -- the
-    label-free proxy for "the normal mass reconstructs well".
+    ``best_val_elbo_`` -- the negative ELBO at ``beta = 1``, *not* the
+    beta-weighted training loss. Since ``beta`` is a search dimension, the
+    weighted loss is a different function in every trial and cannot rank them
+    (see the comment at the objective's return).
+    ``objective_metric="recon_p50"`` selects the median validation
+    reconstruction error (minimised) even when labels exist -- the label-free
+    proxy for "the normal mass reconstructs well".
 
     Trial-level early stopping (distinct from the *per-epoch* early stopping
     inside each trial's own fit, controlled separately by
@@ -1240,7 +1307,21 @@ def tune_vae(
         dropout = trial.suggest_float("dropout", 0.1, 0.4)
         n_layers = trial.suggest_int("n_layers", 1, 3)
         hidden_dim = trial.suggest_categorical("hidden_dim", [32, 64, 128])
-        epochs = trial.suggest_int("epochs", 1, max(1, int(max_epochs)))
+        # Floor at 2, not 1. A single-epoch trial has not trained: its latent
+        # space is still at the prior, so its KL is ~0 and -- under the ELBO
+        # objective -- it can *win* on the numbers while being useless. Seen
+        # empirically: a 1-epoch trial was selected and produced a fully
+        # collapsed model (0 of 9 active units). The floor scales with the
+        # budget so a large `max_epochs` does not spend trials on stubs.
+        epoch_floor = min(2, int(max_epochs)) if max_epochs >= 2 else 1
+        epochs = trial.suggest_int(
+            "epochs", max(epoch_floor, int(max_epochs) // 4), max(1, int(max_epochs))
+        )
+        # The KL ramp must fit inside this trial's own budget. The detector's
+        # default ramp is 10 epochs; a trial that trains for 5 would spend its
+        # entire life at a partial KL weight and never see the beta it is
+        # being evaluated on -- making the trial's `beta` largely fictional.
+        kl_anneal = min(_DEFAULT_KL_ANNEAL_EPOCHS, max(1, epochs // 2))
 
         detector = VAEDetector(
             latent_dim=latent_dim,
@@ -1252,6 +1333,7 @@ def tune_vae(
             optimizer=optimizer,
             batch_size=batch_size,
             epochs=epochs,
+            kl_anneal_epochs=kl_anneal,
             random_state=random_state,
         )
         trial_ckpt = os.path.join(checkpoint_dir, f"trial_{trial.number}")
@@ -1278,7 +1360,27 @@ def tune_vae(
             # the tail, so minimising it sharpens the contrast the score relies on.
             eval_scores = detector.score_samples(X[vm] if vm is not None else X)
             return float(np.median(np.asarray(eval_scores, dtype=float)))
-        # Default unsupervised: validation loss at the best epoch.
+        # Default unsupervised: the negative ELBO (beta=1) at the best epoch.
+        #
+        # NOT `best_val_loss_`, which is `recon + beta*KL` with this trial's own
+        # `beta`. Because `beta` is itself a search dimension, that value is a
+        # different objective function in every trial: a low-beta trial scores
+        # mechanically better than a high-beta one even when the two models are
+        # equally good, so the study would be ranking the parameterisation
+        # rather than the fit. Evaluating every trial at beta=1 -- the actual
+        # ELBO -- restores a common yardstick while keeping the KL term, which
+        # a reconstruction-only objective would drop (and thereby reward
+        # overcapacity: a model that reconstructs everything, noise included,
+        # has no anomaly signal left).
+        #
+        # Training still uses the trial's `beta`: that is the beta-VAE method
+        # (Higgins et al. 2017) and is deliberate. Only the *selection* metric
+        # is beta-free.
+        if np.isfinite(detector.best_val_elbo_):
+            return float(detector.best_val_elbo_)
+        # No validation block (e.g. a caller passed neither mask nor fraction):
+        # fall back to the training-objective value rather than returning inf,
+        # which would make every such trial indistinguishable.
         return float(detector.best_val_loss_)
 
     from src.models._tuning_budget import tpe_startup_trials

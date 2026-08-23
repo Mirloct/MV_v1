@@ -50,10 +50,12 @@ generator months later still yields byte-identical files.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import random
 from dataclasses import dataclass, field
+from datetime import datetime
 from statistics import NormalDist
 from typing import Optional
 
@@ -953,6 +955,42 @@ def _write_ground_truth(gt_df: pd.DataFrame, ground_truth_path: str, logger: log
         return fallback_path
 
 
+def _write_synthetic_marker(out_path: str, logger: logging.Logger, **facts) -> Optional[str]:
+    """Stamp the written panel as generated, next to the CSV itself.
+
+    Without this file, only the run that *generates* the panel knows it is
+    synthetic: every later run finds an ordinary CSV on disk and cannot tell
+    it from real data. That matters because tuned hyperparameters are
+    persisted as project artifacts -- a second `python main.py` on the same
+    generated panel would otherwise write `best_params_*.yaml` fitted to
+    invented numbers and present them as the official ones.
+
+    Best-effort: a marker that cannot be written is logged and skipped rather
+    than failing the generation. The consequence of losing it is that a later
+    run treats the panel as real, so the failure is reported loudly.
+    """
+    marker = paths.synthetic_marker_for(out_path)
+    payload = {
+        "synthetic": True,
+        "generator": "src.data.synthetic.generate_synthetic_panel",
+        "panel": os.path.basename(out_path),
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        **facts,
+    }
+    try:
+        with open(marker, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, default=str)
+        logger.info("Marked panel as synthetic: %s", marker)
+        return marker
+    except OSError as exc:
+        logger.warning(
+            "Could not write the synthetic-provenance marker %s (%s). A later "
+            "run will treat this generated panel as real data and may persist "
+            "tuned parameters from it.", marker, exc,
+        )
+        return None
+
+
 def generate_synthetic_panel(
     n_individuals: int = 100_000,
     n_periods: int = 10,
@@ -1113,6 +1151,11 @@ def generate_synthetic_panel(
             df.to_csv(out_path, index=False)
             logger.info("Wrote main panel to %s (%d rows x %d columns)", out_path, len(df), df.shape[1])
             real_gt_path = _write_ground_truth(ground_truth, ground_truth_path, logger)
+            _write_synthetic_marker(
+                out_path, logger,
+                n_rows=len(df), n_entities=n_individuals, n_periods=n_periods,
+                seed=seed,
+            )
 
         return PanelGenerationResult(
             out_path=out_path,

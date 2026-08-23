@@ -42,6 +42,10 @@ __all__ = [
     "FIGURES_DIR",
     "DATA_PATH",
     "GROUND_TRUTH_PATH",
+    "SYNTHETIC_MARKER",
+    "synthetic_marker_for",
+    "DEV_SEGMENT",
+    "dev_variant",
     "LOG_FILE",
     "IFOREST_MODEL",
     "VAE_MODEL",
@@ -73,6 +77,42 @@ FIGURES_DIR = os.path.join(REPORTS_DIR, "figures")
 # -- data ------------------------------------------------------------------- #
 DATA_PATH = os.path.join(DATA_DIR, "data.csv")
 GROUND_TRUTH_PATH = os.path.join(DATA_DIR, "ground_truth.parquet")
+
+#: Basename of the provenance marker the synthetic generator drops next to the
+#: panel it writes. Its presence is what lets a *later* run still recognise a
+#: CSV as generated: without it, the second run onward would load the same
+#: synthetic file from disk and be unable to tell it from real data -- and
+#: would then persist tuned hyperparameters fitted to invented numbers.
+#: Resolved against the panel's own directory, never assumed to be `DATA_DIR`,
+#: because `--data-path` can point anywhere.
+SYNTHETIC_MARKER = ".synthetic.json"
+
+
+def synthetic_marker_for(data_path: str) -> str:
+    """Path of the provenance marker that belongs with ``data_path``."""
+    return os.path.join(os.path.dirname(data_path) or ".", SYNTHETIC_MARKER)
+
+
+#: Subdirectory that holds artifacts from non-official (synthetic-data) runs.
+#: Keeping them under a sibling folder rather than suffixing filenames means
+#: the official tree can be inspected, shipped or wiped without picking
+#: through a mix of real and generated outputs.
+DEV_SEGMENT = "_dev"
+
+
+def dev_variant(path: str) -> str:
+    """Redirect ``path`` into the :data:`DEV_SEGMENT` sibling directory.
+
+    ``artifacts/tuning/best_params_vae.yaml`` becomes
+    ``artifacts/tuning/_dev/best_params_vae.yaml``.
+
+    Used for every artifact a synthetic run would otherwise write over the
+    official one -- tuned parameters, model checkpoints, Optuna studies. A
+    model fitted to invented data must not be able to masquerade as the
+    deployed one just because it was the last thing written.
+    """
+    parent, name = os.path.split(path)
+    return os.path.join(parent, DEV_SEGMENT, name)
 
 # -- logging ---------------------------------------------------------------- #
 LOG_FILE = "execution.log"

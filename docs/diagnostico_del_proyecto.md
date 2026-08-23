@@ -42,14 +42,31 @@ Tres hallazgos 🔴/🟠 se refuerzan entre sí y explican por qué nadie lo not
 
 | # | Hallazgo | Nivel | Estado |
 | --- | --- | --- | --- |
-| A-1 | `beta` efectivo = `beta × n_features` → VAE colapsado | 🔴 | Diagnosticado, **sin corregir** (requiere decisión) |
-| A-2 | Objetivo Optuna no supervisado depende de `beta`, que es dimensión de búsqueda | 🟠 | Diagnosticado, **sin corregir** |
+| A-1 | `beta` efectivo = `beta × n_features` → VAE colapsado | 🔴 | **CORREGIDO** y verificado (0/8 → 8/8) |
+| A-2 | Objetivo Optuna no supervisado depende de `beta`, que es dimensión de búsqueda | 🟠 | **CORREGIDO** (ELBO a beta=1) |
 | A-3 | Ninguna detección de posterior collapse | 🔴 | **CORREGIDO** |
 | A-4 | Ruta sin tuneo del VAE usaba split de validación aleatorio (fuga temporal) | 🔴 | **CORREGIDO** |
+| A-9 | Rampa de KL más larga que el presupuesto de épocas del trial | 🟠 | **CORREGIDO** |
+| A-10 | `--quick` no alcanza para entrenar el VAE; el trial ganador colapsa | 🟠 | **PENDIENTE** (decisión abierta) |
+| A-11 | Artefactos de corridas sintéticas sobrescribían los oficiales | 🟠 | **CORREGIDO** |
 | A-5 | 53 bloques `except Exception` que degradan en silencio | 🟡 | Abierto |
 | A-6 | Suite de tests eliminada | 🟠 | Decisión del usuario, con consecuencia registrada |
 | A-7 | Reporte HTML de 6 MB por el bundle de Plotly | 🔵 | Abierto |
 | A-8 | Sin persistencia de scores/rankings por corrida | 🔵 | Abierto |
+
+## Verificación de las correcciones (2026-08-23)
+
+Medido sobre el pipeline real, no en aislamiento:
+
+| Escenario | Dimensiones activas | Antes |
+| --- | --- | --- |
+| `--no-tune` (15 épocas, `beta=1.0`) | **8/8** | 0/8 |
+| `--quick --vae-epochs 15` (tuneado, eligió `beta=1.4`, 6 épocas) | **21/21** | 0/9 |
+| `--quick` tal cual (5 épocas máx.) | 0/9 | 0/9 |
+
+Las dos primeras filas confirman A-1: con el escalado corregido, todo el rango
+de `beta` que explora Optuna produce espacios latentes sanos. La tercera es
+A-10, abajo.
 
 ---
 
@@ -206,6 +223,77 @@ documentado y de uso habitual (`--quick` y `--no-tune` lo usan).
 **Consideración de fondo:** que dos rutas del mismo modelo difirieran en algo
 load-bearing es el patrón de riesgo, no el argumento faltante. Conviene que la
 construcción del detector sea una sola función usada por ambas ramas.
+
+---
+
+## 🟠 A-9. La rampa de KL era más larga que el presupuesto del trial — CORREGIDO
+
+**Dónde:** `src/models/vae.py::tune_vae`, construcción del detector por trial.
+
+El objetivo no pasaba `kl_anneal_epochs`, así que cada trial usaba el default
+de **10 épocas de rampa**. Con `--quick` (`max_epochs=5`) o cualquier trial que
+sorteara menos de 10 épocas, la rampa **nunca terminaba**: el modelo entrenaba
+toda su vida con un peso KL parcial y jamás veía el `beta` con el que estaba
+siendo evaluado. El `beta` del trial era en buena medida ficticio.
+
+**Corregido:** `kl_anneal = min(10, max(1, epochs // 2))`, de modo que la rampa
+siempre cabe en el presupuesto y al menos la mitad del entrenamiento ocurre con
+el `beta` completo.
+
+---
+
+## 🟠 A-10. `--quick` no alcanza para entrenar el VAE — PENDIENTE
+
+**Observado:** con el preset `--quick` tal cual (`vae_epochs=5`), el trial
+ganador entrena 2 épocas y el modelo colapsa (0/9 activas). Subiendo solo esa
+variable a `--vae-epochs 15`, el mismo preset produce **21/21 activas**.
+
+**No es un bug del objetivo.** Es el objetivo funcionando: con 5 épocas ningún
+trial alcanza a recuperar el costo de KL mediante mejor reconstrucción, así que
+el ELBO prefiere —correctamente— al que no lo pagó. El problema es el
+presupuesto, no el criterio.
+
+Se subió el piso de `epochs` de 1 a 2 (un trial de 1 época ni siquiera
+entrena), pero eso **no resuelve** el caso: con techo 5, ningún valor del rango
+basta.
+
+**Opciones, pendientes de decisión:**
+
+| Opción | Efecto |
+| --- | --- |
+| Subir `vae_epochs` en `--quick` de 5 a ~15 | `--quick` deja de ser tan rápido, pero su VAE pasa a ser utilizable |
+| Documentar `--quick` como humo puro | Barato y honesto: su resultado de VAE no se interpreta |
+| Penalizar el colapso dentro del objetivo | Evita seleccionar modelos degenerados aun con poco presupuesto; añade un umbral arbitrario al criterio |
+
+**Mitigación vigente:** el gate de A-3 marca la corrida con un health check
+crítico fallido, así que un VAE colapsado ya no pasa inadvertido — que era el
+riesgo real. Ninguna corrida `--quick` debería tomarse como resultado de VAE
+mientras esto siga abierto.
+
+---
+
+## 🟠 A-11. Las corridas sintéticas sobrescribían artefactos oficiales — CORREGIDO
+
+Una corrida sobre datos generados escribía `best_params_*.yaml`, los
+checkpoints de modelo y los estudios de Optuna **en la misma ruta** que una
+corrida real. El último en escribir ganaba, y nada en el artefacto decía de
+qué tipo de datos provenía.
+
+**Corregido en tres piezas:**
+
+1. `generate_synthetic_panel` escribe un marcador de procedencia
+   (`.synthetic.json`) junto al CSV. Sin él, solo la corrida que *genera* el
+   panel sabe que es sintético; a partir de la segunda, el CSV en disco es
+   indistinguible de datos reales.
+2. `PanelSchema.is_synthetic` propaga ese hecho, poniéndolo donde el resto del
+   pipeline ya mira.
+3. `main.py` redirige modelo, parámetros y estudio bajo `_dev/` cuando la
+   corrida no es oficial, y lo registra como health check `run.official`.
+
+**Verificado:** tras una corrida `--quick` completa sobre datos sintéticos,
+`artifacts/tuning/` y `artifacts/models/` quedan **vacíos** y todo lo ajustable
+aparece bajo `_dev/`. El reporte y los entregables Excel sí se generan
+normalmente.
 
 ---
 
@@ -379,17 +467,17 @@ otro modelo.
 
 | Orden | Acción | Nivel | Esfuerzo |
 | --- | --- | --- | --- |
-| 1 | Decidir y aplicar la corrección de `beta` (A-1, opción A) | 🔴 | Bajo — alto impacto |
-| 2 | Re-tunear el VAE tras el cambio; los `best_params` actuales no sirven | 🔴 | Medio |
-| 3 | Cambiar el objetivo no supervisado de Optuna (A-2) | 🟠 | Bajo |
-| 4 | Estabilidad entre semillas del IF (B-3) | 🟠 | Bajo |
-| 5 | Re-medir `robust` para el IF con el VAE ya sano (B-7) | 🔵 | Bajo |
-| 6 | Curva de umbral completa (B-4) | 🟡 | Bajo |
-| 7 | EM/MV (`validacion_no_supervisada.md` §9) | 🟡 | Alto |
+| 1 | **Re-tunear el VAE con datos reales.** Los `best_params_vae.yaml` previos al cambio de escala codifican un `beta` de la escala vieja y no son reutilizables | 🔴 | Medio |
+| 2 | Decidir A-10: presupuesto de épocas de `--quick` | 🟠 | Bajo |
+| 3 | Estabilidad entre semillas del IF (B-3) | 🟠 | Bajo |
+| 4 | Re-medir `robust` para el IF con el VAE ya sano (B-7) | 🔵 | Bajo |
+| 5 | Curva de umbral completa (B-4) | 🟡 | Bajo |
+| 6 | EM/MV (`validacion_no_supervisada.md` §9) | 🟡 | Alto |
 
-**Lo que haría primero:** aplicar A-1 y re-tunear. Hasta entonces, cualquier
-conclusión sobre el VAE — incluidas las de reportes ya generados — describe un
-modelo colapsado.
+**Lo que haría primero:** re-tunear sobre datos reales. Los cuatro defectos
+🔴/🟠 del VAE ya están corregidos y verificados, pero **ningún ajuste anterior
+al 2026-08-23 sirve**: se hizo sobre una pérdida con otra escala. Cualquier
+reporte de VAE generado antes de esa fecha describe un modelo colapsado.
 
 ---
 

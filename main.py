@@ -302,6 +302,9 @@ def run_pipeline(config: PipelineConfig) -> dict:
     # report renders 100% Plotly, so it needs the arrays rather than an image;
     # the PNGs are still written to artifacts/ as run evidence.
     chart_static: dict = {}
+    # Posterior-collapse diagnostics, per model. Keyed by model so the report
+    # renders them beside that model's other numbers.
+    model_latent_diagnostics: dict = {}
     generated_at = datetime.now().isoformat(timespec="seconds")
 
     # -- Phase 2: data ------------------------------------------------------ #
@@ -686,7 +689,15 @@ def run_pipeline(config: PipelineConfig) -> dict:
             vae_detector = VAEDetector(
                 random_state=config.seed, epochs=config.vae_epochs, **config.vae_params
             )
-            vae_detector.fit(X_vae_in)
+            # `valid_mask=valid_local` is NOT optional here. Without it `fit`
+            # falls back to a shuffled 10% split, which in a panel draws its
+            # validation rows from every period -- including ones later than
+            # the rows it trains on. Early stopping and best-epoch selection
+            # would then be judged on the future. The tuned path above already
+            # passes it; omitting it here made the two paths disagree on
+            # something load-bearing, and left `--no-tune` (a documented mode)
+            # silently leaking.
+            vae_detector.fit(X_vae_in, valid_mask=valid_local)
 
         vae_scores = vae_detector.score_samples(X_vae)
         vae_best_params = _read_best_params(VAE_BEST_PARAMS)
@@ -708,6 +719,51 @@ def run_pipeline(config: PipelineConfig) -> dict:
         except Exception as exc:
             logger.warning("plot_latent_space failed (%s); continuing.", exc)
 
+        # -- Posterior-collapse gate ---------------------------------------- #
+        # The one VAE failure this pipeline could not previously see. The
+        # anomaly score IS the reconstruction error, so a decoder that has
+        # learned to ignore the latent code still emits finite scores, still
+        # ranks rows, and still writes a populated best_params.yaml -- the run
+        # looks healthy end to end while the score has stopped meaning
+        # anything. Measured here (right after the fit, on the matrix the model
+        # was actually fitted on) rather than in Phase 10, so a collapsed model
+        # is flagged before its scores are used for the Excel deliverable.
+        try:
+            from src.models import collapse_verdict
+
+            latent_diag = vae_detector.latent_diagnostics(X_vae)
+            verdict = collapse_verdict(latent_diag)
+            model_latent_diagnostics["vae"] = {**latent_diag, **verdict}
+            logger.info(
+                "VAE latent health: %d/%d active units (delta=%.3g), mean KL=%.4f -- %s",
+                latent_diag["active_units"], latent_diag["latent_dim"],
+                latent_diag["delta"], latent_diag["mean_kl"], verdict["reason"],
+            )
+            console_ui.set_stat(
+                "vae dims. latentes activas",
+                f"{latent_diag['active_units']}/{latent_diag['latent_dim']}",
+            )
+            observability.check(
+                name="vae.posterior_collapse", category="training",
+                definition="The VAE's latent space has enough active dimensions "
+                           "(A_j = Var_x(E_q[z_j|x]) > delta, Burda et al. 2016) "
+                           "for the reconstruction error to remain a meaningful "
+                           "anomaly score.",
+                expected=f"active_fraction >= 1/3 and not degenerate "
+                         f"(delta={latent_diag['delta']})",
+                severity="critical" if verdict["severity"] == "critical" else "warning",
+                passed=not verdict["collapsed"],
+                observed={k: latent_diag[k] for k in
+                          ("active_units", "inactive_units", "latent_dim",
+                           "active_fraction", "mean_kl", "delta")},
+                failure_action="The VAE score is no longer discriminative -- retune "
+                               "with a lower beta or a smaller latent_dim before "
+                               "trusting its OOT queue.",
+                evidence="src/models/vae.py::latent_diagnostics",
+            )
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must not break the run
+            logger.warning("VAE latent diagnostics failed (%s); continuing.", exc)
+
     # -- Phases 8-10 per model: evaluation, OOT export, interpretability ---- #
     # Each detector carries the matrix it was actually fitted on: under
     # stacking the VAE lives in a wider space than the forest, and its
@@ -726,6 +782,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 supervised, labels, scores, oot_mask, X_model, label_types=label_types
             )
             model_specs[name] = {"best_params": best_params, "metrics": metrics}
+            if name in model_latent_diagnostics:
+                model_specs[name]["latent_health"] = model_latent_diagnostics[name]
             # Headline KPIs for the console dashboard, published the moment
             # each model's evaluation finishes rather than only at the end.
             if supervised and metrics.get("oot_roc_auc") is not None:

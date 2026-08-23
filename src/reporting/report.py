@@ -688,6 +688,15 @@ figure.chart .plotly-graph-div { width: 100% !important; }
 .callout-title { font-weight: 650; font-size: .85rem; color: var(--text-primary);
   margin-bottom: .35rem; }
 .callout-inline p { margin: 0; }
+/* Latent-health gate: a coloured left edge carries severity at a glance, but
+   the visible status chip in the title is what actually communicates it --
+   colour is never the only channel. */
+.latent-health { border-left: 3px solid var(--border); }
+.latent-health.good { border-left-color: var(--good); }
+.latent-health.warning { border-left-color: var(--warning); }
+.latent-health.serious { border-left-color: var(--serious); }
+.latent-health p + p { margin-top: .5rem; }
+.latent-health .subtitle { font-size: .8rem; color: var(--text-muted); }
 
 /* -- glossary + parameter tables ---------------------------------------------*/
 .table-wrap { overflow-x: auto; }
@@ -957,6 +966,39 @@ def _model_headline_tiles_html(metrics: Optional[dict]) -> str:
     return f"<div class='tile-row'>{''.join(tiles)}</div>"
 
 
+def _latent_health_html(health: Optional[dict]) -> str:
+    """Posterior-collapse readout for a VAE card; ``''`` for other models.
+
+    Rendered as a status callout rather than another row in the metrics table
+    because it is a *gate*, not a measurement to compare: a collapsed latent
+    space invalidates the model's whole score column, so it has to be visible
+    without expanding anything.
+    """
+    if not isinstance(health, dict) or not health.get("latent_dim"):
+        return ""
+    severity = str(health.get("severity", "ok"))
+    active = int(health.get("active_units", 0))
+    total = int(health.get("latent_dim", 0))
+    chip = {"ok": "good", "warning": "warning", "critical": "serious"}.get(severity, "good")
+    label = {"ok": "Saludable", "warning": "Revisar",
+             "critical": "Colapso"}.get(severity, severity)
+    return (
+        f"<div class='callout-inline latent-health {chip}'>"
+        f"<div class='callout-title'>Espacio latente "
+        f"<span class='chip {chip}'>{html.escape(label)}</span></div>"
+        f"<p><strong>{active} de {total}</strong> dimensiones latentes activas "
+        f"(A<sub>j</sub> &gt; {html.escape(str(health.get('delta')))}; "
+        f"KL media {float(health.get('mean_kl', float('nan'))):.4f}). "
+        f"{html.escape(str(health.get('reason', '')))}</p>"
+        "<p class='subtitle'>Criterio de unidades activas de Burda, Grosse y "
+        "Salakhutdinov (IWAE, ICLR 2016). Importa porque el puntaje de anomalía "
+        "<em>es</em> el error de reconstrucción: si el decodificador deja de "
+        "usar el código latente, el puntaje sigue siendo finito pero deja de "
+        "discriminar.</p>"
+        "</div>"
+    )
+
+
 def _model_card_html(name: str, spec: dict) -> str:
     title, subtitle = _MODEL_TITLES.get(name, (name, ""))
     accent = _MODEL_ACCENT.get(name, "var(--series-1)")
@@ -986,6 +1028,8 @@ def _model_card_html(name: str, spec: dict) -> str:
                 ["Tipo"] + [label for _, label in _BY_TYPE_COLUMNS], by_type_rows
             )
         )
+
+    out.append(_latent_health_html((spec or {}).get("latent_health")))
 
     out.append("<div class='two-col'>")
     out.append(

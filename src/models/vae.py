@@ -65,6 +65,7 @@ from src.utils.logging_config import log_phase, setup_logging
 __all__ = [
     "VAEModel",
     "vae_loss",
+    "collapse_verdict",
     "VAEDetector",
     "tune_vae",
     "plot_reconstruction_error",
@@ -92,6 +93,23 @@ _DEFAULT_FIG_DIR = paths.FIGURES_DIR
 # gives the decoder time to learn a real reconstruction first, so by the time
 # the full KL pressure arrives the latent code is already worth keeping.
 _DEFAULT_KL_ANNEAL_EPOCHS = 10
+
+# Active-unit threshold delta: a latent dimension counts as "active" when the
+# variance of its encoder mean across the data exceeds this. 0.01 is the value
+# used by Burda, Grosse & Salakhutdinov (IWAE, ICLR 2016) and since adopted as
+# the reference. See `VAEDetector.latent_diagnostics`.
+_ACTIVE_UNIT_DELTA = 0.01
+# Below this fraction of active dimensions the latent space is judged
+# collapsed. Not from the literature -- the papers report active-unit counts
+# without prescribing a pass/fail line, because the acceptable fraction is
+# task-dependent. Chosen here because the anomaly score is the reconstruction
+# error: once fewer than a third of the dimensions carry signal, the decoder
+# is reconstructing largely from the prior and the score stops discriminating.
+# Documented as a project convention, not a published constant.
+_COLLAPSE_ACTIVE_FRACTION = 1.0 / 3.0
+# A per-dimension KL this small means the posterior for that coordinate is
+# indistinguishable from the prior. Used only as corroborating evidence.
+_COLLAPSE_KL_EPS = 0.01
 
 # Early stopping: epochs without validation improvement before halting.
 _DEFAULT_PATIENCE = 10
@@ -299,6 +317,76 @@ def vae_loss(
         raise ValueError("reduction must be 'mean' or 'sum'.")
     total = recon + float(beta) * kl
     return total, recon, kl
+
+
+def collapse_verdict(diagnostics: dict) -> dict:
+    """Judge whether ``diagnostics`` describes a collapsed latent space.
+
+    Deliberately a function rather than a flag on the diagnostics dict: the
+    measurement (what the encoder does) and the judgement (whether that is
+    acceptable) are separate concerns, and only the judgement carries a
+    project-specific threshold.
+
+    **A low KL alone is not collapse.** Requiring corroboration is the whole
+    point -- a single quiet dimension is normal in any trained VAE, and
+    flagging on that would make the check noise. The verdict is ``collapsed``
+    only when the active fraction is below
+    :data:`_COLLAPSE_ACTIVE_FRACTION` *and* the mean KL is small enough that
+    the posterior has genuinely fallen back to the prior. The two conditions
+    fail together only in the real failure mode.
+
+    ``degenerate`` covers the harder case: exactly one active dimension, or
+    none. That is collapse regardless of KL, because a latent space with no
+    surviving axes cannot carry the structure the reconstruction error is
+    supposed to expose.
+
+    Returns:
+        ``{"collapsed": bool, "severity": "ok"|"warning"|"critical",
+        "reason": str}``.
+    """
+    d = int(diagnostics.get("latent_dim", 0))
+    active = int(diagnostics.get("active_units", 0))
+    frac = float(diagnostics.get("active_fraction", float("nan")))
+    mean_kl = float(diagnostics.get("mean_kl", float("nan")))
+
+    if d == 0:
+        return {"collapsed": False, "severity": "ok",
+                "reason": "Sin dimensiones latentes que evaluar."}
+    if active <= 1:
+        return {
+            "collapsed": True, "severity": "critical",
+            "reason": (
+                f"Solo {active} de {d} dimensiones latentes activas "
+                f"(A_j > {diagnostics.get('delta')}). El decodificador no "
+                "puede estar usando el código latente, así que el error de "
+                "reconstrucción -- que ES el puntaje de anomalía -- ya no "
+                "discrimina."
+            ),
+        }
+    if frac < _COLLAPSE_ACTIVE_FRACTION and mean_kl < _COLLAPSE_KL_EPS * d:
+        return {
+            "collapsed": True, "severity": "critical",
+            "reason": (
+                f"{active} de {d} dimensiones activas ({frac:.0%}, por debajo "
+                f"del {_COLLAPSE_ACTIVE_FRACTION:.0%}) y KL media {mean_kl:.4f} "
+                "cercana a cero: el posterior colapsó al prior en la mayoría "
+                "de las coordenadas."
+            ),
+        }
+    if frac < _COLLAPSE_ACTIVE_FRACTION:
+        return {
+            "collapsed": False, "severity": "warning",
+            "reason": (
+                f"Solo {active} de {d} dimensiones activas ({frac:.0%}), pero "
+                f"la KL media ({mean_kl:.4f}) no indica colapso al prior. "
+                "Puede ser sobrecapacidad latente: considerar un latent_dim "
+                "menor."
+            ),
+        }
+    return {
+        "collapsed": False, "severity": "ok",
+        "reason": f"{active} de {d} dimensiones latentes activas ({frac:.0%}).",
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -818,6 +906,87 @@ class VAEDetector:
                 mu, _ = model.encode(xb)
                 out[start:start + xb.size(0)] = mu.cpu().numpy()
         return out
+
+    def latent_diagnostics(
+        self, X: ArrayLike, delta: float = _ACTIVE_UNIT_DELTA
+    ) -> dict:
+        """Posterior-collapse diagnostics for the fitted latent space.
+
+        A collapsed VAE is the failure mode this project is *most* exposed to
+        and *least* able to notice: the anomaly score IS the reconstruction
+        error, so a decoder that has learned to ignore ``z`` still emits
+        finite, plausible-looking scores and still writes a populated
+        ``best_params.yaml``. Nothing downstream raises. The tuner can even
+        select it, because a high ``beta`` (the search space allows up to 2.0)
+        buys a lower KL term at the cost of the very latent structure the
+        score depends on.
+
+        The **active-units** statistic is the standard test (Burda, Grosse &
+        Salakhutdinov, *Importance Weighted Autoencoders*, ICLR 2016)::
+
+            A_j = Var_x( E_q[z_j | x] )        # variance of the encoder mean
+            dimension j is active  <=>  A_j > delta
+
+        ``delta = 0.01`` is the threshold used in that paper and since adopted
+        as the reference value.
+
+        Per-dimension KL is reported alongside it because neither number is
+        sufficient alone: a low KL on one dimension is normal, and a low
+        variance can also come from a genuinely low-information feature. The
+        collapse claim needs both to point the same way across many dimensions
+        -- see :func:`collapse_verdict`, which is where that judgement is made
+        rather than being left to the caller.
+
+        Args:
+            X: Rows to measure over. Use the same block the model was scored
+                on; the statistic is a property of the encoder's response to
+                data, so measuring it on 10 rows is meaningless.
+            delta: Activity threshold. Defaults to the literature's 0.01.
+
+        Returns:
+            ``dict`` with ``active_units``, ``inactive_units``, ``latent_dim``,
+            ``active_fraction``, ``delta``, ``mean_kl``, ``n_rows``, plus the
+            per-dimension arrays ``activity`` (A_j) and ``kl_per_dim`` as
+            lists, and ``mean_mu_variance`` / ``max_activity`` summaries.
+        """
+        model = self._check_fitted()
+        Xd = _densify(X)
+        model.eval()
+        n_rows, d = Xd.shape[0], model.latent_dim
+
+        mus = np.empty((n_rows, d), dtype=np.float64)
+        kl_sum = np.zeros(d, dtype=np.float64)
+        with torch.no_grad():
+            for start in range(0, n_rows, self.batch_size):
+                chunk = Xd[start:start + self.batch_size]
+                xb = torch.from_numpy(chunk).to(self.device)
+                mu, logvar = model.encode(xb)
+                mus[start:start + xb.size(0)] = mu.cpu().numpy()
+                # Same closed-form Gaussian KL as `vae_loss`, but kept
+                # per-dimension instead of summed, so a single collapsed
+                # coordinate is visible rather than averaged away.
+                kl_d = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp())
+                kl_sum += kl_d.sum(dim=0).cpu().numpy()
+
+        # A_j: variance ACROSS rows of the per-row encoder mean. Population
+        # variance (ddof=0) to match the literature's definition.
+        activity = mus.var(axis=0) if n_rows > 1 else np.zeros(d)
+        kl_per_dim = kl_sum / max(n_rows, 1)
+        active = int((activity > float(delta)).sum())
+
+        return {
+            "latent_dim": int(d),
+            "active_units": active,
+            "inactive_units": int(d - active),
+            "active_fraction": float(active / d) if d else float("nan"),
+            "delta": float(delta),
+            "activity": [float(v) for v in activity],
+            "kl_per_dim": [float(v) for v in kl_per_dim],
+            "mean_kl": float(kl_per_dim.sum()),
+            "mean_mu_variance": float(activity.mean()) if d else float("nan"),
+            "max_activity": float(activity.max()) if d else float("nan"),
+            "n_rows": int(n_rows),
+        }
 
     # -- persistence -------------------------------------------------------- #
     def save(self, path: str = _DEFAULT_DETECTOR_OUT) -> str:

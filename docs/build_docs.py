@@ -41,6 +41,8 @@ DOCS: list[tuple[str, str, str]] = [
      "docs/decisiones_de_modelado.md"),
     ("docs/validacion_no_supervisada.md", "validacion-no-supervisada",
      "docs/validacion_no_supervisada.md"),
+    ("docs/diagnostico_del_proyecto.md", "diagnostico-del-proyecto",
+     "docs/diagnostico_del_proyecto.md"),
     ("docs/models_isolation_forest.md", "iforest", "docs/models_isolation_forest.md"),
     ("docs/models_vae.md", "vae", "docs/models_vae.md"),
     ("docs/evaluation.md", "evaluation", "docs/evaluation.md"),

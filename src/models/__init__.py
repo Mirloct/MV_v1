@@ -20,6 +20,7 @@ from src.models.stacking import (
 from src.models.vae import (
     VAEDetector,
     VAEModel,
+    collapse_verdict,
     plot_latent_space,
     plot_reconstruction_error,
     tune_vae,
@@ -38,6 +39,7 @@ __all__ = [
     "VAEDetector",
     "tune_vae",
     "vae_loss",
+    "collapse_verdict",
     "plot_reconstruction_error",
     "plot_latent_space",
 ]

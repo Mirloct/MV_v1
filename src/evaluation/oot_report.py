@@ -44,13 +44,13 @@ DEFAULT_TOP_N = 50
 
 #: Percentile bands used to grade the exported queue, ascending. An
 #: individual is graded by the highest band its score clears, so the labels
-#: partition the export: `p95` means "at or above P95 but below P97".
+#: partition the export: `p90` means "at or above P90 but below P95".
 #:
 #: Only three, deliberately: the point of the band is to let a reviewer sort
 #: a queue by urgency, and more than three grades stop being actionable --
 #: nobody triages ten tiers differently. P99 is the "look at this today" tier,
-#: P95 the "review this cycle" one.
-PERCENTILE_BANDS: tuple[float, ...] = (95.0, 97.0, 99.0)
+#: P95 the "review this cycle" one, P90 the wider "keep an eye on it" one.
+PERCENTILE_BANDS: tuple[float, ...] = (90.0, 95.0, 99.0)
 #: Column added to the export carrying that grade.
 BAND_COL = "percentil"
 
@@ -61,7 +61,7 @@ def _resolve_out_path(
 ) -> str:
     """Fold the selection size and ``model_name`` into the default filename.
 
-    ``oot_p95_iforest.xlsx`` for a percentile export, ``oot_top50_iforest.xlsx``
+    ``oot_p90_iforest.xlsx`` for a percentile export, ``oot_top50_iforest.xlsx``
     for a top-N one, ``oot_top10_iforest.xlsx`` for a top-fraction one.
     """
     if out_path == _DEFAULT_OUT and model_name and model_name != "model":
@@ -88,7 +88,7 @@ def _percentile_band_labels(
             the top 5% of the top 5% is not P99.
 
     Returns:
-        ``(labels, cutoffs)`` -- a string array like ``"p95"``/``"p97"``/
+        ``(labels, cutoffs)`` -- a string array like ``"p90"``/``"p95"``/
         ``"p99"`` aligned to ``scores``, and the numeric cut-off per band.
     """
     ordered = tuple(sorted(bands))
@@ -107,7 +107,7 @@ def export_oot_top_anomalies(
     out_path: str = _DEFAULT_OUT,
     top_n: Optional[int] = None,
     top_fraction: float = 0.10,
-    min_percentile: Optional[float] = 95.0,
+    min_percentile: Optional[float] = 90.0,
     model_name: str = "model",
     n_oot_periods: int = 1,
     score_col: str = "anomaly_score",
@@ -120,12 +120,12 @@ def export_oot_top_anomalies(
 
     Selection size -- the first of these that is set wins:
 
-    * ``min_percentile=95.0`` (**the default**) -> every individual at or above
-      the 95th percentile of the OOT score distribution. Percentile rather than
+    * ``min_percentile=90.0`` (**the default**) -> every individual at or above
+      the 90th percentile of the OOT score distribution. Percentile rather than
       a fixed headcount because the queue then scales with the portfolio and
-      the cut has a distributional meaning: "the riskiest 5%" holds whether
+      the cut has a distributional meaning: "the riskiest 10%" holds whether
       the panel has 2,000 customers or 200,000. Each exported row also carries
-      a :data:`BAND_COL` grade (``p95``/``p97``/``p99``) so the queue can be
+      a :data:`BAND_COL` grade (``p90``/``p95``/``p99``) so the queue can be
       triaged by urgency.
     * ``top_n=50`` -> the 50 highest-scoring individuals: a fixed headcount for
       a team that works N cases a month regardless of portfolio size. Set
@@ -143,9 +143,9 @@ def export_oot_top_anomalies(
         schema: Panel schema (for ``entity_col`` / ``time_col``).
         out_path: Destination ``.xlsx``. If left at the default and a
             ``model_name`` is given, it becomes
-            ``artifacts/reports/oot_p95_<model>.xlsx`` (or ``oot_top<N>_...``).
+            ``artifacts/reports/oot_p90_<model>.xlsx`` (or ``oot_top<N>_...``).
         min_percentile: Percentile cut-off on the OOT score distribution
-            (default 95.0). ``None`` falls back to ``top_n``/``top_fraction``.
+            (default 90.0). ``None`` falls back to ``top_n``/``top_fraction``.
         top_n: Number of individuals to export. Used only when
             ``min_percentile`` is None.
         top_fraction: Fraction of OOT individuals to keep when both

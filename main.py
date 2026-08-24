@@ -60,9 +60,9 @@ class PipelineConfig:
     """Effective configuration for a single pipeline run."""
 
     n_individuals: int = 2000
-    # 15 periods: enough for a 10/2/3 chronological split and for the 6-period
-    # contrast horizon to exist.
-    n_periods: int = 15
+    # 16 periods: enough for a 10/2/3/1 chronological split (train/val/test/OOT)
+    # and for the 6-period contrast horizon to exist.
+    n_periods: int = 16
     seed: int = 42
     # Strategy default: unsupervised. Ground-truth labels are always loaded
     # (Phase 3) when a ground-truth file exists -- ground_truth.parquet is
@@ -109,12 +109,20 @@ class PipelineConfig:
     # immediately before them (used for tuning AND threshold calibration).
     n_val_periods: int = 2
     n_test_periods: int = 3
+    # Trailing periods reserved AFTER test, exclusively for the OOT business
+    # deliverable (Phase 9's Excel export). Kept strictly separate from
+    # `test_mask` -- test is the once-touched block model metrics are reported
+    # on; OOT is data neither training, tuning, nor test-set reporting has
+    # seen, so the "OOT Excel" never describes the same rows as "test".
+    # `0` would collapse OOT back onto test (the historical, since-removed
+    # behaviour) -- see `src.evaluation.splits.chronological_split`.
+    n_oot_periods: int = 1
     # Headline deliverable: everyone at or above this percentile of the OOT
-    # score distribution, each row graded p95/p97/p99 so the queue can be
+    # score distribution, each row graded p90/p95/p99 so the queue can be
     # triaged. A percentile rather than a fixed headcount because the cut then
     # scales with the portfolio and keeps its distributional meaning.
     # `--top-n N` overrides it with a fixed-size queue instead.
-    oot_min_percentile: Optional[float] = 95.0
+    oot_min_percentile: Optional[float] = 90.0
     top_n: Optional[int] = None
     top_fraction: float = 0.10
     threshold_method: str = "pot"
@@ -429,9 +437,15 @@ def run_pipeline(config: PipelineConfig) -> dict:
     # raw frame because `keys` is just df[[entity_col, time_col]] in row order,
     # so the masks are identical either way (re-verified in Phase 5).
     #
-    # Three blocks, three distinct jobs: train fits preprocessing + models,
+    # Four blocks, four distinct jobs: train fits preprocessing + models,
     # validation selects hyperparameters and calibrates the alert threshold,
-    # test is read exactly once at the end.
+    # test is read exactly once at the end (model metrics/ROC-PR/threshold
+    # diagnostics), and OOT -- strictly later than test, never touched by any
+    # of the above -- is reserved for the Phase 9 business deliverable Excel.
+    # `eval_mask` (== test_mask) and `oot_mask` are deliberately DIFFERENT
+    # blocks: aliasing them (the historical behaviour) made the "OOT Excel"
+    # describe the exact same rows as the reported test metrics, which is the
+    # confusion `n_oot_periods` exists to remove.
     with log_phase("Phase 3a: chronological split"):
         from src.evaluation import chronological_split
 
@@ -439,12 +453,26 @@ def run_pipeline(config: PipelineConfig) -> dict:
             df, time_col=time_col,
             n_val_periods=config.n_val_periods,
             n_test_periods=config.n_test_periods,
+            n_oot_periods=config.n_oot_periods,
         )
         train_mask, val_mask, test_mask = split.train_mask, split.val_mask, split.test_mask
+        oot_mask, oot_periods = split.oot_mask, split.oot_periods
         # Preprocessing may only learn from train; tuning may see train+val.
         in_mask = train_mask | val_mask     # everything the models may touch
-        oot_mask = test_mask                # the reported, never-tuned-on block
-        oot_period_str = ", ".join(str(v)[:10] for v in np.atleast_1d(split.test_periods))
+        # `eval_mask` feeds every "OOT ROC-AUC"/"OOT PR-AUC"/threshold-alert
+        # metric below -- historically named for this block ("test is read
+        # exactly once, at the end") and kept on `test_mask` so those numbers
+        # are unaffected by adding the separate `oot_mask` block above.
+        eval_mask = test_mask
+        eval_period_str = ", ".join(str(v)[:10] for v in np.atleast_1d(split.test_periods))
+        oot_period_str = (
+            ", ".join(str(v)[:10] for v in np.atleast_1d(oot_periods))
+            if oot_periods.size else "(none)"
+        )
+        assert not np.any(test_mask & oot_mask), (
+            "test_mask and oot_mask overlap -- chronological_split must guarantee "
+            "OOT periods are strictly later than test periods."
+        )
         person_overlap = assumptions.measure_person_overlap(
             df, entity_col, train_mask, val_mask, test_mask
         )
@@ -572,6 +600,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             keys, time_col=time_col,
             n_val_periods=config.n_val_periods,
             n_test_periods=config.n_test_periods,
+            n_oot_periods=config.n_oot_periods,
         )
         if not np.array_equal(keys_split.train_mask, train_mask):
             n_disagree = int(np.sum(keys_split.train_mask != train_mask))
@@ -582,6 +611,15 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 f"rows the split intends as validation/test.",
                 check="leakage.split_row_order_preserved",
                 observed={"n_disagreeing_rows": n_disagree, "total_rows": len(train_mask)},
+            )
+        if not np.array_equal(keys_split.oot_mask, oot_mask):
+            n_disagree = int(np.sum(keys_split.oot_mask != oot_mask))
+            raise assumptions.LeakageAssumptionError(
+                f"OOT split recomputed from `keys` disagrees with the mask scoring will "
+                f"use on {n_disagree} row(s) -- the OOT business deliverable would no "
+                f"longer be guaranteed disjoint from test.",
+                check="leakage.oot_split_row_order_preserved",
+                observed={"n_disagreeing_rows": n_disagree, "total_rows": len(oot_mask)},
             )
         # Models see train+val; `valid_local` marks the validation rows *within*
         # that slice, which is what tune_* uses as its held-out block.
@@ -594,8 +632,10 @@ def run_pipeline(config: PipelineConfig) -> dict:
             keys[entity_col].to_numpy()[in_mask] if entity_col in keys.columns else None
         )
         logger.info(
-            "Model input: %d rows (train %d + val %d) | test/OOT rows=%d | test period(s)=%s",
+            "Model input: %d rows (train %d + val %d) | test rows=%d (period(s)=%s) | "
+            "OOT deliverable rows=%d (period(s)=%s)",
             int(in_mask.sum()), int(train_mask.sum()), int(val_mask.sum()),
+            int(eval_mask.sum()), eval_period_str,
             int(oot_mask.sum()), oot_period_str,
         )
 
@@ -680,7 +720,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         p95_path, p95_table, p95_threshold = export_p95_checkpoint(
             df, if_scores,
             in_mask=in_mask, schema=schema,
-            split_masks={"train": train_mask, "val": val_mask, "test": test_mask},
+            split_masks={"train": train_mask, "val": val_mask, "test": test_mask, "oot": oot_mask},
             percentile=config.p95_percentile, model_name="iforest",
         )
         logger.info(
@@ -717,7 +757,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
 
             stack_info = score_shift_report(
                 stack_scores, train_mask,
-                {"validation": val_mask, "test": test_mask},
+                {"validation": val_mask, "test": test_mask, "oot": oot_mask},
             )
             stacked = build_stacked_matrix(
                 X, stack_scores, fit_mask=train_mask, feature_names=feature_names,
@@ -859,7 +899,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             from src.evaluation import plot_embedding, plot_roc_pr
 
             metrics = _model_metrics(
-                supervised, labels, scores, oot_mask, X_model, label_types=label_types
+                supervised, labels, scores, eval_mask, X_model, label_types=label_types
             )
             model_specs[name] = {"best_params": best_params, "metrics": metrics}
             if name in model_latent_diagnostics:
@@ -881,8 +921,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
             # claiming an evaluation the run did not perform. In the default
             # mode the report gets scores + threshold and nothing label-derived.
             chart_data["models"][name] = {
-                "oot_scores": [float(v) for v in scores[oot_mask]],
-                "oot_labels": ([int(v) for v in labels[oot_mask]] if supervised else None),
+                "oot_scores": [float(v) for v in scores[eval_mask]],
+                "oot_labels": ([int(v) for v in labels[eval_mask]] if supervised else None),
                 "metrics": metrics,
                 "supervised": bool(supervised),
             }
@@ -929,7 +969,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                         figures,
                         f"{name} ROC/PR (OOT)",
                         plot_roc_pr(
-                            labels[oot_mask], scores[oot_mask],
+                            labels[eval_mask], scores[eval_mask],
                             filename=f"roc_pr_{name}.png",
                         ),
                     )
@@ -952,7 +992,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             model_specs[name]["threshold"] = cal
             if name in chart_data["models"]:
                 chart_data["models"][name]["threshold"] = cal["threshold"]
-            test_scores = scores[oot_mask]
+            test_scores = scores[eval_mask]
             n_alerts = int((test_scores >= cal["threshold"]).sum()) if np.isfinite(cal["threshold"]) else 0
             model_specs[name]["metrics"]["threshold_value"] = cal["threshold"]
             model_specs[name]["metrics"]["threshold_method"] = cal["method"]
@@ -982,6 +1022,12 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 from src.evaluation import build_scored_frame, export_oot_top_anomalies
 
                 scored_df = build_scored_frame(df, keys, scores, schema)
+                # `n_oot_periods=config.n_oot_periods` (NOT `n_test_periods`):
+                # `export_oot_top_anomalies` derives its own OOT population as
+                # the trailing `n_oot_periods` distinct periods of `scored_df`
+                # (the whole panel). Passing the true OOT period count here is
+                # what makes this deliverable draw from `oot_mask`'s rows --
+                # strictly later than, and disjoint from, `test_mask`/`eval_mask`.
                 out_path, _table = export_oot_top_anomalies(
                     scored_df,
                     schema,
@@ -992,7 +1038,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     top_n=config.top_n,
                     top_fraction=config.top_fraction,
                     model_name=name,
-                    n_oot_periods=config.n_test_periods,
+                    n_oot_periods=config.n_oot_periods,
                     threshold=cal["threshold"],
                 )
                 oot_excels[name] = out_path
@@ -1254,21 +1300,20 @@ def run_pipeline(config: PipelineConfig) -> dict:
 # --------------------------------------------------------------------------- #
 # Preset knobs affected by --quick / --full (resolved against explicit flags).
 _BASE = {
-    "n_individuals": 2000, "n_periods": 15,
+    "n_individuals": 2000, "n_periods": 16,
     "iforest_trials": 15, "vae_trials": 10, "vae_epochs": 15, "tune": True,
 }
-# --quick still needs >= 3 periods for the chronological split; 8 keeps a
-# 4/2/2 train/val/test and lets the h=3 contrast horizon exist (h=6 is dropped
-# automatically by PanelFeatureEngineer).
-# --quick keeps 12 periods so the 7-month training block can actually support
-# the h=6 contrast horizon; with fewer, PanelFeatureEngineer drops it and the
-# smoke run stops exercising the feature it is meant to smoke-test.
+# --quick still needs >= 4 periods for the chronological split with the
+# default `n_oot_periods=1` (train/val/test/OOT); 13 keeps a 8/2/2/1 split and
+# the 7-month training block big enough for the h=6 contrast horizon (h=6 is
+# dropped automatically by PanelFeatureEngineer when the training block is
+# too short).
 _QUICK = {
-    "n_individuals": 500, "n_periods": 12,
+    "n_individuals": 500, "n_periods": 13,
     "iforest_trials": 5, "vae_trials": 5, "vae_epochs": 5,
 }
 _FULL = {
-    "n_individuals": 100_000, "n_periods": 15,
+    "n_individuals": 100_000, "n_periods": 16,
     "iforest_trials": 50, "vae_trials": 30, "vae_epochs": 30,
 }
 
@@ -1350,10 +1395,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--p95-percentile", type=float, default=None,
                         help="Percentile of in-time IF scores above which a row is exported "
                              "in the Phase 6c checkpoint gate before the VAE runs (default 95).")
-    parser.add_argument("--oot-min-percentile", type=float, default=95.0,
+    parser.add_argument("--oot-min-percentile", type=float, default=90.0,
                         help="Percentile of the OOT score distribution above which an "
                              "individual is exported in the risk-ranked Excel (default "
-                             "95). Each row is also graded p95/p97/p99. Overridden by "
+                             "90). Each row is also graded p90/p95/p99. Overridden by "
                              "--top-n when that is set.")
     parser.add_argument("--top-n", type=int, default=None,
                         help="Export a FIXED headcount instead of the percentile cut "
@@ -1363,6 +1408,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Validation months for tuning + threshold calibration (default 2).")
     parser.add_argument("--n-test-periods", type=int, default=3,
                         help="Trailing test months, reported but never tuned on (default 3).")
+    parser.add_argument("--n-oot-periods", type=int, default=1,
+                        help="Trailing months reserved AFTER test, exclusively for the OOT "
+                             "Excel deliverable -- never used for fitting, tuning, threshold "
+                             "calibration, or test-set metrics (default 1).")
     parser.add_argument("--threshold-method", default="pot", choices=["pot", "percentile"],
                         help="Threshold calibration on validation scores (default 'pot').")
     parser.add_argument("--threshold-percentile", type=float, default=99.0,
@@ -1413,6 +1462,7 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         top_fraction=args.top_fraction,
         n_val_periods=args.n_val_periods,
         n_test_periods=args.n_test_periods,
+        n_oot_periods=args.n_oot_periods,
         threshold_method=args.threshold_method,
         threshold_percentile=args.threshold_percentile,
         threshold_target_far=args.threshold_target_far,

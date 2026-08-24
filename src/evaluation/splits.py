@@ -61,7 +61,13 @@ def oot_period(
 
 @dataclass(frozen=True)
 class ChronologicalSplit:
-    """Row masks and period labels for a strictly chronological 3-way split."""
+    """Row masks and period labels for a strictly chronological split.
+
+    ``oot_mask``/``oot_periods`` are populated only when ``n_oot_periods > 0``
+    was requested (see :func:`chronological_split`); otherwise they are empty
+    (an all-``False`` mask and an empty period array), and the split is the
+    original 3-way train/val/test one.
+    """
 
     train_mask: np.ndarray
     val_mask: np.ndarray
@@ -69,6 +75,8 @@ class ChronologicalSplit:
     train_periods: np.ndarray
     val_periods: np.ndarray
     test_periods: np.ndarray
+    oot_mask: np.ndarray
+    oot_periods: np.ndarray
 
     def describe(self) -> str:
         def _fmt(periods: np.ndarray) -> str:
@@ -77,10 +85,15 @@ class ChronologicalSplit:
                 return "(none)"
             return vals[0] if len(vals) == 1 else f"{vals[0]}..{vals[-1]}"
 
-        return (
+        base = (
             f"train={_fmt(self.train_periods)} ({int(self.train_mask.sum())} rows) | "
             f"val={_fmt(self.val_periods)} ({int(self.val_mask.sum())} rows) | "
             f"test={_fmt(self.test_periods)} ({int(self.test_mask.sum())} rows)"
+        )
+        if self.oot_periods.size == 0:
+            return base
+        return base + (
+            f" | oot={_fmt(self.oot_periods)} ({int(self.oot_mask.sum())} rows)"
         )
 
 
@@ -89,9 +102,10 @@ def chronological_split(
     time_col: str = "period",
     n_val_periods: int = 2,
     n_test_periods: int = 3,
+    n_oot_periods: int = 0,
     logger: Optional[logging.Logger] = None,
 ) -> ChronologicalSplit:
-    """Split the panel into train / validation / test by *time*, never at random.
+    """Split the panel into train / validation / test (/ OOT) by *time*, never at random.
 
     The last ``n_test_periods`` distinct periods become test, the
     ``n_val_periods`` immediately before them become validation, and everything
@@ -115,34 +129,69 @@ def chronological_split(
     period survives. A 6-period panel with the defaults therefore yields
     3 train / 1 val / 2 test rather than an error.
 
+    Optional fourth OOT block
+    -------------------------
+    ``n_oot_periods > 0`` reserves that many of the panel's **most recent**
+    distinct periods as a genuinely separate ``oot`` block, strictly after
+    (never overlapping) ``test``: ``train | val | test | oot`` in chronological
+    order. This exists because "OOT" and "test" answer different questions --
+    test is the once-touched block a model's reported metrics come from, while
+    OOT is meant to be data even the test-block reporting never saw, reserved
+    for the business deliverable (:func:`src.evaluation.oot_report.export_oot_top_anomalies`).
+    Passing the two the same trailing rows (the historical behaviour, ``n_oot_periods=0``)
+    makes the "OOT Excel" and the test-set numbers describe the identical rows,
+    which is the confusion this parameter avoids. ``n_oot_periods=0`` (the
+    default) skips this block entirely and reproduces the original 3-way split
+    byte-for-byte, so existing callers are unaffected.
+
     Args:
         keys: The ``(entity_id, period)`` frame produced alongside ``X`` (or any
             frame carrying ``time_col``, e.g. the raw panel).
         time_col: Name of the period column.
         n_val_periods: Requested number of validation periods.
         n_test_periods: Requested number of trailing test periods.
+        n_oot_periods: Requested number of trailing OOT periods, reserved
+            *after* test. ``0`` (default) disables the OOT block.
         logger: Optional logger; defaults to the project logger.
 
     Returns:
         A :class:`ChronologicalSplit`.
 
     Raises:
-        ValueError: If the panel has fewer than 3 distinct periods, which cannot
-            support a 3-way temporal split.
+        ValueError: If the panel has fewer than 3 distinct periods (no OOT
+            block requested), or fewer than 4 (OOT requested) -- too few to
+            support the requested split with a non-empty train block.
     """
     log = logger or setup_logging()
     distinct = _distinct_sorted_periods(keys, time_col)
     n_periods = len(distinct)
-    if n_periods < 3:
+    n_oot = max(0, int(n_oot_periods))
+    min_required = 4 if n_oot > 0 else 3
+    if n_periods < min_required:
         raise ValueError(
-            f"chronological_split needs at least 3 distinct periods, got {n_periods}. "
-            "Use oot_split for a 2-way in-time/out-of-time split."
+            f"chronological_split needs at least {min_required} distinct periods "
+            f"({'train/val/test/oot' if n_oot > 0 else 'train/val/test'}), got "
+            f"{n_periods}. Use oot_split for a 2-way in-time/out-of-time split."
         )
+
+    # The OOT block is carved off the most recent periods FIRST and is never
+    # shrunk: it is the one guarantee this parameter exists to make, so a
+    # panel too short to honour it raises rather than silently degrading back
+    # to "oot == test" (the exact confusion this feature removes).
+    if n_oot > 0 and n_oot > n_periods - 3:
+        raise ValueError(
+            f"n_oot_periods={n_oot} leaves fewer than 3 periods for "
+            f"train/val/test (panel has {n_periods} distinct periods). Reduce "
+            "n_oot_periods or provide more periods."
+        )
+    oot_periods = distinct[n_periods - n_oot:] if n_oot > 0 else distinct[:0]
+    remaining = distinct[: n_periods - n_oot]
+    n_remaining = len(remaining)
 
     n_test = max(1, int(n_test_periods))
     n_val = max(1, int(n_val_periods))
     # Shrink test first, then validation, until a train block remains.
-    while n_test + n_val >= n_periods:
+    while n_test + n_val >= n_remaining:
         if n_test > 1 and n_test >= n_val:
             n_test -= 1
         elif n_val > 1:
@@ -150,23 +199,25 @@ def chronological_split(
         else:
             break
 
-    test_periods = distinct[n_periods - n_test:]
-    val_periods = distinct[n_periods - n_test - n_val: n_periods - n_test]
-    train_periods = distinct[: n_periods - n_test - n_val]
+    test_periods = remaining[n_remaining - n_test:]
+    val_periods = remaining[n_remaining - n_test - n_val: n_remaining - n_test]
+    train_periods = remaining[: n_remaining - n_test - n_val]
 
     col = keys[time_col]
     test_mask = col.isin(test_periods).to_numpy()
     val_mask = col.isin(val_periods).to_numpy()
-    train_mask = ~(test_mask | val_mask)
+    oot_mask = col.isin(oot_periods).to_numpy() if n_oot > 0 else np.zeros(len(keys), dtype=bool)
+    train_mask = ~(test_mask | val_mask | oot_mask)
 
     split = ChronologicalSplit(
         train_mask=train_mask, val_mask=val_mask, test_mask=test_mask,
         train_periods=train_periods, val_periods=val_periods, test_periods=test_periods,
+        oot_mask=oot_mask, oot_periods=oot_periods,
     )
     if (n_test, n_val) != (int(n_test_periods), int(n_val_periods)):
         log.warning(
-            "Panel has only %d periods; shrank the split to %d val / %d test "
-            "period(s) so a train block survives.", n_periods, n_val, n_test,
+            "Panel has only %d non-OOT periods; shrank the split to %d val / "
+            "%d test period(s) so a train block survives.", n_remaining, n_val, n_test,
         )
     log.info("Chronological split on %r: %s", time_col, split.describe())
     return split

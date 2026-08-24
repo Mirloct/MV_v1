@@ -55,20 +55,27 @@ what goes wrong otherwise.
 **Where:** `src/evaluation/splits.py` → `chronological_split` →
 `ChronologicalSplit`.
 
-| Block | Periods (15-month default) | Job |
+| Block | Periods (16-month default) | Job |
 | --- | --- | --- |
 | train | 1–10 | fits preprocessing statistics and the models |
 | validation | 11–12 | selects hyperparameters **and** calibrates the threshold |
-| test | 13–15 | read exactly once, at the end, to report |
+| test | 13–15 | read exactly once, at the end, to report model metrics (ROC-AUC/PR-AUC/threshold diagnostics) |
+| oot | 16 | reserved exclusively for the `export_oot_top_anomalies` Excel deliverable |
 
 > Each block is spent on a different decision, and mixing them is the classic
 > leak. Validation is *consumed* by model selection and threshold fitting, so it
 > can no longer be an unbiased estimate of anything — which is precisely why a
-> separate untouched test block has to exist.
+> separate untouched test block has to exist. The `oot` block goes one step
+> further: it is untouched even by *reporting*. Aliasing it to `test` (the
+> historical behaviour, `n_oot_periods=0`) made the "OOT Excel" describe the
+> exact same rows the test-set metrics were computed from — `n_oot_periods > 0`
+> (default 1) carves it off as its own, strictly later, never-reported-on block.
 
 There is no random splitting anywhere in the pipeline. Short panels shrink the
-later blocks rather than failing (a 6-period panel yields 3/1/2), and fewer than
-3 distinct periods raises.
+train/val/test blocks rather than failing (a 6-period panel with no OOT block
+yields 3/1/2); `n_oot_periods > 0` is never shrunk -- a panel too short to
+honour it raises rather than silently falling back to `oot == test`. Panels
+need at least 3 distinct periods with no OOT block, or 4 with one.
 
 *Tests:* `test_evaluation.py::TestChronologicalSplit` — asserts the masks
 partition every row exactly once, that the blocks are strictly ordered in time,

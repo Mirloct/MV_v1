@@ -135,9 +135,14 @@ adding a figure.
   tuning: SQLite study resume + incremental YAML checkpoint; VAE: per-epoch
   `checkpoint.pth` training resume + SQLite study resume + incremental YAML)
 - [ ] `src/evaluation` — metrics + evaluation harness. **Hard deliverable:** an
-  Excel export of the **top 10% of individuals by anomaly score in the OOT
-  (out-of-time) month**, sorted descending, table format **ID – SCORE –
-  VARIABLES**. OOT month = the last panel period (held out from fitting).
+  Excel export of individuals at/above P90 of the anomaly score in the OOT
+  (out-of-time) month(s), sorted descending, table format **ID – SCORE –
+  VARIABLES**, each row graded p90/p95/p99. OOT month = the last panel
+  period(s) (`n_oot_periods`, default 1), reserved strictly AFTER `test` —
+  **not the same block**: `test` is the once-touched block model metrics
+  (ROC-AUC/PR-AUC/threshold diagnostics) are reported on, `oot` is data none
+  of fitting, tuning, threshold calibration, or test-set reporting ever
+  touched. See `chronological_split(..., n_oot_periods=...)`.
 - [x] `src/interpretability` — SHAP / path-length attribution for the Isolation
   Forest (`iforest_explain.py`: `shap_summary_iforest`, `path_length_analysis`)
   and latent-space / per-feature reconstruction analysis for the VAE
@@ -300,12 +305,12 @@ it locks in:
 | Phase | Where | Contract |
 | --- | --- | --- |
 | 1 Features | `PanelFeatureEngineer` | `lag/diff/ratio` at horizons `(1, 3, 6)`, resolved against the **fit window**; ratios fill to `1.0`, not `0.0` |
-| 2 Split | `chronological_split` | train / val / test strictly by period; no randomness anywhere |
+| 2 Split | `chronological_split` | train / val / test / OOT strictly by period, no randomness; OOT (`n_oot_periods`, default 1) is reserved strictly after test and is never the same block |
 | 3 Preprocessing | `fit_transform_panel(fit_mask=)` | stage 1 (causal) over the full panel, stage 2 (estimators) on train only |
 | 4 Tuning | `tune_*(valid_mask=)` | static temporal holdout; label-free proxies `tail_separation` / `recon_p50`; VAE gets KL annealing + early stopping |
 | 5 Final fit | `tune_*` refit | winning config refit on train+val |
 | 6 Threshold | `calibrate_threshold` | POT/GPD (or percentile) fitted on **validation**, applied to test |
-| 7 Deliverable | `export_oot_top_anomalies` | distinct individuals at/above P95 of the OOT score (default), graded p95/p97/p99; `--top-n` switches to a fixed headcount |
+| 7 Deliverable | `export_oot_top_anomalies` | distinct individuals at/above P90 of the OOT score (default), graded p90/p95/p99; `--top-n` switches to a fixed headcount |
 
 **Two hazards that bit us and are now guarded.** A short training window makes a
 column near-constant *in the fit block*, and any scaler fitted there amplifies

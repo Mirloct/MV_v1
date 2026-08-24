@@ -902,7 +902,8 @@ def _dataset_tiles_html(dataset: dict) -> str:
     for key, label, sub in (
         ("train_rows", "Entrenamiento", "ajusta preprocesamiento y modelos"),
         ("val_rows", "Validación", "selecciona umbral e hiperparámetros"),
-        ("oot_rows", "Fuera de tiempo (OOT)", "leído una sola vez, al final"),
+        ("test_rows", "Prueba (test)", "métricas reportadas, nunca se ajusta"),
+        ("oot_rows", "Fuera de tiempo (OOT)", "bloque exclusivo del Excel final"),
     ):
         if dataset.get(key) is not None:
             pct = _pct_of_rows(dataset[key])

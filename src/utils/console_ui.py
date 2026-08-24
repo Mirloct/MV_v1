@@ -92,7 +92,7 @@ _PHASE_PLAN: tuple[tuple[str, str, float], ...] = (
     ("Phase 7",  "VAE",                               4.0),
     ("Phase 8",  "Evaluación",                        0.5),
     ("Phase 8b", "Calibración del umbral",            0.3),
-    ("Phase 9",  "Entregable Excel top-N",            0.5),
+    ("Phase 9",  "Entregable Excel OOT",               0.5),
     ("Phase 10", "Interpretabilidad",                 2.0),
     ("Phase 11", "Reporte",                           1.0),
 )

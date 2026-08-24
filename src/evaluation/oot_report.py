@@ -42,27 +42,72 @@ _DEFAULT_OUT = paths.OOT_REPORT_DEFAULT
 # Business default: the review queue is a fixed headcount, not a percentage.
 DEFAULT_TOP_N = 50
 
+#: Percentile bands used to grade the exported queue, ascending. An
+#: individual is graded by the highest band its score clears, so the labels
+#: partition the export: `p95` means "at or above P95 but below P97".
+#:
+#: Only three, deliberately: the point of the band is to let a reviewer sort
+#: a queue by urgency, and more than three grades stop being actionable --
+#: nobody triages ten tiers differently. P99 is the "look at this today" tier,
+#: P95 the "review this cycle" one.
+PERCENTILE_BANDS: tuple[float, ...] = (95.0, 97.0, 99.0)
+#: Column added to the export carrying that grade.
+BAND_COL = "percentil"
+
 
 def _resolve_out_path(
-    out_path: str, top_fraction: float, model_name: str, top_n: Optional[int]
+    out_path: str, top_fraction: float, model_name: str, top_n: Optional[int],
+    min_percentile: Optional[float] = None,
 ) -> str:
     """Fold the selection size and ``model_name`` into the default filename.
 
-    ``oot_top50_iforest.xlsx`` for a top-N export, ``oot_top10_iforest.xlsx``
-    for a top-fraction one.
+    ``oot_p95_iforest.xlsx`` for a percentile export, ``oot_top50_iforest.xlsx``
+    for a top-N one, ``oot_top10_iforest.xlsx`` for a top-fraction one.
     """
     if out_path == _DEFAULT_OUT and model_name and model_name != "model":
-        tag = int(top_n) if top_n is not None else int(round(top_fraction * 100))
-        return os.path.join(paths.REPORTS_DIR, f"oot_top{tag}_{model_name}.xlsx")
+        if min_percentile is not None:
+            tag = f"p{int(round(min_percentile))}"
+        else:
+            tag = f"top{int(top_n) if top_n is not None else int(round(top_fraction * 100))}"
+        return os.path.join(paths.REPORTS_DIR, f"oot_{tag}_{model_name}.xlsx")
     return out_path
+
+
+def _percentile_band_labels(
+    scores: np.ndarray, reference: np.ndarray,
+    bands: "tuple[float, ...]" = PERCENTILE_BANDS,
+) -> tuple[np.ndarray, dict]:
+    """Grade each score by the highest percentile band it clears.
+
+    Args:
+        scores: Scores of the rows being exported.
+        reference: The score population the percentiles are computed from.
+            Passed separately (rather than reusing ``scores``) because the
+            cut-offs must describe the *whole* OOT block: computing them from
+            the already-filtered selection would make the bands circular --
+            the top 5% of the top 5% is not P99.
+
+    Returns:
+        ``(labels, cutoffs)`` -- a string array like ``"p95"``/``"p97"``/
+        ``"p99"`` aligned to ``scores``, and the numeric cut-off per band.
+    """
+    ordered = tuple(sorted(bands))
+    cutoffs = {p: float(np.percentile(reference, p)) for p in ordered}
+    labels = np.full(len(scores), "", dtype=object)
+    # Ascending assignment: each higher band overwrites the previous, so a
+    # score ends up labelled with the highest band it clears.
+    for p in ordered:
+        labels[scores >= cutoffs[p]] = f"p{int(round(p))}"
+    return labels, cutoffs
 
 
 def export_oot_top_anomalies(
     scored_df: pd.DataFrame,
     schema: PanelSchema,
     out_path: str = _DEFAULT_OUT,
-    top_n: Optional[int] = DEFAULT_TOP_N,
+    top_n: Optional[int] = None,
     top_fraction: float = 0.10,
+    min_percentile: Optional[float] = 95.0,
     model_name: str = "model",
     n_oot_periods: int = 1,
     score_col: str = "anomaly_score",
@@ -73,19 +118,24 @@ def export_oot_top_anomalies(
     This is the project's headline business deliverable: the alert queue an
     analyst actually works through.
 
-    Selection size -- ``top_n`` wins when set (the default), otherwise
-    ``top_fraction`` is used:
+    Selection size -- the first of these that is set wins:
 
-    * ``top_n=50`` -> the 50 highest-scoring individuals. A review queue is a
-      fixed headcount: an analyst team can work N cases a month regardless of
-      how many customers the portfolio has, so a fixed N is the operationally
-      meaningful cut. Pass ``top_n=None`` to fall back to the percentage.
-    * ``top_fraction=0.10`` -> the top decile, i.e. ``ceil(0.10 * n_oot_rows)``.
+    * ``min_percentile=95.0`` (**the default**) -> every individual at or above
+      the 95th percentile of the OOT score distribution. Percentile rather than
+      a fixed headcount because the queue then scales with the portfolio and
+      the cut has a distributional meaning: "the riskiest 5%" holds whether
+      the panel has 2,000 customers or 200,000. Each exported row also carries
+      a :data:`BAND_COL` grade (``p95``/``p97``/``p99``) so the queue can be
+      triaged by urgency.
+    * ``top_n=50`` -> the 50 highest-scoring individuals: a fixed headcount for
+      a team that works N cases a month regardless of portfolio size. Set
+      ``min_percentile=None`` to use it.
+    * ``top_fraction=0.10`` -> the top decile, used when both others are None.
 
     **One row per individual.** When ``n_oot_periods > 1`` an entity appears in
     several test months; the export keeps that entity's single highest-scoring
-    month, so "top 50" is always 50 distinct people rather than 50 rows that may
-    describe 20.
+    month, and the ``time_col`` of that month is part of the output -- so a
+    reviewer can see *which* period triggered the alert.
 
     Args:
         scored_df: Output of :func:`src.evaluation.scoring.build_scored_frame`
@@ -93,10 +143,13 @@ def export_oot_top_anomalies(
         schema: Panel schema (for ``entity_col`` / ``time_col``).
         out_path: Destination ``.xlsx``. If left at the default and a
             ``model_name`` is given, it becomes
-            ``artifacts/reports/oot_top<N>_<model>.xlsx``.
-        top_n: Number of individuals to export (default 50). ``None`` defers to
-            ``top_fraction``.
-        top_fraction: Fraction of OOT individuals to keep when ``top_n is None``.
+            ``artifacts/reports/oot_p95_<model>.xlsx`` (or ``oot_top<N>_...``).
+        min_percentile: Percentile cut-off on the OOT score distribution
+            (default 95.0). ``None`` falls back to ``top_n``/``top_fraction``.
+        top_n: Number of individuals to export. Used only when
+            ``min_percentile`` is None.
+        top_fraction: Fraction of OOT individuals to keep when both
+            ``min_percentile`` and ``top_n`` are None.
         model_name: Detector name, folded into the default filename.
         n_oot_periods: Trailing distinct periods treated as OOT (default 1).
         score_col: Name of the score column in ``scored_df``.
@@ -112,7 +165,9 @@ def export_oot_top_anomalies(
     log = setup_logging()
     entity_col = schema.entity_col or "entity_id"
     time_col = schema.time_col or "period"
-    out_path = _resolve_out_path(out_path, top_fraction, model_name, top_n)
+    out_path = _resolve_out_path(
+        out_path, top_fraction, model_name, top_n, min_percentile,
+    )
 
     with log_phase("evaluation.export_oot_top_anomalies", log):
         oot_vals = oot_period(scored_df, time_col=time_col, n_oot_periods=n_oot_periods)
@@ -142,25 +197,61 @@ def export_oot_top_anomalies(
                 n_rows_before_dedup, n_individuals,
             )
 
-        if top_n is not None:
-            k = min(n_individuals, max(1, int(top_n)))
-            selection = f"top {k} individuals (requested top_n={int(top_n)})"
-        else:
-            k = min(n_individuals, max(1, math.ceil(top_fraction * n_individuals)))
-            selection = f"top {k} = ceil({top_fraction:.4g} x {n_individuals})"
-        top = oot.iloc[:k].copy()
+        # Percentile cut-offs come from the FULL de-duplicated OOT population,
+        # before any selection. Deriving them from the exported subset instead
+        # would be circular: the top 5% of the top 5% is not P99.
+        all_oot_scores = oot[score_col].to_numpy(dtype=float)
 
-        # ID - SCORE - VARIABLES. Variables = raw features (everything that is
-        # not a key column or the score column), in their original order.
+        if min_percentile is not None:
+            cut = float(np.percentile(all_oot_scores, float(min_percentile)))
+            # `>=` so ties at the cut-off are kept: dropping half a tie group
+            # would make the export depend on sort order among equal scores.
+            keep = all_oot_scores >= cut
+            k = int(keep.sum())
+            top = oot.loc[keep].copy()
+            selection = (
+                f"{k} individuals at or above P{min_percentile:g} "
+                f"(score >= {cut:.6f})"
+            )
+        else:
+            if top_n is not None:
+                k = min(n_individuals, max(1, int(top_n)))
+                selection = f"top {k} individuals (requested top_n={int(top_n)})"
+            else:
+                k = min(n_individuals, max(1, math.ceil(top_fraction * n_individuals)))
+                selection = f"top {k} = ceil({top_fraction:.4g} x {n_individuals})"
+            top = oot.iloc[:k].copy()
+
+        # ID - PERIOD - SCORE - BAND - VARIABLES.
+        #
+        # `time_col` is part of the output, not stripped as a key: with more
+        # than one OOT period the export keeps each entity's worst month, and
+        # without the period a reviewer cannot tell *when* the alert fired --
+        # which is the first thing needed to go look at the case.
         variable_cols = [
             c for c in scored_df.columns
             if c not in (entity_col, time_col, score_col)
         ]
-        table = top[[entity_col, score_col] + variable_cols].reset_index(drop=True)
+        table = top[[entity_col, time_col, score_col] + variable_cols].reset_index(drop=True)
+
+        # Percentile band per exported row, graded against the full OOT
+        # population computed above.
+        bands, cutoffs = _percentile_band_labels(
+            top[score_col].to_numpy(dtype=float), all_oot_scores,
+        )
+        table.insert(3, BAND_COL, bands)
+        band_counts = {b: int((bands == b).sum()) for b in sorted(set(bands)) if b}
+        log.info(
+            "Percentile bands (cut-offs from the %d-individual OOT block): %s; "
+            "exported counts: %s",
+            n_individuals,
+            {f"p{int(p)}": round(v, 6) for p, v in cutoffs.items()},
+            band_counts,
+        )
 
         if threshold is not None and np.isfinite(threshold):
             alerts = (top[score_col].to_numpy(dtype=float) >= float(threshold)).astype(int)
-            table.insert(2, "alert", alerts)
+            table.insert(4, "alert", alerts)
             log.info(
                 "Calibrated threshold %.6f: %d of the exported %d individuals "
                 "are above it",
@@ -176,9 +267,9 @@ def export_oot_top_anomalies(
         score_hi = float(top[score_col].max())
         log.info(
             "OOT export: period(s)=%s, %d individuals in the OOT block, %s, "
-            "selected score range [%.6f, %.6f], layout=ID-SCORE-%d variables -> %s",
+            "selected score range [%.6f, %.6f], layout=ID-%s-SCORE-%s-%d variables -> %s",
             [str(v) for v in np.atleast_1d(oot_vals)], n_individuals, selection,
-            score_lo, score_hi, len(variable_cols), out_path,
+            score_lo, score_hi, time_col, BAND_COL, len(variable_cols), out_path,
         )
 
     return out_path, table

@@ -771,6 +771,31 @@ class AutoNumericTransformer(BaseEstimator, TransformerMixin):
         return {str(n): t for n, t in zip(names, self.chosen_transforms_)}
 
 
+def _make_numeric_imputer(impute_numeric: str) -> SimpleImputer:
+    """Build the numeric imputer, translating the ``"zero"`` alias.
+
+    ``"zero"`` is the project default and maps to sklearn's
+    ``strategy="constant", fill_value=0.0``. It is a *statistic-free* fill:
+    nothing is estimated from the data, so unlike ``"median"`` it cannot leak
+    across the train/test boundary and cannot shift when the fit window
+    changes.
+
+    The trade-off is real and worth naming: a zero is a *value*, not a
+    "missing" symbol. In a column where 0 already means something (an empty
+    balance, no transactions) a filled zero is indistinguishable from a
+    genuine one. That is why `add_missing_indicators` defaults to True --
+    the 0/1 flag per NaN-bearing column keeps "this was absent" recoverable,
+    so the pair (zero fill + indicator) loses no information even though the
+    fill alone would. Turning indicators off while keeping zero fill is the
+    combination to avoid.
+    """
+    if _normalize_name(impute_numeric) in ("zero", "zeros", "constant"):
+        return SimpleImputer(
+            strategy="constant", fill_value=0.0, keep_empty_features=True,
+        )
+    return SimpleImputer(strategy=impute_numeric, keep_empty_features=True)
+
+
 def _make_numeric_pipeline(numeric_transform, impute_numeric, random_state) -> Pipeline:
     if _normalize_name(numeric_transform) == "auto":
         transform = AutoNumericTransformer(random_state=random_state)
@@ -778,7 +803,7 @@ def _make_numeric_pipeline(numeric_transform, impute_numeric, random_state) -> P
         transform = make_numeric_transformer(numeric_transform, random_state)
     return Pipeline(
         [
-            ("impute", SimpleImputer(strategy=impute_numeric, keep_empty_features=True)),
+            ("impute", _make_numeric_imputer(impute_numeric)),
             ("transform", transform),
         ]
     )
@@ -864,7 +889,7 @@ def build_preprocessing_pipeline(
     schema: PanelSchema,
     numeric_transform: str = "yeo-johnson",
     categorical_encoding: str = "onehot",
-    impute_numeric: str = "median",
+    impute_numeric: str = "zero",
     impute_categorical: str = "most_frequent",
     add_missing_indicators: bool = True,
     add_panel_features: bool = True,
@@ -884,8 +909,12 @@ def build_preprocessing_pipeline(
         numeric_transform: One of :data:`NUMERIC_TRANSFORMS`. Selectable by
             name so an Optuna study can tune it as a categorical.
         categorical_encoding: One of :data:`CATEGORICAL_ENCODINGS`.
-        impute_numeric: SimpleImputer strategy for numeric columns
-            ("median"/"mean"/"most_frequent"/"constant").
+        impute_numeric: Numeric fill strategy. ``"zero"`` (the default) fills
+            NaN with 0.0; ``"median"``/``"mean"``/``"most_frequent"`` use the
+            corresponding sklearn statistic instead. See
+            :func:`_make_numeric_imputer` for why zero is the default and what
+            it costs. `main.py` exposes ``--no-zero-impute`` to switch to
+            ``"median"`` without editing code.
         impute_categorical: "most_frequent" or "constant" (fills "__missing__").
         add_missing_indicators: Append a 0/1 flag per NaN-bearing column
             (defaults on -- upstream MNAR missingness is informative).

@@ -409,3 +409,87 @@ domina, seguida del preprocesamiento (25 s) y la interpretabilidad (23 s). Es
 la métrica de estabilidad de ranking entre semillas, que reajusta el modelo
 varias veces. Cualquier esfuerzo de optimización debería empezar ahí, no en el
 tuneo.
+
+---
+
+## 5. Cuatro cambios de entregable (2026-08-23)
+
+Pedidos explícitos del usuario sobre el formato de los entregables, no
+hallazgos de diagnóstico. Se documentan aquí porque cambian el comportamiento
+por defecto del pipeline.
+
+### 5.1 Imputación numérica: cero por defecto, con función de escape
+
+`build_preprocessing_pipeline(impute_numeric=...)` acepta `"zero"` (nuevo
+default) además de `"median"`/`"mean"`/`"most_frequent"`. `main.py` expone
+`--no-zero-impute` para volver a `"median"` sin tocar código.
+
+**Por qué cero y no una estadística.** `"zero"` no estima nada de los datos:
+mapea a `SimpleImputer(strategy="constant", fill_value=0.0)`. A diferencia de
+`"median"`, no puede filtrarse entre el bloque de entrenamiento y el de
+prueba, y no cambia si la ventana de ajuste cambia — dos propiedades que
+`"median"` no tiene (la mediana se recalcula por columna sobre el bloque de
+ajuste, así que el mismo NaN se imputa distinto según qué ventana temporal
+esté fitteando).
+
+**El costo, dicho explícitamente.** Un cero es un *valor*, no un símbolo de
+"faltante". En una columna donde 0 ya significa algo (saldo vacío, cero
+transacciones) un cero imputado es indistinguible de uno real. Por eso
+`add_missing_indicators=True` sigue siendo el default del pipeline — el flag
+0/1 por columna con NaN mantiene "esto estaba ausente" recuperable, así que el
+par (imputación cero + indicador) no pierde información aunque la imputación
+sola sí la perdería. Apagar los indicadores mientras se mantiene la
+imputación cero es la combinación a evitar.
+
+### 5.2 Entregable OOT: percentil con banda, período incluido
+
+`export_oot_top_anomalies` cambia su selección por defecto de "top 50 fijo" a
+**todo individuo en o por encima de P95** del bloque OOT, con una columna
+`percentil` (`p95`/`p97`/`p99`) que clasifica cada fila por la banda más alta
+que alcanza.
+
+**Por qué percentil y no headcount fijo, por defecto.** Un top-N fijo no tiene
+significado distribucional: "50" es 2.5% de un portafolio de 2,000 y 0.05% de
+uno de 100,000. Un percentil escala con el portafolio y conserva su
+interpretación ("el 5% más riesgoso") sin importar el tamaño. `--top-n N`
+sigue disponible para quien de verdad necesita una cola de tamaño fijo (un
+equipo que trabaja N casos al mes, sin importar el tamaño del portafolio).
+
+**Por qué solo tres bandas.** Más de tres deja de ser accionable — nadie
+triaja diez niveles de urgencia distinto. `p99` es "revisar hoy"; `p95` es
+"revisar este ciclo". Los cortes se calculan sobre la población OOT completa
+**antes** de filtrar, nunca sobre la selección ya exportada — calcularlos
+sobre el subconjunto sería circular (el top 5% del top 5% no es P99).
+
+**La columna de período.** El export ya deduplicaba a una fila por individuo
+(su mes de score más alto cuando el bloque de prueba abarca varios meses),
+pero no exponía *cuál* mes era ese. Sin él, un analista no puede ubicar la
+observación en el tiempo para investigarla. Ahora se incluye con el nombre
+real de la columna temporal del panel (`codmes`, `period`, o el que tenga el
+schema) — no un nombre fijo.
+
+### 5.3 Excel de atribución completa por variable
+
+`src/interpretability/attribution_export.py::export_attribution_workbook`
+escribe `feature_attribution.xlsx` con una hoja por modelo
+(`iforest`/`vae`), cada una con **todas** las variables, no solo las 20 que
+muestra el gráfico.
+
+**Por qué existen ambos.** El gráfico (SHAP beeswarm / barras) recorta a las
+20 variables principales porque un gráfico con 60+ filas no se lee — ese
+recorte es correcto para una figura. Pero recortar el *entregable* a lo mismo
+descartaría en silencio cualquier variable fuera del top 20, y quien audita el
+modelo o monitorea deriva de variables necesita el valor de todas, no una
+imagen. Este workbook es el par sin recortar: los mismos diccionarios
+`{variable: valor}` que alimentan los gráficos (`shap_summary_iforest`,
+`reconstruction_error_by_feature`), escritos completos.
+
+**Por qué dos metodologías distintas y no la misma columna.** La hoja
+`iforest` lleva `mean_abs_shap` (SHAP nativo, o importancia por permutación
+si SHAP no soporta el modelo); la hoja `vae` lleva
+`mean_reconstruction_error` (no hay SHAP para un VAE en este pipeline — el
+análogo real es qué tan mal reconstruye cada columna, que es lo que ya movía
+el puntaje de anomalía del VAE). Cada hoja lleva una descripción de una línea
+en la fila 1 diciendo qué metodología produjo esos números, para que abrir el
+archivo en frío no obligue a adivinar si son comparables entre hojas (no lo
+son).

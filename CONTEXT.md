@@ -42,7 +42,7 @@ Modelo-v0.1/
     ├── logs/               # execution.log
     ├── models/             # iforest.joblib, vae_best.pt, vae/, vae_tuning/
     ├── tuning/             # optuna_*.db, best_params_*.yaml (Optuna outputs)
-    └── reports/            # anomaly_report.{html,md}, model_documentation.md, oot_top50_*.xlsx
+    └── reports/            # anomaly_report.{html,md}, model_documentation.md, oot_p95_*.xlsx, feature_attribution.xlsx
         └── figures/        # ALL figures, flat (see rule below)
 ```
 
@@ -305,7 +305,7 @@ it locks in:
 | 4 Tuning | `tune_*(valid_mask=)` | static temporal holdout; label-free proxies `tail_separation` / `recon_p50`; VAE gets KL annealing + early stopping |
 | 5 Final fit | `tune_*` refit | winning config refit on train+val |
 | 6 Threshold | `calibrate_threshold` | POT/GPD (or percentile) fitted on **validation**, applied to test |
-| 7 Deliverable | `export_oot_top_anomalies` | top-N distinct individuals, `top_n=50` default, parameterisable |
+| 7 Deliverable | `export_oot_top_anomalies` | distinct individuals at/above P95 of the OOT score (default), graded p95/p97/p99; `--top-n` switches to a fixed headcount |
 
 **Two hazards that bit us and are now guarded.** A short training window makes a
 column near-constant *in the fit block*, and any scaler fitted there amplifies

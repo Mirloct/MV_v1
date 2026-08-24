@@ -267,6 +267,12 @@ guarda su figura en `artifacts/reports/figures/` y retorna un `dict`/ruta simple
   UMAP, si no PCA) y `reconstruction_error_by_feature` (error de reconstrucción
   medio por feature — qué columnas reproduce peor el VAE).
 
+Cada gráfico de atribución (SHAP, error de reconstrucción) se recorta a las 20
+variables principales para que se pueda leer. El detalle completo, **todas**
+las variables, queda en `artifacts/reports/feature_attribution.xlsx`
+(`export_attribution_workbook`) — una hoja `iforest` y una `vae`, cada una con
+columnas `variable` y su valor de atribución, ordenadas descendente.
+
 `build_report(context, ...)` renderiza la corrida en dos entregables
 autocontenidos bajo `artifacts/reports/`: un **Markdown** y un **HTML offline**
 (CSS embebido, todos los gráficos interactivos vía Plotly, sin red ni
@@ -400,16 +406,25 @@ vez al final.
 **Entregable principal — la cola priorizada por riesgo.** Cada detector escribe
 
 ```
-artifacts/reports/oot_top50_iforest.xlsx
-artifacts/reports/oot_top50_vae.xlsx
+artifacts/reports/oot_p95_iforest.xlsx
+artifacts/reports/oot_p95_vae.xlsx
 ```
 
-los **50 individuos de mayor score** en los meses de prueba, con formato
-**ID – SCORE – VARIABLES** y una columna `alert` que marca las filas sobre el
-umbral calibrado. El tamaño es parametrizable con `--top-n` (usa `--top-n 0` para
-caer a la fracción de `--top-fraction`). Una fila por individuo: cuando el bloque
-de prueba abarca varios meses, cada entidad se representa por su mes de mayor
-score.
+por defecto, **todo individuo en o por encima del percentil 95** del puntaje
+en los meses de prueba, con formato **ID – PERÍODO – SCORE – PERCENTIL –
+VARIABLES** y una columna `alert` que marca las filas sobre el umbral
+calibrado. La columna `período` lleva el mes exacto en que la entidad fue
+alertada (el nombre real de esa columna es el que tenga tu panel, p. ej.
+`codmes`). `percentil` clasifica cada fila en `p95`/`p97`/`p99` — la banda más
+alta que alcanza — calculado sobre la población completa del bloque OOT, no
+sobre la selección exportada.
+
+Un percentil escala con el tamaño del portafolio en vez de fijar un número; para
+una cola de tamaño fijo usa `--top-n 50` (o cualquier N), que vuelve al
+comportamiento anterior de "las 50 puntuaciones más altas". `--oot-min-percentile`
+cambia el corte por defecto. Una fila por individuo: cuando el bloque de prueba
+abarca varios meses, cada entidad se representa por su mes de mayor score — y
+ese es el mes que queda en la columna de período.
 
 **Compuerta P95 entre capas.** Al terminar el Isolation Forest y **antes** de que
 arranque el VAE, se exporta `artifacts/reports/p95_checkpoint_iforest.xlsx` con

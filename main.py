@@ -88,6 +88,14 @@ class PipelineConfig:
     console_ui: bool = True
     numeric_transform: str = "yeo-johnson"
     categorical_encoding: str = "onehot"
+    # Numeric NaN fill. "zero" (default) is statistic-free: nothing is
+    # estimated from the data, so it cannot leak across the train/test
+    # boundary or shift when the fit window changes. Paired with
+    # `add_missing_indicators` (on by default inside the pipeline), which
+    # keeps "this value was absent" recoverable -- a filled 0 is otherwise
+    # indistinguishable from a real 0 in columns where zero means something.
+    # `--no-zero-impute` switches to "median".
+    impute_numeric: str = "zero"
     # Within-entity lag/diff/ratio/own-z + seasonality features. Off by default:
     # this pipeline's own real-data usage computes those features in a separate
     # upstream flow, so generating them here would duplicate/conflict with that.
@@ -101,9 +109,13 @@ class PipelineConfig:
     # immediately before them (used for tuning AND threshold calibration).
     n_val_periods: int = 2
     n_test_periods: int = 3
-    # Headline deliverable: a fixed-size review queue. `top_n` wins; set it to
-    # None to fall back to `top_fraction`.
-    top_n: Optional[int] = 50
+    # Headline deliverable: everyone at or above this percentile of the OOT
+    # score distribution, each row graded p95/p97/p99 so the queue can be
+    # triaged. A percentile rather than a fixed headcount because the cut then
+    # scales with the portfolio and keeps its distributional meaning.
+    # `--top-n N` overrides it with a fixed-size queue instead.
+    oot_min_percentile: Optional[float] = 95.0
+    top_n: Optional[int] = None
     top_fraction: float = 0.10
     threshold_method: str = "pot"
     threshold_percentile: float = 99.0
@@ -305,6 +317,10 @@ def run_pipeline(config: PipelineConfig) -> dict:
     # Posterior-collapse diagnostics, per model. Keyed by model so the report
     # renders them beside that model's other numbers.
     model_latent_diagnostics: dict = {}
+    # Full per-feature attribution, per model -- the uncropped counterpart to
+    # the top-20 SHAP/reconstruction-error figures. Exported as a workbook
+    # after the interpretability phase; see attribution_export.py.
+    model_attributions: dict = {}
     generated_at = datetime.now().isoformat(timespec="seconds")
 
     # Artifact destinations for THIS run. Locals, not the module constants:
@@ -485,6 +501,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             fit_mask=train_mask,
             numeric_transform=config.numeric_transform,
             categorical_encoding=config.categorical_encoding,
+            impute_numeric=config.impute_numeric,
             add_panel_features=config.panel_features,
             random_state=config.seed,
         )
@@ -968,6 +985,10 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 out_path, _table = export_oot_top_anomalies(
                     scored_df,
                     schema,
+                    # An explicit --top-n switches off the percentile cut, so
+                    # the two selection modes can never both apply.
+                    min_percentile=(None if config.top_n is not None
+                                    else config.oot_min_percentile),
                     top_n=config.top_n,
                     top_fraction=config.top_fraction,
                     model_name=name,
@@ -1017,8 +1038,11 @@ def run_pipeline(config: PipelineConfig) -> dict:
                         figures, "iForest SHAP summary",
                         os.path.join(FIGURES_DIR, "iforest_shap_summary.png"),
                     )
-                    # Also feeds the report's interactive version of this chart.
+                    # Also feeds the report's interactive version of this chart
+                    # (both capped at the top 20 there) and the uncropped
+                    # per-variable Excel workbook below.
                     chart_static["shap_importance"] = imp
+                    model_attributions["iforest"] = imp
                 except Exception as exc:
                     logger.warning("shap_summary_iforest failed (%s); continuing.", exc)
                 try:
@@ -1055,8 +1079,35 @@ def run_pipeline(config: PipelineConfig) -> dict:
                         os.path.join(FIGURES_DIR, "vae_recon_by_feature.png"),
                     )
                     chart_static["recon_by_feature"] = recon
+                    model_attributions["vae"] = recon
                 except Exception as exc:
                     logger.warning("reconstruction_error_by_feature failed (%s); continuing.", exc)
+
+    # -- Phase 10b: full per-feature attribution workbook ------------------- #
+    # Outside the per-model loop: this needs both models' dicts together (one
+    # sheet each), not one at a time.
+    attribution_path = None
+    if model_attributions:
+        with log_phase("Phase 10b: attribution workbook"):
+            from src.interpretability import export_attribution_workbook
+
+            try:
+                attribution_path = export_attribution_workbook(model_attributions)
+                observability.check(
+                    name="artifact.attribution_workbook_written", category="artifact",
+                    definition="The full per-feature SHAP/reconstruction-error "
+                               "workbook exists and is non-empty.",
+                    expected="attribution_path is not None", severity="warning",
+                    passed=attribution_path is not None,
+                    observed={"path": attribution_path,
+                              "models": sorted(model_attributions)},
+                    failure_action="Best-effort artifact; the report and figures "
+                                   "are unaffected. Check the log for which "
+                                   "model's attribution failed upstream.",
+                    evidence=paths.REPORTS_DIR,
+                )
+            except Exception as exc:
+                logger.warning("export_attribution_workbook failed (%s); continuing.", exc)
 
     # -- Phase 11: report --------------------------------------------------- #
     report_paths: dict = {"html": None, "md": None, "model_doc": None}
@@ -1099,7 +1150,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 "threshold_target_far": config.threshold_target_far,
             },
             "notes": (
-                f"Entregables Excel top-{config.top_n if config.top_n is not None else f'{config.top_fraction:.0%}'} "
+                f"Entregables Excel "
+                f"{'top-' + str(config.top_n) if config.top_n is not None else 'P' + str(int(config.oot_min_percentile))} "
                 f"clasificados por riesgo -> {oot_note}. "
                 f"División cronológica: {split.describe()}. "
                 f"Umbral calibrado en validación vía {config.threshold_method}. "
@@ -1144,6 +1196,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
     artifacts = {
         "oot_excels": oot_excels,
         "p95_checkpoint": p95_path,
+        "attribution_workbook": attribution_path,
         "reports": report_paths,
         "figures_dir": os.path.abspath(FIGURES_DIR),
         "log_file": os.path.abspath(os.path.join(LOGS_DIR, "execution.log")),
@@ -1155,6 +1208,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         "PIPELINE COMPLETE - artifact locations:",
         f"  IF P95 checkpoint: {p95_path}",
         f"  OOT Excel(s)   : {', '.join(oot_excels.values()) or '(none)'}",
+        f"  Feature attribution (xlsx): {attribution_path}",
         f"  Report (html)  : {report_paths.get('html')}",
         f"  Report (md)    : {report_paths.get('md')}",
         f"  Model docs     : {report_paths.get('model_doc')}",
@@ -1240,6 +1294,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Numeric transform for preprocessing (default 'yeo-johnson').")
     parser.add_argument("--categorical-encoding", default="onehot",
                         help="Categorical encoding for preprocessing (default 'onehot').")
+    parser.add_argument("--no-zero-impute", action="store_true",
+                        help="Fill numeric NaNs with the column MEDIAN instead of 0.0. "
+                             "Zero-fill is the default because it estimates nothing "
+                             "from the data (so it cannot leak across the train/test "
+                             "split); use this when a filled 0 would be confused with "
+                             "a real 0 and the missingness indicators are not enough.")
     parser.add_argument("--live-view", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Open a local-only live progress view (127.0.0.1, no external "
@@ -1290,9 +1350,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--p95-percentile", type=float, default=None,
                         help="Percentile of in-time IF scores above which a row is exported "
                              "in the Phase 6c checkpoint gate before the VAE runs (default 95).")
-    parser.add_argument("--top-n", type=int, default=50,
-                        help="Individuals exported in the risk-ranked Excel (default 50). "
-                             "Pass 0 to use --top-fraction instead.")
+    parser.add_argument("--oot-min-percentile", type=float, default=95.0,
+                        help="Percentile of the OOT score distribution above which an "
+                             "individual is exported in the risk-ranked Excel (default "
+                             "95). Each row is also graded p95/p97/p99. Overridden by "
+                             "--top-n when that is set.")
+    parser.add_argument("--top-n", type=int, default=None,
+                        help="Export a FIXED headcount instead of the percentile cut "
+                             "(default: unset, percentile mode). Pass 0 or a negative "
+                             "value to force percentile mode explicitly.")
     parser.add_argument("--n-val-periods", type=int, default=2,
                         help="Validation months for tuning + threshold calibration (default 2).")
     parser.add_argument("--n-test-periods", type=int, default=3,
@@ -1331,6 +1397,7 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         seed=args.seed,
         numeric_transform=args.numeric_transform,
         categorical_encoding=args.categorical_encoding,
+        impute_numeric=("median" if args.no_zero_impute else "zero"),
         supervised=args.supervised,
         live_view=args.live_view,
         console_ui=args.console_ui,
@@ -1339,8 +1406,10 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         iforest_trials=resolve("iforest_trials"),
         vae_trials=resolve("vae_trials"),
         vae_epochs=resolve("vae_epochs"),
-        # --top-n 0 is the explicit "use the percentage instead" escape hatch.
+        # --top-n 0 (or negative) is the explicit "use percentile mode" escape
+        # hatch; unset (None) already means percentile mode by default.
         top_n=(None if args.top_n is not None and args.top_n <= 0 else args.top_n),
+        oot_min_percentile=args.oot_min_percentile,
         top_fraction=args.top_fraction,
         n_val_periods=args.n_val_periods,
         n_test_periods=args.n_test_periods,

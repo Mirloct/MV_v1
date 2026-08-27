@@ -125,7 +125,7 @@ rest pass through unchanged.
 
 **Not exposed by this project's wrapper** (sklearn defaults apply, unmodified): `verbose` (`0`, no progress printing — this project's own `tqdm` bar in `tune_iforest` covers that need at the trial level instead) and `warm_start` (`False` — this project always fits from scratch; incremental forest growth is never used).
 
-**Sensitivity analysis actually run vs. still open.** §3 below and `tests/test_iforest.py` cover: score finiteness/orientation under malformed input, resume/crash-recovery correctness, and rank agreement between two seeds at the tuned configuration (`TestRankAgreement`-style tests). **Not yet measured on this project's data**: a systematic sweep of `n_estimators` alone (holding everything else fixed) to find where score-variance-across-seeds actually plateaus, and a `max_samples` sensitivity curve. Treat "200 trees is enough" as this project's working assumption, justified by the reasoning above, not as a measured optimum — CONTEXT.md's own convention (label a claim as "evidence required" rather than proven) applies here too.
+**Sensitivity analysis actually run vs. still open.** §3 below covers: score finiteness/orientation under malformed input, resume/crash-recovery correctness, and rank agreement between two seeds at the tuned configuration. **Not yet measured on this project's data**: a systematic sweep of `n_estimators` alone (holding everything else fixed) to find where score-variance-across-seeds actually plateaus, and a `max_samples` sensitivity curve. Treat "200 trees is enough" as this project's working assumption, justified by the reasoning above, not as a measured optimum.
 
 ---
 
@@ -168,8 +168,6 @@ To resume after an interruption, simply call `tune_iforest` again with the same
 > agreement are all rank statistics — so contamination is *mathematically
 > incapable* of changing an objective value. Searching it burned TPE budget on a
 > flat dimension and persisted an arbitrary "best".
-> `tests/test_iforest.py::TestContaminationIsNotSearched` asserts both its
-> absence from the search space and the invariance premise itself.
 
 ### Held-out objective
 
@@ -249,9 +247,9 @@ Two counter-intuitive conclusions:
    that extreme values isolate in few splits; `log1p` and `yeo-johnson` compress
    exactly the right tail where `global` anomalies live, so those anomalies then
    need *more* splits and score *lower*. Shape-preserving affine transforms
-   double the PR-AUC and take `global` recall to 1.0 — consistent with
-   `TestAffineRescalingIsANoOp`, which proves `robust` and `standard` are the
-   same thing to this model.
+   double the PR-AUC and take `global` recall to 1.0 — consistent with the
+   theory above: `robust` and `standard` are the same affine shape to this
+   model, so they score identically.
 2. **`local` is the blind spot** — 0.0–0.2 recall under every transform, mean
    score percentile ≈ 0.50, i.e. the forest ranks a local anomaly as no more
    suspicious than a median row. By construction a local anomaly is drawn from

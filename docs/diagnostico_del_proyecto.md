@@ -21,12 +21,16 @@ criterio, no un parche.
 
 # Resumen ejecutivo
 
-**El hallazgo dominante: el VAE del proyecto está colapsado, y lo ha estado en
-toda corrida real.** Se verificó empíricamente: **0 de 8 dimensiones latentes
-activas**, KL media 0.0001. El decodificador ignora por completo el código
-latente. Como el puntaje de anomalía **es** el error de reconstrucción, el VAE
-ha estado emitiendo puntajes finitos, ordenando filas y exportando su cola de
-Excel OOT a partir de un modelo degenerado — sin que nada fallara.
+**El hallazgo dominante de esta revisión: el VAE del proyecto estaba
+colapsado, en toda corrida real hecha hasta el momento de esta revisión.** Se
+verificó empíricamente: **0 de 8 dimensiones latentes activas**, KL media
+0.0001. El decodificador ignoraba por completo el código latente. Como el
+puntaje de anomalía **es** el error de reconstrucción, el VAE había estado
+emitiendo puntajes finitos, ordenando filas y exportando su cola de Excel OOT
+a partir de un modelo degenerado — sin que nada fallara. **Corregido y
+verificado el mismo día (0/8 → 8/8 dimensiones activas) — ver A-1.** Todo
+resultado de VAE producido antes de esa corrección describe el modelo
+degenerado; ver `CONTEXT.md` "Known open problems".
 
 La causa raíz es un desajuste de escala entre los dos términos de la pérdida
 (§A-1), que multiplica el `beta` efectivo por el número de features. Con 22
@@ -74,7 +78,7 @@ A-10, abajo.
 
 # A. Nivel de código
 
-## 🔴 A-1. El `beta` efectivo es `beta × n_features` — el VAE colapsa
+## 🔴 A-1. El `beta` efectivo es `beta × n_features` — el VAE colapsa — CORREGIDO
 
 **Dónde:** `src/models/vae.py::vae_loss`, `reduction="mean"`.
 
@@ -131,24 +135,27 @@ reconstruye aproximadamente la media.
 razonable (rango [0.009, 6.45], σ=0.83 en el caso de prueba). Ninguna
 aserción falla, ningún NaN aparece, el `best_params.yaml` se escribe poblado.
 
-### Corrección recomendada — requiere tu decisión
+### Corrección aplicada (2026-08-22)
 
-**No la apliqué** porque cambia el comportamiento de todo modelo entrenado e
-invalida los `best_params_vae.yaml` existentes. Tres caminos:
+Se aplicó la **Opción A**: `vae_loss` cambió a MSE **sumado sobre features**,
+promediado sobre batch (`reduction="mean"` ahora escala ambos términos igual),
+en vez de dividir el término de reconstrucción entre `batch × features` como
+antes. `beta=1.0` vuelve a significar lo que dice la literatura (Higgins et
+al. 2017), y el rango `[0.1, 2.0]` de Optuna deja de ser catastrófico.
 
-| Opción | Cambio | Ventaja | Costo |
-| --- | --- | --- | --- |
-| **A (recomendada)** | `reduction="mean"` → MSE **sumado sobre features**, promediado sobre batch | Convención ELBO estándar; `beta` recupera su significado de la literatura | Hay que re-tunear; los `beta` guardados dejan de ser comparables |
-| **B** | Dividir la KL entre `D` dentro de `vae_loss` | Mismo efecto, cambio mínimo | Se aleja de la forma publicada; confunde a quien lea el código |
-| **C** | Mover el rango de `beta` a `[0.001, 0.1]` | No toca la pérdida | Enmascara el problema; el rango correcto dependería de `D`, que varía |
+De las tres opciones consideradas (A: cambiar la reducción de la pérdida — la
+aplicada; B: dividir la KL entre `D` dentro de `vae_loss`, mismo efecto pero
+más alejado de la forma publicada; C: mover el rango de `beta` sin tocar la
+pérdida, que solo enmascara el problema), A era la única que hace que `beta`
+signifique lo mismo para cualquier ancho de matriz `D`.
 
-**A** es la correcta: hace que `beta=1.0` signifique lo que dice la literatura
-(Higgins et al. 2017) y que el rango `[0.1, 2.0]` de Optuna sea razonable en
-vez de catastrófico.
+**Costo, tal como se anticipó:** todo `best_params_vae.yaml` generado antes
+de este cambio codifica un `beta` en la escala vieja y no es reutilizable —
+hay que re-tunear. Ver `CONTEXT.md` "Known open problems".
 
 ---
 
-## 🟠 A-2. El objetivo de Optuna no es comparable entre trials
+## 🟠 A-2. El objetivo de Optuna no es comparable entre trials — CORREGIDO
 
 **Dónde:** `src/models/vae.py::tune_vae`, modo no supervisado (el **default**
 del proyecto).
@@ -171,12 +178,14 @@ por el peso del término, no por calidad del modelo.
 dirección *sana* — así que compensa parcialmente A-1 por accidente. Pero está
 seleccionando sobre un artefacto de la parametrización, no sobre calidad.
 
-**Corrección sugerida:** usar como objetivo el **error de reconstrucción de
-validación solo** (sin el término KL), que sí es comparable entre trials. El
-módulo ya soporta `objective_metric="recon_p50"` — bastaría con hacerlo el
-default no supervisado. Alternativamente, un objetivo compuesto que penalice
-explícitamente el colapso (p. ej. reconstrucción sujeta a un mínimo de
-dimensiones activas).
+**Corrección aplicada (2026-08-22).** El objetivo no supervisado por defecto
+ya no es `best_val_loss_` (la pérdida ponderada por `beta` de ese trial); es
+la **ELBO negativa a `beta=1`**, calculada aparte
+(`VAEDetector.best_val_elbo_`) precisamente porque no depende de la dimensión
+de búsqueda. Los trials vuelven a ser comparables entre sí sin importar qué
+`beta` sorteó cada uno. `objective_metric="recon_p50"` (error de
+reconstrucción de validación puro, sin KL) sigue disponible como alternativa
+explícita.
 
 ---
 

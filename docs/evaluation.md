@@ -6,9 +6,9 @@
 
 This document covers the evaluation module in `src/evaluation/`: the
 out-of-time (OOT) split, the ground-truth join, the supervised and unsupervised
-metric suites, the human-readable scored frame, the headline top-N (default 50) risk-ranked
-Excel export, and the evaluation figures. It explains the concepts, the API, and
-gives a runnable end-to-end snippet.
+metric suites, the human-readable scored frame, the headline risk-ranked
+Excel export (percentile-based by default), and the evaluation figures. It
+explains the concepts, the API, and gives a runnable end-to-end snippet.
 
 > Metric concepts adapted from GeeksforGeeks, see
 > `geeksforgeeks_notes.md` (section 5, "Evaluation Metrics for
@@ -68,7 +68,7 @@ metrics simply degrade to `NaN` and can be skipped.
 | `calibrate_threshold(scores, method="pot"\|"percentile", ...)` | `thresholds.py` | **Alert cut-off fitted on validation scores** (GPD/POT or percentile). |
 | `apply_threshold(scores, threshold)` | `thresholds.py` | 0/1 alert flags. |
 | `build_scored_frame(raw_df, keys, scores, schema)` | `scoring.py` | Attach `anomaly_score` + **raw** features to `(entity_id, period)`. |
-| `export_oot_top_anomalies(scored_df, schema, top_n=50, ...)` | `oot_report.py` | **The deliverable:** top-N distinct individuals, ID–SCORE–VARIABLES `.xlsx`. |
+| `export_oot_top_anomalies(scored_df, schema, min_percentile=90.0, ...)` | `oot_report.py` | **The deliverable:** distinct individuals at/above a score percentile (default P90), ID–PERIOD–SCORE–BAND–VARIABLES `.xlsx`. `top_n`/`top_fraction` switch to a fixed headcount instead. |
 | `export_oot_top_decile(scored_df, schema, ...)` | `oot_report.py` | Percentage-based wrapper kept for backwards compatibility. |
 | `plot_embedding(X, scores_or_labels, method=...)` | `visualize.py` | 2D PCA/t-SNE/UMAP scatter coloured by score. |
 | `plot_roc_pr(y_true, scores)` | `visualize.py` | ROC + PR curves side by side. |
@@ -158,7 +158,7 @@ section 5):**
 
 ---
 
-## 4. The top-N risk-ranked Excel deliverable
+## 4. The risk-ranked Excel deliverable
 
 This is the project's headline business artifact.
 
@@ -170,24 +170,31 @@ matter: the deliverable must be readable by a human reviewer, so it carries the
 **original** feature values, not the scaled/encoded model matrix. `scores` must be
 row-aligned with `keys` (the `fit_transform_panel` order); a mismatch raises.
 
-`export_oot_top_anomalies(scored_df, schema, top_n=50,
-top_fraction=0.10, model_name="model", n_oot_periods=1, score_col="anomaly_score")`
-then writes the **top 10% of individuals by anomaly score in the OOT (last)
-month**, sorted by score descending (ties broken by `entity_id` ascending, stable
-sort), and returns `(path, table_df)`.
+`export_oot_top_anomalies(scored_df, schema, min_percentile=90.0, top_n=None,
+top_fraction=0.10, model_name="model", n_oot_periods=1, score_col="anomaly_score",
+threshold=None)` writes every individual **at or above the 90th percentile of
+the OOT-block score** by default — a percentile rather than a fixed headcount
+because the queue then scales with the portfolio ("the riskiest 10%" holds at
+2,000 customers or 200,000). Sorted by score descending (ties broken by
+`entity_id` ascending, stable sort). Passing `top_n` (or setting
+`min_percentile=None` and leaving `top_fraction`) instead selects a fixed
+headcount/fraction, the older behavior. Returns `(path, table_df)`.
 
 **Exact column layout (hard requirement):**
 
-| Column 1 | Column 2 | Columns 3+ |
-| --- | --- | --- |
-| **ID** (`entity_id`) | **SCORE** (`anomaly_score`) | **VARIABLES** (raw, human-readable feature values) |
+| Column 1 | Column 2 | Column 3 | Column 4 | Columns 5+ |
+| --- | --- | --- | --- | --- |
+| **ID** (`entity_id`) | **PERIOD** (`time_col`) | **SCORE** (`anomaly_score`) | **BAND** (`p90`/`p95`/`p99`, the highest reached) | **VARIABLES** (raw, human-readable feature values) |
 
-The OOT month is constant across the table (it is the single last period), so it
-is logged rather than repeated as a column. `K = ceil(top_fraction * n_oot_rows)`
-(always at least 1). If `out_path` is left at the default and a `model_name` is
-given, the file becomes `artifacts/reports/oot_top<pct>_<model>.xlsx`
-(e.g. `artifacts/reports/oot_top50_iforest.xlsx`). The `.xlsx` write uses the `openpyxl`
-engine. Output lands under `artifacts/reports/`.
+An `alert` column is inserted after BAND when a calibrated `threshold` is
+passed. Percentile cut-offs (and the band assignment) are computed over the
+**full** de-duplicated OOT population before any selection — never over the
+exported subset, which would be circular. If `out_path` is left at the
+default and a `model_name` is given, the file becomes
+`artifacts/reports/oot_p<percentile>_<model>.xlsx` (e.g.
+`artifacts/reports/oot_p90_iforest.xlsx`) under the percentile default, or
+`oot_top<N>_<model>.xlsx` under the fixed-headcount mode. The `.xlsx` write
+uses the `openpyxl` engine. Output lands under `artifacts/reports/`.
 
 ---
 
@@ -253,9 +260,8 @@ print("rank_stability:", uns["rank_stability"])
 
 # 5. Human-readable scored frame (RAW features) and the OOT Excel deliverable.
 scored = build_scored_frame(df, keys, scores, schema)
-path, table = export_oot_top_anomalies(scored, schema, top_n=50,
-                                    top_fraction=0.10, model_name="iforest")
-print("top-N risk-ranked Excel:", path)        # -> artifacts/reports/oot_top50_iforest.xlsx
+path, table = export_oot_top_anomalies(scored, schema, model_name="iforest")
+print("risk-ranked Excel:", path)              # -> artifacts/reports/oot_p90_iforest.xlsx
 
 # 6. Figures -> artifacts/reports/figures/
 plot_embedding(X[oot_mask], scores[oot_mask], method="pca", y=y[oot_mask])

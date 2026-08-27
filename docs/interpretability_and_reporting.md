@@ -83,10 +83,17 @@ falling through on failure, and logs which tier fired:
    `IsolationForest` is version-dependent, so this may raise and trigger the
    fallback.
 2. **Model-agnostic `shap.Explainer`** over `detector.score_samples` with a
-   small subsample masker — used when tier 1 raises.
+   small subsample masker — used when tier 1 raises. Cost scales with the
+   **feature count** (each evaluation re-scores the forest ~`2*n_features+1`
+   times), so this tier times a couple of calibration rows first and only
+   explains as many more as fit inside a ~60s budget rather than running to
+   completion unbounded — see `CONTEXT.md` and `CHANGELOG.md` 2026-08-26 for
+   why (measured at ~2.7+ hours unbounded at ~180-190 features).
 3. **Permutation importance** on `detector.score_samples` — the last resort;
    each feature column is shuffled and the mean absolute change in the anomaly
-   score is recorded.
+   score is recorded. Also budgeted: rows are subsampled and `n_repeats` is
+   reduced so total `score_samples()` calls stay under a fixed cap regardless
+   of feature count.
 
 `path_length_analysis(detector, X, out_dir=..., max_samples=20000, ...) -> dict`
 
@@ -143,7 +150,7 @@ silently omitted:
 | `models`        | `{model_name: {"best_params": {...}, "metrics": {...}, "threshold": {...}}}`. |
 | `figures`       | List of `{"title": str, "path": str}`; missing files are skipped. |
 | `chart_data`    | Raw scores/labels/thresholds driving the interactive Plotly charts; `chart_data["static"]` additionally carries the arrays behind the former-PNG charts (SHAP importances, path length, embeddings, latent space). |
-| `oot_excel`     | Path, or `{model: path}`, to the top-N Excel deliverable(s). |
+| `oot_excel`     | Path, or `{model: path}`, to the risk-ranked Excel deliverable(s). |
 | `preprocessing` | Flat dict of pipeline settings — goes to the technical doc only. |
 | `notes`         | Free-text notes block. |
 
@@ -204,9 +211,9 @@ Applied uniformly so the figures read as one system (see
 - **Metrics & best params** per model (from `context["models"]`).
 - **Figures** — including the interpretability figures produced in Section 2 and
   any evaluation/model figures, all under `artifacts/reports/figures/`.
-- **The OOT Excel deliverable** — linked and explained: the top decile of the
-  held-out last panel period ranked by descending anomaly score, in
-  ID – SCORE – VARIABLES format.
+- **The OOT Excel deliverable** — linked and explained: individuals at or
+  above the calibrated percentile of the OOT block, ranked by descending
+  anomaly score, in ID – PERIOD – SCORE – BAND – VARIABLES format.
 - **VAE methodology math** — the ELBO and the closed-form Gaussian KL:
 
   $$\mathrm{ELBO}(x) = \mathbb{E}_{q(z\mid x)}\big[\log p(x\mid z)\big] - \mathrm{KL}\big(q(z\mid x)\,\|\,p(z)\big)$$
@@ -277,8 +284,8 @@ context = {
         {"title": "VAE recon by feature",
          "path": "artifacts/reports/figures_recon_by_feature.png"},
     ],
-    # From the evaluation module's top-N (default 50) risk-ranked export, when available.
-    "oot_excel": "artifacts/reports/oot_top50_iforest.xlsx",
+    # From the evaluation module's risk-ranked export, when available.
+    "oot_excel": "artifacts/reports/oot_p90_iforest.xlsx",
     "notes": "Higher score = more anomalous for both detectors.",
 }
 out = build_report(context)

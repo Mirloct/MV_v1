@@ -78,9 +78,8 @@ La mediana (punto de ruptura 50%) y el IQR (que descarta los cuartiles
 externos por construcción) no se ven afectados por una minoría de valores
 extremos, así que la cola escalada conserva su magnitud.
 
-`tests/test_linear_scaling.py::TestOtherMethods::test_robust_beats_standard_at_preserving_the_anomaly`
-fija esta diferencia: sobre el mismo dato, la anomalía queda **más de 100×**
-más lejos del centro con robust que con standard.
+Medido sobre el mismo dato: la anomalía queda **más de 100×** más lejos del
+centro con robust que con standard.
 
 ### División por cero
 
@@ -111,9 +110,9 @@ df     = apply_linear_scaling(df, params)      # aplicadas a todas las filas
 `params` es JSON-serializable, así que puede registrarse en logs, guardarse
 junto al modelo y recargarse sin deserializar ninguna clase.
 
-`test_one_shot_and_two_step_differ_when_the_tail_is_out_of_sample` es el
-guardián de regresión: si las dos formas dejan de diferir, la ruta sin fuga no
-está haciendo nada.
+Si las dos formas (una sola llamada vs. las dos pasos) alguna vez dejan de
+diferir sobre un panel con partición cronológica, es señal de que la ruta sin
+fuga dejó de estar haciendo algo.
 
 ---
 

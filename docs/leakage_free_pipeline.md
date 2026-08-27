@@ -4,8 +4,11 @@ This document is the audit trail for the project's anti-leakage design: what
 each phase does, **where it lives in the code**, and the reasoning behind the
 choice. It doubles as the checklist to re-run whenever the pipeline changes.
 
-Every claim below is enforced by a test; the test names are given so a reviewer
-can go straight to the assertion rather than take this document's word for it.
+Every claim below was, at the time it was written, backed by a project test
+suite naming the exact assertion. That suite was removed 2026-08-22 (not
+needed to run the project — see `CHANGELOG.md`), so the `Test*`/`test_*.py`
+names below no longer resolve to files on disk; they are kept as a record of
+what was checked, and as a guide for what a reintroduced test should cover.
 
 ---
 
@@ -46,8 +49,6 @@ levels/differences and **`1.0` for ratios** — a ratio of 0 would read as
 only kept when the training block is deep enough to contain it. See Phase 3 for
 what goes wrong otherwise.
 
-*Tests:* `test_preprocessing.py::TestMultiHorizonContrastFeatures`.
-
 ---
 
 ## Phase 2 — Strictly chronological split
@@ -77,9 +78,9 @@ yields 3/1/2); `n_oot_periods > 0` is never shrunk -- a panel too short to
 honour it raises rather than silently falling back to `oot == test`. Panels
 need at least 3 distinct periods with no OOT block, or 4 with one.
 
-*Tests:* `test_evaluation.py::TestChronologicalSplit` — asserts the masks
-partition every row exactly once, that the blocks are strictly ordered in time,
-and that no period appears in two blocks.
+`chronological_split` guarantees the masks partition every row exactly once,
+that the blocks are strictly ordered in time, and that no period appears in
+two blocks.
 
 ---
 
@@ -104,8 +105,8 @@ The pipeline has two stages and **only one of them can leak**:
 > own-z features become NaN, get filled with `0.0`, and end up identically zero
 > on exactly the rows being evaluated. Splitting by *stage* rather than by
 > *call* fixes the leak without touching the time-series dependencies.
-> `test_preprocessing.py::TestFitMask::test_naive_fit_in_transform_oot_destroys_them`
-> keeps the failure mode reproducible.
+> (formerly guarded by a regression test that reproduced the failure mode
+> directly; see `CHANGELOG.md` 2026-08-22 on the test suite's removal).
 
 ### Two zero-variance hazards, both fixed
 
@@ -126,9 +127,6 @@ without bound.
 A **blow-up guard** (`_warn_on_extreme_magnitudes`) logs any feature exceeding
 `1e6` after transformation and names it, so this class of bug can never again be
 silent.
-
-*Tests:* `TestFitMask`, `TestCyclicalFeaturesBypassScaling`,
-`TestMultiHorizonContrastFeatures::test_horizons_are_resolved_against_the_fit_window`.
 
 ### On `RobustScaler`
 
@@ -221,10 +219,6 @@ cannot move any rank-based objective.
 `(X.shape, feature_names, objective mode, direction)`, so trials scored on
 PR-AUC are never pooled with trials scored on a separation proxy.
 
-*Tests:* `test_iforest.py::TestBlockedSplit`, `TestRankAgreement`,
-`TestStudyFingerprint`, `TestObjectiveUsesHeldOutRows`;
-`test_vae.py::TestKLAnnealingAndEarlyStopping`, `TestTemporalValidation`.
-
 ---
 
 ## Phase 5 — Final training
@@ -263,34 +257,35 @@ Degenerate cases (fewer than 30 exceedances, a failed fit, a non-finite result)
 fall back to the percentile and record `fallback_reason` — a silently wrong
 threshold is worse than an honest simple one.
 
-*Tests:* `test_evaluation.py::TestThresholdCalibration`.
-
 ---
 
 ## Phase 7 — Test evaluation and the deliverable
 
 **Where:** `src/evaluation/oot_report.py` → `export_oot_top_anomalies`.
 
-The headline output is a fixed-size, risk-ranked queue:
+The headline output is a risk-ranked queue:
 
 ```
-artifacts/reports/oot_top50_iforest.xlsx
-artifacts/reports/oot_top50_vae.xlsx
+artifacts/reports/oot_p90_iforest.xlsx
+artifacts/reports/oot_p90_vae.xlsx
 ```
 
-* **`top_n=50` by default, fully parameterisable** (`--top-n`, or
-  `top_n=None` to fall back to `--top-fraction`). A review queue is a fixed
-  headcount: a team works N cases a month regardless of portfolio size, so a
-  fixed N is the operationally meaningful cut.
-* **One row per individual.** With several test months an entity appears more
-  than once; the export keeps that entity's highest-scoring month, so "top 50"
-  is always 50 distinct people.
-* Layout is **ID – SCORE – VARIABLES** (raw, human-readable features), plus an
-  `alert` column flagging the rows above the calibrated threshold — so the file
-  shows both the fixed-size queue *and* which of those cases the calibrated rule
-  would independently have raised.
-
-*Tests:* `test_evaluation.py::TestTopNExport`.
+* **`min_percentile=90.0` by default, fully parameterisable.** Every
+  individual at or above the 90th percentile of the OOT score, so the queue
+  scales with the portfolio instead of fixing a headcount — "the riskiest
+  10%" holds whether the panel has 2,000 or 200,000 customers. Each row also
+  carries a `p90`/`p95`/`p99` band, the highest it reaches, computed over the
+  full OOT population before any filtering. `top_n=N` (`--top-n`) switches to
+  a fixed headcount instead, for a team that works N cases a month regardless
+  of portfolio size; `top_fraction` is the fallback when both are `None`.
+* **One row per individual.** With several OOT months an entity appears more
+  than once; the export keeps that entity's highest-scoring month, and that
+  month is part of the output.
+* Layout is **ID – PERIOD – SCORE – BAND – VARIABLES** (raw, human-readable
+  features), plus an `alert` column flagging rows above the calibrated
+  threshold when one is supplied — so the file shows both the selection
+  *and* which of those cases the calibrated rule would independently have
+  raised.
 
 ### The plateau effect
 
@@ -357,16 +352,16 @@ reconstruction error of every held-out row rather than only the anomalous ones.
 
 ## Anti-leakage checklist
 
-| # | Control | Enforced by |
+| # | Control | Mechanism |
 | --- | --- | --- |
-| 1 | Train/val/test split is strictly chronological | `chronological_split`; `TestChronologicalSplit` |
-| 2 | Contrast features (`diff{h}`, `ratio{h}`) fight the smoothing | `_DEFAULT_LAG_HORIZONS`; `TestMultiHorizonContrastFeatures` |
-| 3 | Scalers/encoders `.fit()` on train only, `.transform()` elsewhere | `fit_transform_panel(fit_mask=...)`; `TestFitMask` |
-| 4 | Panel features still computed over the full panel (no zeroed lags) | `TestFitMask::test_naive_fit_in_transform_oot_destroys_them` |
-| 5 | Optuna uses a static temporal split, never random K-fold | `tune_*(valid_mask=...)`; `TestObjectiveUsesHeldOutRows` |
-| 6 | Objective is scored on held-out rows, never in-sample | `TestObjectiveUsesHeldOutRows` |
-| 7 | Threshold calibrated on validation, applied to test | `calibrate_threshold`; `TestThresholdCalibration` |
-| 8 | VAE uses KL annealing + early stopping | `TestKLAnnealingAndEarlyStopping` |
-| 9 | VAE validation is temporal, not shuffled | `TestTemporalValidation` |
-| 10 | No zero-variance column can silently explode | `_warn_on_extreme_magnitudes`; `TestCyclicalFeaturesBypassScaling` |
-| 11 | Deliverable is top-N distinct individuals, parameterisable | `export_oot_top_anomalies`; `TestTopNExport` |
+| 1 | Train/val/test split is strictly chronological | `chronological_split` |
+| 2 | Contrast features (`diff{h}`, `ratio{h}`) fight the smoothing | `_DEFAULT_LAG_HORIZONS` |
+| 3 | Scalers/encoders `.fit()` on train only, `.transform()` elsewhere | `fit_transform_panel(fit_mask=...)` |
+| 4 | Panel features still computed over the full panel (no zeroed lags) | `PanelFeatureEngineer` runs before the train-only `ColumnTransformer` fit, not after |
+| 5 | Optuna uses a static temporal split, never random K-fold | `tune_*(valid_mask=...)` |
+| 6 | Objective is scored on held-out rows, never in-sample | `_blocked_split` (IF) / temporal `val_fraction` split (VAE) |
+| 7 | Threshold calibrated on validation, applied to test | `calibrate_threshold` |
+| 8 | VAE uses KL annealing + early stopping | `kl_anneal_epochs`, `early_stopping_patience` |
+| 9 | VAE validation is temporal, not shuffled | `valid_mask` passed from `main.py`, both tuned and untuned paths |
+| 10 | No zero-variance column can silently explode | `_warn_on_extreme_magnitudes` |
+| 11 | Deliverable is distinct individuals, parameterisable | `export_oot_top_anomalies` (percentile default; `--top-n` for a fixed headcount) |

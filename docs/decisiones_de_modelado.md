@@ -168,8 +168,9 @@ mayoría de los trials para la fase guiada —que es la razón de usar TPE. **En
 presupuestos de 30+ el valor sigue siendo 10**, así que las corridas `--full`
 que ya funcionaban no cambian de comportamiento.
 
-*Pruebas:* `tests/test_tuning_budget.py` (18 casos), incluida la garantía de
-que ningún preset gasta el presupuesto entero explorando.
+Verificado en su momento con 18 casos de prueba (suite eliminada 2026-08-22,
+ver `CHANGELOG.md`), incluida la garantía de que ningún preset gasta el
+presupuesto entero explorando.
 
 ---
 
@@ -444,9 +445,10 @@ imputación cero es la combinación a evitar.
 ### 5.2 Entregable OOT: percentil con banda, período incluido
 
 `export_oot_top_anomalies` cambia su selección por defecto de "top 50 fijo" a
-**todo individuo en o por encima de P95** del bloque OOT, con una columna
-`percentil` (`p95`/`p97`/`p99`) que clasifica cada fila por la banda más alta
-que alcanza.
+**todo individuo en o por encima de P90** del bloque OOT, con una columna
+`percentil` (`p90`/`p95`/`p99`) que clasifica cada fila por la banda más alta
+que alcanza. (El corte por defecto pasó por P95 antes de fijarse en P90 — ver
+`CHANGELOG.md` 2026-08-23.)
 
 **Por qué percentil y no headcount fijo, por defecto.** Un top-N fijo no tiene
 significado distribucional: "50" es 2.5% de un portafolio de 2,000 y 0.05% de

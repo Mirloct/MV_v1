@@ -149,13 +149,13 @@ of 2026-08-19 against installed `torch==2.9.1+cpu` (this machine has no CUDA;
 
 | Parameter | Default | Meaning | Alternatives and what they change | Trade-off |
 | --- | --- | --- | --- | --- |
-| `latent_dim` | `8` | Width of the bottleneck `z`. | Any positive int. Optuna search space: `[2, 32]`. | Too small under-fits structure the reconstruction needs (everything reconstructs poorly, including normal rows, which compresses the anomaly/normal score gap); too large lets the decoder memorize idiosyncrasies of individual normal rows, which can make genuinely anomalous rows reconstruct *too* well. No closed-form optimum — this is why it is searched, not fixed. |
+| `latent_dim` | `8` | Width of the bottleneck `z`. | Any positive int. Optuna search space: `[4, 32]` (`src/models/vae.py:1297`). | Too small under-fits structure the reconstruction needs (everything reconstructs poorly, including normal rows, which compresses the anomaly/normal score gap); too large lets the decoder memorize idiosyncrasies of individual normal rows, which can make genuinely anomalous rows reconstruct *too* well. No closed-form optimum — this is why it is searched, not fixed. |
 | `hidden_dim` / `hidden_dims` | `64` / `None` (falls back to `[hidden_dim] * n_layers`) | Width of each encoder/decoder hidden layer. `hidden_dims` overrides with an explicit per-layer list (e.g. a funnel `[128, 64]`). | `hidden_dim`: any positive int, Optuna categorical `{32, 64, 128}`. `hidden_dims`: any list of positive ints (its length then sets the effective `n_layers`). | Wider layers add capacity and compute cost together; a funnel shape (`hidden_dims`) is a specific inductive bias (progressive compression) this project's tuning does not currently search — `n_layers`/`hidden_dim` cover the uniform-width case only. |
 | `n_layers` | `2` | Number of encoder blocks (decoder mirrors it). | Int in `[1, 3]` (Optuna search space); more is possible but untested here. | More layers increase representational capacity and training cost together, and add vanishing/exploding-gradient risk on this small an MLP without normalization layers (`BatchNorm` is **not** used in this implementation — see below). |
-| `dropout` | `0.0` | Dropout probability after each hidden activation. | Float in `[0, 0.5]` (Optuna search space includes `0.0`, i.e. off). | `0.0` means no regularization from dropout at all — a deliberate default given the project's own measured finding (`CONTEXT.md`, "conflict: the two models want opposite numeric transforms") that this VAE is already fragile to input scale; adding stochastic dropout on top of a tuning search already exploring architecture width was judged more likely to add noise to the tuning objective than to help. Non-zero values are still searched because the tuned config may disagree. |
-| `beta` | `1.0` | Weight on the KL term: `loss = recon + beta * KL`. `beta=1` is a vanilla VAE (proper ELBO); `beta != 1` is a beta-VAE. | Float in `[0.1, 4.0]` (Optuna search space). | `beta > 1` pushes the latent posterior harder toward the prior `N(0, I)` — more disentangled/regularized latents, usually *worse* reconstruction (and thus a compressed anomaly score range). `beta < 1` favors reconstruction fidelity, risking a less-regularized latent space. `CONTEXT.md` records the search space was later narrowed to `beta <= 2.0` after measurement showed larger values degraded detection quality on this data. |
+| `dropout` | `0.0` | Dropout probability after each hidden activation. | Float in `[0.1, 0.4]` (Optuna search space, `src/models/vae.py:1307` — the fit-time default stays `0.0`, but the tuner never actually explores `0.0`). | `0.0` (the untuned default) means no regularization from dropout at all — a deliberate choice given the project's own measured finding (`CONTEXT.md` "Leakage-free pipeline", numeric-transform conflict) that this VAE is already fragile to input scale. The tuned search space floors at `0.1` rather than including `0.0`, so a tuning run always explores some dropout. |
+| `beta` | `1.0` | Weight on the KL term: `loss = recon + beta * KL`. `beta=1` is a vanilla VAE (proper ELBO); `beta != 1` is a beta-VAE. | Float in `[0.1, 2.0]` (Optuna search space, `src/models/vae.py:1303`). | `beta > 1` pushes the latent posterior harder toward the prior `N(0, I)` — more disentangled/regularized latents, usually *worse* reconstruction (and thus a compressed anomaly score range). `beta < 1` favors reconstruction fidelity, risking a less-regularized latent space. The range was narrowed from an earlier `[0.1, 4.0]` after measurement showed larger values degraded detection quality on this data (`CHANGELOG.md` 2026-08-01) — narrower still than that measurement suggests useful now, since the 2026-08-22 loss-scaling fix changes what a given `beta` does (see `CONTEXT.md` "Known open problems"). |
 | `score_kl_weight` | `0.0` | How much of the per-row KL term (not the loss's `beta`-weighted KL, the raw per-row KL) is blended into the **anomaly score** itself (`score = recon_err + score_kl_weight * KL`). | Any float `>= 0`. Not currently searched by `tune_vae`. | `0.0` (the default and what every measured number in `CONTEXT.md` uses) means the score is *pure* reconstruction error — the project's documented convention ("VAE score is the per-row MSE reconstruction error") depends on this staying `0.0`; changing it changes what the number in every OOT Excel export actually means and would invalidate direct comparison against past measurements. |
-| `lr` | `1e-3` | Adam-family learning rate. | Float, log-scale search `[1e-4, 1e-2]` (Optuna). | Standard exploration/stability trade-off; log-scale search reflects that the right order of magnitude matters more than the exact value. |
+| `lr` | `1e-3` | Adam-family learning rate. | Float, log-scale search `[1e-4, 1e-3]` (Optuna, `src/models/vae.py:1298`). | Standard exploration/stability trade-off; log-scale search reflects that the right order of magnitude matters more than the exact value. |
 | `optimizer` | `"adam"` | Which `torch.optim` optimizer builds the update rule. | `{"adam", "adamw", "rmsprop"}` (`_OPTIMIZERS`, `src/models/vae.py:112`) — anything else raises `ValueError` at construction. Optuna searches all three. | `adamw` decouples weight decay from the gradient update (matters only when `weight_decay > 0`); `rmsprop` has no bias-correction term and can behave differently early in training. No single choice dominates across trials in this project's own tuning history — hence all three stay in the search space. |
 | `weight_decay` | `0.0` | L2 penalty coefficient passed to the optimizer. | Any float `>= 0`. Not currently searched. | `0.0` means no explicit weight decay; the project instead regularizes primarily through `beta` (KL) and early stopping. Left available for a future ablation, not yet run. |
 | `batch_size` | `256` | Rows per gradient step. | `{128, 256, 512}` (Optuna categorical). | Larger batches give smoother gradient estimates and better hardware utilization but fewer updates per epoch; on a CPU-only build (confirmed above) the practical ceiling is RAM, not a GPU. |
@@ -173,15 +173,21 @@ without normalization layers, deeper stacks are more exposed to internal
 covariate shift, which is part of why `n_layers` tops out at 3 in the search
 space rather than going deeper.
 
-**Sensitivity analysis actually run vs. still open.** `tests/test_vae.py`
-covers: finite loss/gradients under both default and edge-case configs, KL
+**Sensitivity analysis actually run vs. still open.** Covered at the time:
+finite loss/gradients under both default and edge-case configs, KL
 annealing reaching its configured `beta` on schedule, early-stopping firing
-and restoring best weights, and checkpoint resume correctness. `CONTEXT.md`
-records one real sensitivity finding — the `beta`/numeric-transform conflict
-between the two detectors (§"Measured conflict: the two models want opposite
-numeric transforms"). **Not yet measured**: an isolated `latent_dim` sweep or
-a `dropout`-on-vs-off ablation at fixed everything-else; both remain
-Optuna-searched rather than independently characterized.
+and restoring best weights, and checkpoint resume correctness. `CHANGELOG.md`
+(2026-08-01) records one real sensitivity finding — the `beta`/numeric-transform
+conflict between the two detectors. **Not yet measured**: an isolated
+`latent_dim` sweep or a `dropout`-on-vs-off ablation at fixed
+everything-else; both remain Optuna-searched rather than independently
+characterized.
+
+**Note on the loss scaling this table describes.** The `beta` behaviour
+above (and the `CONTEXT.md`/`CHANGELOG.md` numeric-transform conflict it
+references) predates a 2026-08-22 fix to `vae_loss`'s reduction, which
+changed what a given `beta` value actually does — see `CONTEXT.md` "Known
+open problems" before reusing any `beta` conclusion drawn before that date.
 
 ---
 
@@ -257,12 +263,12 @@ so the best-so-far config is always durable on disk.
 
 ### Search space
 
-- `latent_dim` — int in `[2, 32]`
-- `lr` — float in `[1e-4, 1e-2]` (log scale)
+- `latent_dim` — int in `[4, 32]`
+- `lr` — float in `[1e-4, 1e-3]` (log scale)
 - `optimizer` — `{"adam", "adamw", "rmsprop"}`
 - `batch_size` — `{128, 256, 512}`
-- `beta` — float in `[0.1, 4.0]`
-- `dropout` — float in `[0.0, 0.5]`
+- `beta` — float in `[0.1, 2.0]`
+- `dropout` — float in `[0.1, 0.4]`
 - `n_layers` — int in `[1, 3]`
 - `hidden_dim` — `{32, 64, 128}`
 - `epochs` — int in `[1, max_epochs]` (small budget for tuning speed)

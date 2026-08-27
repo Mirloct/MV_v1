@@ -33,6 +33,7 @@ OUTPUT_PATH = PROJECT_ROOT / "docs" / "documentation.html"
 DOCS: list[tuple[str, str, str]] = [
     ("README.md", "readme", "README.md"),
     ("CONTEXT.md", "context", "CONTEXT.md"),
+    ("CHANGELOG.md", "changelog", "CHANGELOG.md"),
     ("docs/leakage_free_pipeline.md", "leakage-free-pipeline",
      "docs/leakage_free_pipeline.md"),
     ("docs/escalamiento_lineal.md", "escalamiento-lineal",

@@ -26,6 +26,7 @@ isolated with shorter average path lengths); no verbatim copy.
 from __future__ import annotations
 
 import os
+import time
 import warnings
 
 import numpy as np
@@ -37,6 +38,23 @@ from src.utils.logging_config import log_phase, setup_logging
 __all__ = ["shap_summary_iforest", "path_length_analysis"]
 
 _DEFAULT_FIG_DIR = paths.FIGURES_DIR
+
+# Both SHAP fallback paths (model-agnostic Explainer, permutation importance)
+# call `detector.score_samples` many times -- once per (row x ~2*n_features)
+# evaluation for the former, once per (feature x repeat) for the latter -- so
+# their wall-clock cost scales with the number of *features*, not just rows.
+# Measured on this project's synthetic panel: at 180 features the
+# model-agnostic path costs ~4.8s per explained row (~2.7 hours for the 2000
+# rows `shap_summary_iforest` explains by default), which is exactly the
+# "the process hangs / seems to crash during interpretability" failure a
+# feature-rich real dataset (150-200 columns) triggers, since the 22-67
+# feature synthetic panel this project was developed against never spent
+# enough time in either fallback to notice. Both fallbacks are therefore kept
+# time/call-budgeted below instead of running unbounded.
+_MODEL_AGNOSTIC_TIME_BUDGET_S = 60.0
+_MODEL_AGNOSTIC_CALIBRATION_ROWS = 2
+_PERM_IMPORTANCE_MAX_SAMPLES = 1000
+_PERM_IMPORTANCE_CALL_BUDGET = 150  # total score_samples() calls across (features x repeats)
 
 
 def _densify(X) -> np.ndarray:
@@ -99,30 +117,57 @@ def _save_bar_plot(names, importances, out_path, title, xlabel, top_n=30):
     plt.close(fig)
 
 
-def _permutation_importance(detector, X, random_state=42, n_repeats=3):
+def _permutation_importance(
+    detector,
+    X,
+    random_state=42,
+    n_repeats=3,
+    max_samples=_PERM_IMPORTANCE_MAX_SAMPLES,
+    call_budget=_PERM_IMPORTANCE_CALL_BUDGET,
+):
     """Manual permutation importance on ``score_samples``.
 
     For each feature, its column is randomly permuted and the mean absolute
     change in the (higher=more-anomalous) anomaly score is recorded, averaged
     over ``n_repeats`` shuffles. This is label-free and only reads how much each
     feature drives the anomaly score.
+
+    Cost is ``d * n_repeats`` calls to ``score_samples`` over ``n`` rows, which
+    scales with the feature count -- at ~150-200 features and hundreds of
+    trees this can reach minutes even though it looked instant on a
+    dozen-feature panel. Bounded two ways: rows are subsampled to
+    ``max_samples`` (this fallback needs far fewer rows than the SHAP paths
+    for a stable ranking), and ``n_repeats`` is reduced so total calls never
+    exceed ``call_budget``.
     """
     from tqdm.auto import tqdm
 
+    log = setup_logging()
+    X, _ = _subsample(X, max_samples, random_state)
     rng = np.random.default_rng(random_state)
-    base = detector.score_samples(X)
     n, d = X.shape
+
+    n_repeats_eff = max(1, min(n_repeats, call_budget // max(d, 1)))
+    if n_repeats_eff < n_repeats:
+        log.info(
+            "permutation_importance: %d features x %d requested repeat(s) would "
+            "cost %d score_samples() calls over %d row(s); capping to %d "
+            "repeat(s) (%d calls total) to keep this bounded.",
+            d, n_repeats, d * n_repeats, n, n_repeats_eff, d * n_repeats_eff,
+        )
+
+    base = detector.score_samples(X)
     imp = np.zeros(d, dtype=np.float64)
     for j in tqdm(range(d), desc="permutation_importance", unit="feature"):
         acc = 0.0
         col = X[:, j].copy()
-        for _ in range(n_repeats):
+        for _ in range(n_repeats_eff):
             perm = rng.permutation(n)
             X[:, j] = col[perm]
             shuffled = detector.score_samples(X)
             acc += float(np.mean(np.abs(shuffled - base)))
         X[:, j] = col  # restore
-        imp[j] = acc / max(n_repeats, 1)
+        imp[j] = acc / max(n_repeats_eff, 1)
     return imp
 
 
@@ -222,22 +267,62 @@ def shap_summary_iforest(
                 masker = shap.maskers.Independent(background)
                 explainer = shap.Explainer(_score_fn, masker)
                 # This path calls `_score_fn` (which re-scores the whole
-                # forest) many times per explained row and has no built-in
-                # progress log of its own -- on a few thousand rows this can
-                # run for minutes with nothing printed, which reads as a
-                # hang. TreeExplainer (path 1, tried first) normally avoids
-                # this path entirely; log explicitly for when it doesn't.
+                # forest) roughly `2 * n_features + 1` times *per explained
+                # row*, so its cost scales with the feature count, not just
+                # the row count -- measured at ~4.8s/row for 180 features,
+                # i.e. ~2.7 hours to explain 2000 rows unbounded. That is the
+                # "the pipeline hangs/crashes during interpretability" failure
+                # on a feature-rich real dataset; it never showed up on this
+                # project's ~20-70 feature synthetic panel. Rather than guess
+                # a static feature-count cutoff (which would not generalize
+                # across hardware/tree size), time a couple of rows and
+                # extrapolate how many fit in a fixed wall-clock budget.
                 log.info(
                     "shap.TreeExplainer unavailable -- falling back to the "
-                    "model-agnostic Explainer over %d row(s) x %d feature(s); "
-                    "this path re-scores the forest many times per row and can "
-                    "take minutes with no further log output until it finishes.",
-                    Xd.shape[0], Xd.shape[1],
+                    "model-agnostic Explainer over up to %d row(s) x %d "
+                    "feature(s); calibrating on %d row(s) first to bound this "
+                    "to a ~%.0fs budget instead of running unbounded.",
+                    Xd.shape[0], Xd.shape[1], min(_MODEL_AGNOSTIC_CALIBRATION_ROWS, Xd.shape[0]),
+                    _MODEL_AGNOSTIC_TIME_BUDGET_S,
                 )
-                explanation = explainer(Xd)
+                calib_n = min(_MODEL_AGNOSTIC_CALIBRATION_ROWS, Xd.shape[0])
+                t0 = time.monotonic()
+                explanation = explainer(Xd[:calib_n])
+                calib_dt = time.monotonic() - t0
+                per_row = calib_dt / max(calib_n, 1)
+                if per_row > 0:
+                    extra_rows = max(
+                        0, int((_MODEL_AGNOSTIC_TIME_BUDGET_S - calib_dt) / per_row)
+                    )
+                else:
+                    extra_rows = Xd.shape[0] - calib_n
+                n_explain = min(Xd.shape[0], calib_n + extra_rows)
+                if n_explain > calib_n:
+                    log.info(
+                        "Model-agnostic SHAP calibration: %.2fs for %d row(s) "
+                        "(~%.2fs/row) at %d feature(s); explaining %d of %d "
+                        "row(s) to stay near the %.0fs budget.",
+                        calib_dt, calib_n, per_row, Xd.shape[1], n_explain,
+                        Xd.shape[0], _MODEL_AGNOSTIC_TIME_BUDGET_S,
+                    )
+                    explanation = explainer(Xd[:n_explain])
+                elif Xd.shape[0] > calib_n:
+                    log.warning(
+                        "Model-agnostic SHAP is too slow at %d feature(s) "
+                        "(~%.2fs/row, projected %.0fs for all %d rows); keeping "
+                        "only the %d calibration row(s) explained instead of "
+                        "running unbounded.",
+                        Xd.shape[1], per_row, per_row * Xd.shape[0], Xd.shape[0],
+                        calib_n,
+                    )
                 shap_values = np.asarray(explanation.values, dtype=np.float64)
                 if shap_values.ndim == 3:
                     shap_values = shap_values[..., 0]
+                if shap_values.shape[0] != Xd.shape[0]:
+                    # The budget above may have explained fewer rows than
+                    # Xd holds; keep the beeswarm plot's feature matrix
+                    # row-aligned with the values actually computed.
+                    Xd = Xd[:shap_values.shape[0]]
                 used_path = "shap.Explainer(score_samples)"
             except Exception as exc:  # noqa: BLE001
                 log.warning(

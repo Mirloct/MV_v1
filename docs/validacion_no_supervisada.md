@@ -110,7 +110,7 @@ La especificación original propone un paquete `validation/`. El proyecto usa
 | `validation/leave_one_period_out.py` | **[PROPUESTO]** |
 | `validation/excess_mass.py` | **[PROPUESTO]** |
 | `validation/mass_volume.py` | **[PROPUESTO]** |
-| `validation/vae_validation.py` | **[PARCIAL]** `src/interpretability/vae_explain.py` (espacio latente, error por feature); sin active units |
+| `validation/vae_validation.py` | **[PARCIAL]** `src/interpretability/vae_explain.py` (espacio latente, error por feature) + `VAEDetector.latent_diagnostics`/`collapse_verdict` (active units, §17) |
 
 **Recomendación**: no crear un paquete `validation/` paralelo. Extender
 `src/evaluation/` mantiene una sola ubicación para "cómo se juzga un detector"
@@ -385,7 +385,7 @@ así que las contribuciones son comparables entre variables. Si se cambiara a
 
 ---
 
-## 17. Posterior collapse — [PROPUESTO]
+## 17. Posterior collapse — [IMPLEMENTADO] (2026-08-22)
 
 Métrica de referencia (Burda et al., 2016):
 
@@ -401,10 +401,14 @@ distribución de KL, `Var(mu)`.
 > evidencia conjunta: KL≈0 en múltiples dimensiones, pocas dimensiones activas
 > (Aⱼ < δ), baja variabilidad de las representaciones, y posterior ≈ prior.
 
-**Por qué importa aquí**: el espacio de búsqueda incluye `beta` ∈ [0.1, 2.0].
-Un β alto empuja hacia el colapso, y hoy **nada en el pipeline lo detecta** —
-un VAE colapsado seguiría produciendo puntajes y un `best_params.yaml`
-poblado. Es el hueco de validación más relevante de esta lista.
+**Implementado**: `VAEDetector.latent_diagnostics` (`src/models/vae.py`)
+calcula exactamente esta métrica con el mismo umbral δ=0.01, y
+`collapse_verdict` aplica la regla de evidencia conjunta de arriba (nunca solo
+KL baja). `main.py` Fase 7 corre el gate justo después de cada ajuste del VAE
+y lo registra como health check. Esto era, hasta su implementación, el hueco
+de validación más relevante de esta lista — encontró un colapso real en toda
+corrida existente del proyecto (ver `docs/diagnostico_del_proyecto.md` A-1/A-3
+y `CONTEXT.md` "Known open problems").
 
 ---
 
@@ -641,11 +645,12 @@ con estado `VALID` / `WARNING` / `INVALID` / `NOT APPLICABLE`.
 
 Si se implementa parte de este marco, el orden por relación valor/esfuerzo:
 
-1. **§17 Posterior collapse** — el hueco más serio: hoy un VAE colapsado pasa
-   inadvertido y produce puntajes plausibles. Barato de calcular.
-2. **§6 Estabilidad ante semillas (IF)** — el más citado y el más simple; solo
+1. **§6 Estabilidad ante semillas (IF)** — el más citado y el más simple; solo
    requiere repetir el ajuste variando la semilla.
-3. **§8 Curva de umbral completa** — extiende algo que ya existe.
-4. **§15 Gap de reconstrucción** — dos líneas sobre datos ya calculados.
-5. **§9 EM/MV** — el más valioso metodológicamente y el más caro; requiere
+2. **§8 Curva de umbral completa** — extiende algo que ya existe.
+3. **§15 Gap de reconstrucción** — dos líneas sobre datos ya calculados.
+4. **§9 EM/MV** — el más valioso metodológicamente y el más caro; requiere
    resolver antes la cuestión del muestreo con one-hot.
+
+(§17 Posterior collapse encabezaba esta lista y ya no aparece: se implementó
+el 2026-08-22 — ver arriba.)

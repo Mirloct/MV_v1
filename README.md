@@ -406,18 +406,17 @@ vez al final.
 **Entregable principal — la cola priorizada por riesgo.** Cada detector escribe
 
 ```
-artifacts/reports/oot_p95_iforest.xlsx
-artifacts/reports/oot_p95_vae.xlsx
+artifacts/reports/oot_p90_iforest.xlsx
+artifacts/reports/oot_p90_vae.xlsx
 ```
 
-por defecto, **todo individuo en o por encima del percentil 95** del puntaje
-en los meses de prueba, con formato **ID – PERÍODO – SCORE – PERCENTIL –
-VARIABLES** y una columna `alert` que marca las filas sobre el umbral
-calibrado. La columna `período` lleva el mes exacto en que la entidad fue
-alertada (el nombre real de esa columna es el que tenga tu panel, p. ej.
-`codmes`). `percentil` clasifica cada fila en `p95`/`p97`/`p99` — la banda más
-alta que alcanza — calculado sobre la población completa del bloque OOT, no
-sobre la selección exportada.
+por defecto, **todo individuo en o por encima del percentil 90** del puntaje
+en el bloque OOT, con formato **ID – PERÍODO – SCORE – BANDA – VARIABLES** y
+una columna `alert` que marca las filas sobre el umbral calibrado. La columna
+`período` lleva el mes exacto en que la entidad fue alertada (el nombre real
+de esa columna es el que tenga tu panel, p. ej. `codmes`). La banda clasifica
+cada fila en `p90`/`p95`/`p99` — la más alta que alcanza — calculado sobre la
+población completa del bloque OOT, no sobre la selección exportada.
 
 Un percentil escala con el tamaño del portafolio en vez de fijar un número; para
 una cola de tamaño fijo usa `--top-n 50` (o cualquier N), que vuelve al
@@ -470,5 +469,7 @@ Modelo-v0.1/
   consolidada en una página offline navegable. Regenerar con
   `python docs/build_docs.py` tras editar cualquier `.md`; **nunca editarla a
   mano**, es un archivo derivado.
-- `CONTEXT.md` — memoria del proyecto: contratos de datos, decisiones tomadas con
-  su justificación, resultados medidos y problemas abiertos.
+- `CONTEXT.md` — memoria del proyecto: arquitectura y contratos **vigentes**
+  (datos, preprocesamiento, defaults) que hay que conocer antes de tocar código.
+- `CHANGELOG.md` — el histórico fechado detrás de esas decisiones: mediciones,
+  hallazgos y su corrección, en el orden en que ocurrieron.

@@ -379,15 +379,23 @@ arrangement (both models export their own Excel).
   no child process left behind afterward; the exact reconstructed
   200,000-row/`max_samples=0.5` scenario above still completes in ~113s
   through the isolated path.
-- **Interpretability has fine-grained health checkpoints for exactly this
-  failure mode.** Both `iforest_explain.py` and `vae_explain.py` define a
-  module-local `_checkpoint(name, **observed)` that records an always-passing
-  `observability.check("interpretability.iforest_shap.<name>" / "...vae_
-  explain.<name>", ...)` at every meaningful sub-step (calibration started/
-  measured, full explain started/done, a `*_hard_killed` name when the
-  ceiling above actually fires, beeswarm render started/done, UMAP
-  started/done, permutation-importance progress every ~25% of features,
-  etc.) — appended to `artifacts/logs/run_events.jsonl` and mirrored live to
+- **Every part of interpretability that runs leaves a checkpoint trace —
+  not just the SHAP paths.** All three interpretability modules
+  (`iforest_explain.py`, `vae_explain.py`, `attribution_export.py`) define a
+  module-local `_checkpoint(name, **observed)` recording an always-passing
+  `observability.check(...)` under its own namespace —
+  `interpretability.iforest.<name>` (covers **both** `shap_summary_iforest`
+  *and* `path_length_analysis`, since both live in `iforest_explain.py`),
+  `interpretability.vae_explain.<name>`, and
+  `interpretability.attribution_export.<name>` (Phase 10b, the per-model
+  Excel-sheet writer that runs right after Phase 10 and right before the
+  report — `started` → one `sheet_written` per model → `completed`). Every
+  meaningful sub-step gets one: calibration started/measured, full explain
+  started/done, a `*_hard_killed` name when the ceiling above actually
+  fires, beeswarm render started/done, UMAP started/done, permutation-
+  importance progress every ~25% of features, path-length analysis started/
+  completed, VAE encode/UMAP/batch-loop steps, attribution-workbook sheet
+  writes — appended to `artifacts/logs/run_events.jsonl` and mirrored live to
   the console dashboard's "Supuestos (IF/VAE)" panel via the existing
   `observability.add_check_observer` hook (no changes needed there). The
   point is diagnosing a stall after the fact or live: whichever checkpoint

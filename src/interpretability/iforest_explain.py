@@ -44,24 +44,29 @@ _DEFAULT_FIG_DIR = paths.FIGURES_DIR
 def _checkpoint(name: str, **observed) -> None:
     """Record a lightweight, always-passing progress checkpoint.
 
+    Shared by every function in this module (`shap_summary_iforest` and
+    `path_length_analysis`) so every part of Isolation Forest interpretability
+    that actually runs leaves a trace, not just the SHAP paths.
+
     Purely diagnostic -- these never fail a run (this module already has its
     own try/except-per-path recovery in `main.py`'s caller). The point is
     what happens when the *process itself* stalls or is killed: the health
     checks in `artifacts/logs/run_events.jsonl` (and the console dashboard's
     live "Supuestos" panel, which shows every `observability.check(...)`
     project-wide) are append-only and flushed per call, so whichever
-    `interpretability.iforest_shap.*` name is *last* in the log is exactly
-    the step that was in flight when things stopped -- e.g. a "...
-    _calibration_started" with no matching "..._calibrated" after it means
-    the calibration call itself (not the bounded, budgeted continuation) is
-    what is hanging.
+    `interpretability.iforest.*` name is *last* in the log is exactly the
+    step that was in flight when things stopped -- e.g. a "..._calibration_
+    started" with no matching "..._calibrated" after it means the calibration
+    call itself (not the bounded, budgeted continuation) is what is hanging.
     """
     observability.check(
-        name=f"interpretability.iforest_shap.{name}",
+        name=f"interpretability.iforest.{name}",
         category="validation",
-        definition="Progress checkpoint inside shap_summary_iforest -- always "
-                    "passes; its presence (or absence) in the health-check "
-                    "log is the diagnostic, not a pass/fail verdict.",
+        definition="Progress checkpoint inside Isolation Forest "
+                    "interpretability (shap_summary_iforest / "
+                    "path_length_analysis) -- always passes; its presence "
+                    "(or absence) in the health-check log is the diagnostic, "
+                    "not a pass/fail verdict.",
         expected="reached without hanging",
         severity="info",
         passed=True,
@@ -598,6 +603,9 @@ def shap_summary_iforest(
                 if result["stage"] == "error":
                     raise RuntimeError(result["error"])
 
+                n_explain = result["n_explain"]
+                log.info("Model-agnostic shap.Explainer finished.")
+                _checkpoint("model_agnostic_done", rows_explained=int(min(n_explain, Xd.shape[0])))
                 shap_values = np.asarray(result["values"], dtype=np.float64)
                 if shap_values.ndim == 3:
                     shap_values = shap_values[..., 0]
@@ -726,6 +734,7 @@ def path_length_analysis(
     with log_phase("interpretability.path_length_iforest", log):
         Xd = _densify(X)
         Xd, _ = _subsample(Xd, max_samples, random_state)
+        _checkpoint("path_length_started", n_rows=int(Xd.shape[0]))
         scores = np.asarray(detector.score_samples(Xd), dtype=np.float64).ravel()
 
         # s = 2 ** (-nd)  ->  nd = -log2(s). Guard against non-positive scores.
@@ -784,4 +793,5 @@ def path_length_analysis(
             "Path-length analysis saved to %s (corr(score, path_len)=%.4f).",
             out_path, corr,
         )
+        _checkpoint("path_length_completed", n_rows=int(scores.size))
         return summary

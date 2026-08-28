@@ -1091,3 +1091,52 @@ believed sufficient -- `Process.kill()` sends `SIGKILL`-equivalent
 termination, which the OS itself, not this process, enforces -- but it is
 stated rather than assumed given how wrong the "path 1 never needs this"
 assumption from 2026-08-26 turned out to be.
+
+---
+
+## 2026-08-28 (same day, later still) — checkpoint coverage audit: 3 gaps found and closed
+
+**Trigger.** The user reported the anomaly report *does* get generated,
+which is real evidence: if Phase 11 (report) runs, Phase 10 (interpretability)
+did not hang forever on this particular run -- it more likely raised/failed
+through the fallback chain (already caught by `main.py`'s per-call
+try/except) rather than blocking indefinitely. That distinction matters for
+diagnosis, and the checkpoint system added earlier the same day was not
+actually complete enough to tell the two apart everywhere interpretability
+runs -- it only covered `shap_summary_iforest`.
+
+**Audit, three gaps found and closed:**
+
+1. **`shap_summary_iforest` path 2 (model-agnostic Explainer) was missing a
+   `_done` checkpoint** — path 1 (`tree_explainer_done`) had one right after
+   a successful result, path 2 did not. Added `model_agnostic_done`,
+   mirroring path 1 exactly.
+2. **`path_length_analysis` had zero checkpoints** — it was judged low-risk
+   (no SHAP, a closed-form calculation, historically sub-second) when the
+   original checkpoint pass was scoped to the SHAP paths specifically. Added
+   `path_length_started` / `path_length_completed`.
+3. **`attribution_export.py::export_attribution_workbook` (Phase 10b — the
+   per-model Excel-sheet writer that runs between Phase 10 and the report in
+   Phase 11) had zero checkpoints at all**, since it is a separate module the
+   original pass never touched. Added `started` (records which models are
+   present), one `sheet_written` per model, and `completed`. This is
+   directly relevant to the trigger above: Phase 10b sits *between*
+   interpretability and the report the user confirmed runs, so if something
+   in the pipeline were silently slow or degraded there rather than in
+   Phase 10 proper, there was previously no way to tell from the checkpoint
+   log alone.
+
+**Also renamed the shared Isolation Forest checkpoint namespace** from
+`interpretability.iforest_shap.*` to `interpretability.iforest.*`, since it
+is used by both `shap_summary_iforest` *and* (now) `path_length_analysis` --
+the old name implied SHAP-only coverage that was never quite accurate and
+is now actively wrong.
+
+**Verified with a full `python main.py --quick --no-tune` run:** 22
+interpretability checkpoints recorded across all three modules (10 from
+`iforest_explain.py`, 8 from `vae_explain.py`, 4 from
+`attribution_export.py`), 39/39 total health checks passed, `run_ended
+status=success`. Every function in all three interpretability modules that
+`main.py` calls now has at least a `started`/`completed` pair, so a stall
+anywhere in Phase 10 or 10b -- not just inside the SHAP paths -- is now
+diagnosable from `run_events.jsonl` alone.

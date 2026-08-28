@@ -18,12 +18,29 @@ from typing import Optional
 
 import pandas as pd
 
-from src.utils import paths
+from src.utils import observability, paths
 from src.utils.logging_config import log_phase, setup_logging
 
 __all__ = ["export_attribution_workbook"]
 
 _DEFAULT_OUT = os.path.join(paths.REPORTS_DIR, "feature_attribution.xlsx")
+
+
+def _checkpoint(name: str, **observed) -> None:
+    """Always-passing progress checkpoint -- see the twin helpers in
+    `iforest_explain.py` / `vae_explain.py` for why (diagnosing *where* a
+    stall happened from the last-recorded name in `run_events.jsonl`)."""
+    observability.check(
+        name=f"interpretability.attribution_export.{name}",
+        category="validation",
+        definition="Progress checkpoint inside export_attribution_workbook "
+                    "-- always passes; its presence (or absence) in the "
+                    "health-check log is the diagnostic.",
+        expected="reached without hanging",
+        severity="info",
+        passed=True,
+        observed=observed,
+    )
 
 #: Sheet name, column header for the value, and a one-line description of
 #: what the number means -- written as a small header block on each sheet so
@@ -67,6 +84,7 @@ def export_attribution_workbook(
     """
     log = setup_logging()
     with log_phase("interpretability.export_attribution_workbook", log):
+        _checkpoint("started", models=list(per_model.keys()))
         sheets_written = []
         parent = os.path.dirname(os.path.abspath(out_path))
         if parent:
@@ -101,6 +119,7 @@ def export_attribution_workbook(
                 if description:
                     writer.sheets[sheet_name]["A1"] = description
                 sheets_written.append((sheet_name, len(df)))
+                _checkpoint("sheet_written", model=sheet_name, n_variables=len(df))
 
         if not sheets_written:
             log.warning(
@@ -109,6 +128,7 @@ def export_attribution_workbook(
             )
             if os.path.exists(out_path):
                 os.remove(out_path)  # ExcelWriter creates the file eagerly
+            _checkpoint("completed", sheets_written=0)
             return None
 
         log.info(
@@ -116,4 +136,5 @@ def export_attribution_workbook(
             out_path,
             ", ".join(f"{name}: {n} variables" for name, n in sheets_written),
         )
+        _checkpoint("completed", sheets_written=len(sheets_written))
         return os.path.abspath(out_path)

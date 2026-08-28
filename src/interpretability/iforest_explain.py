@@ -48,9 +48,10 @@ _DEFAULT_FIG_DIR = paths.FIGURES_DIR
 def _checkpoint(name: str, **observed) -> None:
     """Record a lightweight, always-passing progress checkpoint.
 
-    Shared by every function in this module (`shap_summary_iforest` and
-    `path_length_analysis`) so every part of Isolation Forest interpretability
-    that actually runs leaves a trace, not just the SHAP paths.
+    Shared by every function in this module (`shap_summary_iforest`,
+    `path_length_analysis`, and `explain_rows_iforest`) so every part of
+    Isolation Forest interpretability that actually runs leaves a trace, not
+    just the SHAP paths.
 
     Purely diagnostic -- these never fail a run (this module already has its
     own try/except-per-path recovery in `main.py`'s caller). The point is
@@ -852,9 +853,12 @@ def explain_rows_iforest(
     if n_rows_requested == 0:
         return []
 
+    _checkpoint("explain_rows_started", n_rows=n_rows_requested)
+
     model = getattr(detector, "model_", None)
     if model is None:
         log.warning("explain_rows_iforest: detector has no fitted model_; skipping.")
+        _checkpoint("explain_rows_completed", n_explained=0, n_requested=n_rows_requested)
         return [None] * n_rows_requested
 
     Xd = _densify(X)
@@ -864,17 +868,43 @@ def explain_rows_iforest(
     try:
         import shap  # noqa: F401 - import check before spending a subprocess
 
+        # Same checkpoint names/shape as `shap_summary_iforest`'s path 1 (this
+        # reuses that exact isolated, hard-kill-guarded child), so a stall here
+        # is diagnosed the same way: whichever `explain_rows_*` name is last in
+        # the log is the sub-step that was in flight when progress stopped.
+        _checkpoint("explain_rows_calibration_started", calib_rows=calib_rows)
+
+        def _on_progress(msg, _n_total=Xd.shape[0]):
+            _checkpoint(
+                "explain_rows_calibrated", calib_rows=msg["calib_n"],
+                calib_seconds=round(msg["calib_dt"], 2),
+                seconds_per_row=round(msg["per_row"], 2),
+                planned_rows=int(msg["n_explain"]),
+                bounded=bool(msg["n_explain"] < _n_total),
+            )
+            if msg["n_explain"] > msg["calib_n"]:
+                _checkpoint(
+                    "explain_rows_explain_started", planned_rows=int(msg["n_explain"]),
+                )
+
         result = _run_with_hard_kill(
             _tree_explainer_child, (model, Xd, calib_rows, time_budget_s), hard_kill_s,
+            on_progress=_on_progress,
         )
+        if result.get("stage") == "hard_killed":
+            _checkpoint("explain_rows_hard_killed", hard_timeout_s=hard_kill_s)
+        elif result.get("stage") != "done":
+            _checkpoint("explain_rows_failed", error=str(result.get("error", result.get("stage"))))
         if result.get("stage") != "done":
             log.warning(
                 "explain_rows_iforest: TreeExplainer unavailable or too slow "
                 "for %d row(s) (%s); no per-row explanations.",
                 n_rows_requested, result.get("error", result.get("stage")),
             )
+            _checkpoint("explain_rows_completed", n_explained=0, n_requested=n_rows_requested)
             return [None] * n_rows_requested
 
+        _checkpoint("explain_rows_done", rows_explained=int(result["n_explain"]))
         sv = result["sv"]
         if isinstance(sv, list):
             sv = sv[0]
@@ -883,6 +913,8 @@ def explain_rows_iforest(
             sv = sv[..., 0]
     except Exception as exc:  # noqa: BLE001 - never block the deliverable this feeds
         log.warning("explain_rows_iforest failed (%s); no per-row explanations.", exc)
+        _checkpoint("explain_rows_failed", error=str(exc))
+        _checkpoint("explain_rows_completed", n_explained=0, n_requested=n_rows_requested)
         return [None] * n_rows_requested
 
     n_explained = sv.shape[0]
@@ -898,4 +930,5 @@ def explain_rows_iforest(
         order = np.argsort(-np.abs(sv[i]))[:k]
         explanations.append(", ".join(names[j] for j in order))
     explanations.extend([None] * (n_rows_requested - n_explained))
+    _checkpoint("explain_rows_completed", n_explained=n_explained, n_requested=n_rows_requested)
     return explanations

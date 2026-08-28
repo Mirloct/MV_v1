@@ -384,25 +384,52 @@ arrangement (both models export their own Excel).
   (`iforest_explain.py`, `vae_explain.py`, `attribution_export.py`) define a
   module-local `_checkpoint(name, **observed)` recording an always-passing
   `observability.check(...)` under its own namespace —
-  `interpretability.iforest.<name>` (covers **both** `shap_summary_iforest`
-  *and* `path_length_analysis`, since both live in `iforest_explain.py`),
-  `interpretability.vae_explain.<name>`, and
-  `interpretability.attribution_export.<name>` (Phase 10b, the per-model
-  Excel-sheet writer that runs right after Phase 10 and right before the
-  report — `started` → one `sheet_written` per model → `completed`). Every
-  meaningful sub-step gets one: calibration started/measured, full explain
-  started/done, a `*_hard_killed` name when the ceiling above actually
-  fires, beeswarm render started/done, UMAP started/done, permutation-
-  importance progress every ~25% of features, path-length analysis started/
-  completed, VAE encode/UMAP/batch-loop steps, attribution-workbook sheet
-  writes — appended to `artifacts/logs/run_events.jsonl` and mirrored live to
-  the console dashboard's "Supuestos (IF/VAE)" panel via the existing
-  `observability.add_check_observer` hook (no changes needed there). The
-  point is diagnosing a stall after the fact or live: whichever checkpoint
-  name is *last* in the log is exactly the sub-step that was in flight when
-  the process stopped advancing — e.g. a `tree_explainer_calibration_started`
-  with no matching `tree_explainer_calibrated` after it means the calibration
-  call itself hung (the one sub-step the budget above cannot preempt).
+  `interpretability.iforest.<name>` (covers `shap_summary_iforest`,
+  `path_length_analysis`, **and `explain_rows_iforest`**, since all three
+  live in `iforest_explain.py`), `interpretability.vae_explain.<name>`
+  (covers `latent_space_plot`, `reconstruction_error_by_feature`, **and
+  `explain_rows_vae`**), and `interpretability.attribution_export.<name>`
+  (Phase 10b, the per-model Excel-sheet writer that runs right after Phase
+  10 and right before the report — `started` → one `sheet_written` per model
+  → `completed`). Every meaningful sub-step gets one: calibration
+  started/measured, full explain started/done, a `*_hard_killed` name when
+  the ceiling above actually fires, beeswarm render started/done, UMAP
+  started/done, permutation-importance progress every ~25% of features,
+  path-length analysis started/completed, VAE encode/UMAP/batch-loop steps,
+  attribution-workbook sheet writes, and (2026-08-28) the per-row
+  `explain_rows_iforest`/`explain_rows_vae` functions' own
+  calibration/explain/progress steps — these two ran with **zero**
+  checkpoints until then despite `explain_rows_iforest` reusing the exact
+  same hang-prone `shap.TreeExplainer` subprocess path as
+  `shap_summary_iforest`, a real coverage gap now closed with the identical
+  checkpoint names/shape (`explain_rows_calibration_started` ->
+  `explain_rows_calibrated` -> `explain_rows_explain_started` ->
+  `explain_rows_done`/`explain_rows_hard_killed`/`explain_rows_failed` ->
+  `explain_rows_completed`). Every checkpoint is appended to
+  `artifacts/logs/run_events.jsonl`; whichever name is *last* in the log is
+  exactly the sub-step that was in flight when the process stopped
+  advancing — e.g. a `tree_explainer_calibration_started` with no matching
+  `tree_explainer_calibrated` after it means the calibration call itself
+  hung (the one sub-step the budget above cannot preempt).
+- **Live view: interpretability's checkpoints get their own line, not just
+  a spot in "Supuestos" (2026-08-28).** Previously every
+  `observability.check(...)` project-wide — genuine IF/VAE assumption gates
+  *and* interpretability's routine progress pings alike — fed one shared,
+  8-slot "Supuestos (IF / VAE)" deque in the console dashboard
+  (`src/utils/console_ui.py`); a burst of a few dozen interpretability
+  checkpoints during Phase 10 could flush every real assumption result out
+  of view, under a panel title that only names IF/VAE. `ConsoleUI._on_check`
+  now routes anything named `interpretability.*` to a separate 3-slot deque
+  (`_interp_checks`) instead, so "Supuestos" is assumption-gates-only again.
+  That deque feeds a **new sub-step line directly under the current-phase
+  readout** — `↳ interpretabilidad  <last up-to-3 checkpoint names, oldest
+  first> <time on the latest> (<n> checkpoints)` — the "one level more of
+  detail" a phase-only progress bar cannot give: "Phase 10 is running" says
+  nothing about whether it is progressing or stuck, but a sub-step frozen in
+  place with a growing timer next to it is an unambiguous stall signal, live,
+  without reading `execution.log`. Stays visible (frozen on its last value)
+  after Phase 10 finishes, the same way the phase checklist keeps its green
+  boxes lit.
 - **Full feature-attribution workbook.** Each attribution chart (SHAP
   beeswarm, reconstruction-error bars) is cropped to its top 20 variables for
   readability; `export_attribution_workbook`
@@ -603,9 +630,12 @@ arrangement (both models export their own Excel).
   `PipelineConfig.live_view` (default `True`) / `--live-view`/`--no-live-view`.
 - During a run, `main.py` shows a live console dashboard (`rich`, disables
   itself when stdout is not a terminal or `rich` is missing; `--no-console-ui`
-  forces it off): a fixed 15-row phase checklist, an "Assumptions (IF/VAE)"
-  panel fed by the same `observability.check(...)` calls, and a team-health
-  line (RAM/CPU, always with the number visible, never color alone).
+  forces it off): a fixed 15-row phase checklist, an "Supuestos (IF/VAE)"
+  panel fed by genuine assumption/gate `observability.check(...)` calls, a
+  dedicated interpretability sub-step line under the current-phase readout
+  (see "Live view: interpretability's checkpoints..." above), and a
+  team-health line (RAM/CPU, always with the number visible, never color
+  alone).
 
 ## Known open problems
 

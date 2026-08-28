@@ -123,10 +123,15 @@ negative), score/path-length min/mean/max, `n_samples`, and `figure_path`.
 *each* row of `X`, same order — the complement of `shap_summary_iforest`'s
 population-level ranking, meant for a small, specific row set (an alert
 queue), not a representative subsample. Reuses `shap.TreeExplainer` through
-the same isolated-process, hard-kill-guarded path as `shap_summary_iforest`.
-Returns one comma-joined string per row, or `None` for a row that could not
-be explained — never raises. `main.py` uses this to populate the OOT
-deliverable's `top_5_variables` column (see `docs/evaluation.md`).
+the same isolated-process, hard-kill-guarded path as `shap_summary_iforest`,
+including that path's checkpoint coverage (`explain_rows_calibration_
+started` -> `explain_rows_calibrated` -> `explain_rows_explain_started` ->
+`explain_rows_done`/`explain_rows_hard_killed`/`explain_rows_failed` ->
+`explain_rows_completed`, under `interpretability.iforest.*` — added
+2026-08-28, see `CHANGELOG.md`). Returns one comma-joined string per row, or
+`None` for a row that could not be explained — never raises. `main.py` uses
+this to populate the OOT deliverable's `top_5_variables` column (see
+`docs/evaluation.md`).
 
 ### VAE — `vae_explain.py`
 
@@ -168,7 +173,11 @@ reconstruction error for *each* row, always exactly computable (no
 fallback). `categorical_columns` groups one-hot columns back under their
 source variable **per row** (`group_name_by_source`) so the result never
 names a raw one-hot slice. `main.py` uses this for the same
-`top_5_variables` column as the Isolation Forest's version.
+`top_5_variables` column as the Isolation Forest's version. Checkpoints
+(`interpretability.vae_explain.explain_rows_started` /
+`explain_rows_progress` every ~25% of batches / `explain_rows_completed`,
+added 2026-08-28) are lighter than the Isolation Forest's since this path
+has no subprocess/hang risk — a batched `torch.no_grad()` forward pass.
 
 ---
 

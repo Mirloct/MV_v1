@@ -1345,3 +1345,88 @@ new `Histogram2d`/`Heatmap` traces, the `Spearman rho` annotation, and the
 "OOT genuino, N individuos" title present in the rendered HTML; health
 checks passed in every run (42/42 parallel-mode, 41/41 stacked-mode); no
 "Model-agreement chart skipped" warning was logged in any run.
+
+---
+
+## 2026-08-28 (same day, later still still still) — one-hot category counts (diagnostic answer, no code change), then closing the last checkpoint-coverage gap and giving interpretability its own live progress line
+
+**Ask 1 (diagnostic, no code change):** "¿tienes regulares datos por cada
+categoría one-hot encoded?" -- measured directly on the current synthetic
+panel (6,000 rows) by running `fit_transform_panel` and summing each
+resulting `cat__*` column. Most categories are well populated (hundreds to
+thousands of rows), but a real tail exists: `transaction_channel_legacy_
+terminal` (6 rows, exactly at the `rare_min_frequency=0.001` boundary) and
+`product_type_student_account` (12 rows) survive as their own one-hot column
+despite having almost no support, while `crypto_gateway` (4 rows, just under
+the threshold) correctly gets folded into sklearn's `infrequent` bucket --
+confirming the boundary is a strict `<`, not `<=`. Answered directly with the
+numbers and the existing `--rare-min-frequency` lever (raising it to e.g.
+`0.01` would fold both of the thin survivors in too); no code changed for
+this part.
+
+**Ask 2:** "Actualiza la documentación..., limpia el contexto..., y
+asegúrate que la vista de avance contemple los checks de interpretabilidad
+[...] indica un nivel más de detalle al avance." Investigating what the live
+console dashboard (`src/utils/console_ui.py`) actually did with
+interpretability's checkpoints turned up two real gaps, not just a
+documentation/cosmetics task:
+
+1. **`explain_rows_iforest` and `explain_rows_vae` (the per-row `top_5_
+   variables` functions added earlier today) emitted *zero* checkpoints.**
+   `explain_rows_iforest` in particular reuses the exact same isolated,
+   hard-kill-guarded `shap.TreeExplainer` subprocess path as `shap_summary_
+   iforest` -- the one path this project spent most of today's earlier
+   session hardening specifically *because* it can hang -- yet had no
+   `_checkpoint(...)` calls at all, unlike every other function in that
+   module. Fixed by adding the identical checkpoint shape used elsewhere
+   in `iforest_explain.py`: `explain_rows_started` ->
+   `explain_rows_calibration_started` -> `explain_rows_calibrated` ->
+   `explain_rows_explain_started` -> `explain_rows_done` /
+   `explain_rows_hard_killed` / `explain_rows_failed` ->
+   `explain_rows_completed`, reusing the same `_on_progress` callback
+   pattern as `shap_summary_iforest`'s path 1. `explain_rows_vae`
+   (`vae_explain.py`) got the lighter-weight equivalent appropriate to its
+   always-fast batched-forward-pass implementation: `explain_rows_started`,
+   `explain_rows_progress` every ~25% of batches, `explain_rows_completed`.
+   Verified: a `--no-stack-iforest-into-vae` run's `run_events.jsonl` shows
+   all six `interpretability.iforest.explain_rows_*` names and all four
+   `interpretability.vae_explain.explain_rows_*` names firing in order;
+   52/52 health checks passed.
+
+2. **The console dashboard mixed interpretability's routine progress pings
+   into the "Supuestos (IF / VAE)" panel**, alongside genuine IF/VAE
+   assumption gates -- a panel titled for assumption checks, fed by both a
+   handful of rare, meaningful pass/fail gates *and* a few dozen
+   always-passing `interpretability.*` pings that Phase 10 alone can fire in
+   quick succession, which could flush every real assumption result out of
+   the 8-slot deque. `ConsoleUI._on_check` now routes anything named
+   `interpretability.*` to its own separate 3-slot deque
+   (`_interp_checks`) instead of `_checks`, so "Supuestos" is
+   assumption-gates-only again, and a **new sub-step line** renders directly
+   under the current-phase readout: `↳ interpretabilidad  <last up-to-3
+   checkpoint names> <time on the latest> (<n> checkpoints)` -- the extra
+   level of detail asked for. A phase-level progress bar can only say "Phase
+   10 is running"; this line says exactly which internal checkpoint it last
+   reached and for how long, which is what actually distinguishes "still
+   working" from "stuck" without opening `execution.log`. The line persists
+   (frozen on its last value) after Phase 10 finishes, matching how the
+   phase checklist keeps its boxes lit rather than resetting.
+   Verified by directly driving `ConsoleUI` with synthetic phase/check
+   events and rendering it to a captured buffer (avoids a Windows-console
+   Unicode encoding issue unrelated to the change itself): the
+   interpretability checkpoints appear only in the new sub-step line with a
+   correct running trail and count, and a real passing/failing assumption
+   check still lands in "Supuestos" as before, untouched.
+
+**`CONTEXT.md` cleanup, done alongside the above:** two passages had gone
+stale relative to the code as it now stands and were rewritten rather than
+left to contradict it -- the interpretability-checkpoint-coverage bullet
+still said "no changes needed there" about the console dashboard hook (now
+false: `console_ui.py` changed, described above) and still listed only the
+pre-existing checkpoint-bearing functions (missing the two `explain_rows_*`
+additions from earlier today); and the Reporting section's one-line
+dashboard description still called the panel "Assumptions (IF/VAE)" fed by
+"the same `observability.check(...)` calls" without qualification, which is
+no longer accurate now that interpretability's checks are routed elsewhere.
+Both are corrected in place rather than appended as a second, conflicting
+note.

@@ -437,6 +437,8 @@ def explain_rows_vae(
     if model is None or n_rows_requested == 0:
         return [None] * n_rows_requested
 
+    _checkpoint("explain_rows_started", n_rows=n_rows_requested)
+
     Xd = _densify(X)
     n_rows, n_features = Xd.shape
     names = (
@@ -461,9 +463,14 @@ def explain_rows_vae(
         report_names = names
 
     explanations = []
+    n_batches = max(1, -(-n_rows // bs))  # ceil division
+    # A checkpoint roughly every quarter of the batches -- always fast in
+    # practice (one forward pass, no subprocess), but a very large alert
+    # queue should still leave a trace partway through, not just at the end.
+    checkpoint_every = max(1, n_batches // 4)
     model.eval()
     with torch.no_grad():
-        for start in range(0, n_rows, bs):
+        for b, start in enumerate(range(0, n_rows, bs)):
             chunk = Xd[start:start + bs]
             xb = torch.from_numpy(chunk).to(device)
             mu, _ = model.encode(xb)
@@ -477,4 +484,10 @@ def explain_rows_vae(
                 else:
                     order = np.argsort(-row)[:k]
                 explanations.append(", ".join(report_names[j] for j in order))
+            if (b + 1) % checkpoint_every == 0 or (b + 1) == n_batches:
+                _checkpoint(
+                    "explain_rows_progress", rows_done=len(explanations),
+                    rows_total=n_rows_requested,
+                )
+    _checkpoint("explain_rows_completed", n_explained=len(explanations), n_requested=n_rows_requested)
     return explanations

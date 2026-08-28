@@ -12,13 +12,25 @@ dashboard off.
 Layout::
 
     ┌ header ─────────────────────────────────────────────┐  run id, elapsed,
-    ├ progress + equipo (RAM proceso/sistema, CPU) ────────┤  live-view URL,
-    ├ checklist          │ supuestos ─────────────────────┤  a resource
-    │ (all phases,       │ (assumption/training checks,   │  reading every
-    │  fixed, boxes light│  pass/fail tally + recent)      │  ~1s -- most
-    │  up as they run)   ├ datos de la corrida ────────────┤  useful during
-    ├───────────────────┴─────────────────────────────────┤  training /
-    └ log tail ───────────────────────────────────────────┘  interpretability
+    ├ progress + current phase ─────────────────────────── ┤  live-view URL,
+    ├ ↳ interpretability sub-step (Phase 10 only) ─────────┤  a resource
+    ├ equipo (RAM proceso/sistema, CPU) ────────────────────┤  reading every
+    ├ checklist          │ supuestos ─────────────────────┤  ~1s -- most
+    │ (all phases,       │ (assumption/training checks,   │  useful during
+    │  fixed, boxes light│  pass/fail tally + recent)      │  training /
+    │  up as they run)   ├ datos de la corrida ────────────┤  interpretability
+    ├───────────────────┴─────────────────────────────────┤
+    └ log tail ───────────────────────────────────────────┘
+
+The interpretability sub-step line is a second, finer-grained progress
+readout beneath the phase-level one: the phase checklist can only say "Phase
+10 is running," but Phase 10 is exactly the phase most prone to stalling
+(SHAP over the forest, a hard-kill-guarded subprocess -- see
+`src/interpretability/iforest_explain.py`), so its own `interpretability.*`
+checkpoints (routed to a separate deque from the assumption checks below, not
+mixed into "supuestos") get a dedicated line showing the last few reached and
+how long it has sat on the latest one -- a frozen sub-step with a growing
+timer is a stall; an unmoving top-level progress bar alone cannot say that.
 
 The phase checklist is the full, fixed plan from the very first frame --
 nothing scrolls or appends into view. Each row starts pending (dim, empty
@@ -225,6 +237,20 @@ class ConsoleUI:
         # calls), most-recent-last.
         self._checks: deque = deque(maxlen=8)
         self._check_counts = {"pass": 0, "fail": 0}
+        # Interpretability's own progress checkpoints (`interpretability.*` --
+        # `iforest_explain.py` / `vae_explain.py` / `attribution_export.py`)
+        # are kept separate from `_checks` rather than mixed in: they are
+        # always-passing progress pings, not assumption gates, and Phase 10
+        # alone can fire a few dozen of them in quick succession, which would
+        # otherwise flush every real assumption result out of the 8-slot
+        # `_checks` deque and make both harder to read. `(short_name, ts)`,
+        # most-recent-last -- `ts` (`time.perf_counter()`) is what lets the
+        # "now" line show how long it has sat on the current sub-step, the
+        # extra level of detail a phase-only progress bar cannot give: a stall
+        # inside Phase 10 shows up here as a frozen sub-step and a growing
+        # "hace Ns", not just an unmoving progress bar.
+        self._interp_checks: deque = deque(maxlen=3)
+        self._interp_total = 0
         # Sampled roughly once a second (see `_loop`), not on every ~100ms
         # repaint -- a psutil call per frame would be needless overhead for a
         # number that does not change that fast.
@@ -262,6 +288,11 @@ class ConsoleUI:
                     return
 
     # -- assumption/training-check observer --------------------------------- #
+    @staticmethod
+    def _interp_short_name(name: str) -> str:
+        prefix = "interpretability."
+        return name[len(prefix):] if name.startswith(prefix) else name
+
     def _on_check(self, hc) -> None:
         """Record one `observability.HealthCheck` (a passed or failed gate).
 
@@ -269,8 +300,20 @@ class ConsoleUI:
         includes the `iforest.*` / `vae.*` assumption gates run immediately
         before each model's `.fit()` (`src/utils/assumptions.py`) -- the
         "pruebas de los supuestos" this panel exists to surface live.
+
+        `interpretability.*` checkpoints (Phase 10's own progress pings, see
+        the docstring on `self._interp_checks`) are routed to that separate
+        deque instead of `_checks`/`_check_counts`, so they get their own
+        clearly-labelled place in the dashboard rather than diluting the
+        assumption-gate tally and list with routine progress noise.
         """
         with self._lock:
+            if hc.name.startswith("interpretability."):
+                self._interp_total += 1
+                self._interp_checks.append(
+                    (self._interp_short_name(hc.name), time.perf_counter())
+                )
+                return
             self._check_counts["pass" if hc.passed else "fail"] += 1
             self._checks.append((hc.name, bool(hc.passed), hc.category))
 
@@ -322,6 +365,8 @@ class ConsoleUI:
             checks = list(self._checks)
             check_counts = dict(self._check_counts)
             resource = self._resource
+            interp_checks = list(self._interp_checks)
+            interp_total = self._interp_total
 
         elapsed = time.perf_counter() - self._start
         frac, n_done, n_total = self._progress_fraction()
@@ -361,6 +406,26 @@ class ConsoleUI:
             )
         else:
             now = Text("· en espera", style="dim")
+
+        # -- interpretability sub-step: one level of detail below "now" ----- #
+        # Phase-level progress says "Phase 10 is running"; this says exactly
+        # which internal checkpoint it last reached and for how long it has
+        # sat there -- the detail that tells the difference between "SHAP is
+        # still busy" and "SHAP is hung" without reading `execution.log`. Kept
+        # visible after Phase 10 finishes too (like the phase checklist boxes
+        # staying green), so the final state is still legible right up to the
+        # next phase's first checkpoint replacing it.
+        interp_sub = None
+        if interp_checks:
+            trail = " -> ".join(name for name, _ts in interp_checks)
+            last_ts = interp_checks[-1][1]
+            interp_sub = Text("  ↳ interpretabilidad  ", style="dim")
+            interp_sub.append(trail, style="cyan")
+            interp_sub.append(
+                f"   {self._fmt_elapsed(time.perf_counter() - last_ts)}"
+                f"   ({interp_total} checkpoint{'s' if interp_total != 1 else ''})",
+                style="dim",
+            )
 
         # -- resource health: RAM/CPU, most useful during training / interpretability #
         # A single always-visible line rather than gated to specific phases:
@@ -470,6 +535,8 @@ class ConsoleUI:
             hint.append(f"  {self.live_url}", style="dim underline")
 
         info_rows = [head, Text(""), bar, now]
+        if interp_sub is not None:
+            info_rows.append(interp_sub)
         if health is not None:
             info_rows.append(health)
         return Panel(

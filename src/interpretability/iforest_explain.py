@@ -32,12 +32,40 @@ import warnings
 import numpy as np
 import scipy.sparse as sp
 
-from src.utils import paths
+from src.utils import observability, paths
 from src.utils.logging_config import log_phase, setup_logging
 
 __all__ = ["shap_summary_iforest", "path_length_analysis"]
 
 _DEFAULT_FIG_DIR = paths.FIGURES_DIR
+
+
+def _checkpoint(name: str, **observed) -> None:
+    """Record a lightweight, always-passing progress checkpoint.
+
+    Purely diagnostic -- these never fail a run (this module already has its
+    own try/except-per-path recovery in `main.py`'s caller). The point is
+    what happens when the *process itself* stalls or is killed: the health
+    checks in `artifacts/logs/run_events.jsonl` (and the console dashboard's
+    live "Supuestos" panel, which shows every `observability.check(...)`
+    project-wide) are append-only and flushed per call, so whichever
+    `interpretability.iforest_shap.*` name is *last* in the log is exactly
+    the step that was in flight when things stopped -- e.g. a "...
+    _calibration_started" with no matching "..._calibrated" after it means
+    the calibration call itself (not the bounded, budgeted continuation) is
+    what is hanging.
+    """
+    observability.check(
+        name=f"interpretability.iforest_shap.{name}",
+        category="validation",
+        definition="Progress checkpoint inside shap_summary_iforest -- always "
+                    "passes; its presence (or absence) in the health-check "
+                    "log is the diagnostic, not a pass/fail verdict.",
+        expected="reached without hanging",
+        severity="info",
+        passed=True,
+        observed=observed,
+    )
 
 # Both SHAP fallback paths (model-agnostic Explainer, permutation importance)
 # call `detector.score_samples` many times -- once per (row x ~2*n_features)
@@ -55,6 +83,20 @@ _MODEL_AGNOSTIC_TIME_BUDGET_S = 60.0
 _MODEL_AGNOSTIC_CALIBRATION_ROWS = 2
 _PERM_IMPORTANCE_MAX_SAMPLES = 1000
 _PERM_IMPORTANCE_CALL_BUDGET = 150  # total score_samples() calls across (features x repeats)
+
+# shap.TreeExplainer (path 1) was assumed fast enough not to need budgeting --
+# true on every configuration measured directly (up to 600 trees, 200
+# features, max_features down to 0.3, bootstrap either way: 2-23s). Confirmed
+# in production against a real feature-rich dataset that it can still hang
+# well past that on tree/data shapes not reproduced in those tests, so it now
+# gets the same calibrate-then-bound treatment as path 2. This does NOT fully
+# close the gap: it only bounds cost that scales with the number of rows
+# explained. If even `_TREE_EXPLAINER_CALIBRATION_ROWS` rows do not return
+# within the budget, that points to a per-call pathology independent of row
+# count (e.g. a shap/IsolationForest tree-shape interaction), which no
+# in-process timing can preempt -- see the fallback-to-path-2 branch below.
+_TREE_EXPLAINER_TIME_BUDGET_S = 90.0
+_TREE_EXPLAINER_CALIBRATION_ROWS = 5
 
 
 def _densify(X) -> np.ndarray:
@@ -155,9 +197,19 @@ def _permutation_importance(
             "repeat(s) (%d calls total) to keep this bounded.",
             d, n_repeats, d * n_repeats, n, n_repeats_eff, d * n_repeats_eff,
         )
+    _checkpoint(
+        "permutation_importance_repeats_set", n_features=int(d), n_rows=int(n),
+        requested_repeats=int(n_repeats), effective_repeats=int(n_repeats_eff),
+        total_calls=int(d * n_repeats_eff), capped=bool(n_repeats_eff < n_repeats),
+    )
 
     base = detector.score_samples(X)
     imp = np.zeros(d, dtype=np.float64)
+    # A checkpoint roughly every quarter of the features (not per-feature --
+    # that would be d health-check writes for what tqdm already shows live in
+    # the console) so a stall shows up in run_events.jsonl within ~1/4 of the
+    # loop's total budgeted time instead of only at the very end.
+    checkpoint_every = max(1, d // 4)
     for j in tqdm(range(d), desc="permutation_importance", unit="feature"):
         acc = 0.0
         col = X[:, j].copy()
@@ -168,6 +220,8 @@ def _permutation_importance(
             acc += float(np.mean(np.abs(shuffled - base)))
         X[:, j] = col  # restore
         imp[j] = acc / max(n_repeats_eff, 1)
+        if (j + 1) % checkpoint_every == 0 or j + 1 == d:
+            _checkpoint("permutation_importance_progress", features_done=int(j + 1), features_total=int(d))
     return imp
 
 
@@ -215,6 +269,8 @@ def shap_summary_iforest(
     Xd, _ = _subsample(Xd, max_samples, random_state)
     names = _resolve_feature_names(feature_names, Xd.shape[1])
 
+    _checkpoint("started", n_rows=int(Xd.shape[0]), n_features=int(Xd.shape[1]))
+
     with log_phase("interpretability.shap_iforest", log):
         model = getattr(detector, "model_", None)
         if model is None:
@@ -229,25 +285,78 @@ def shap_summary_iforest(
         try:
             import shap
 
-            log.info(
-                "Computing SHAP values via shap.TreeExplainer over %d row(s) x %d "
-                "feature(s) (usually seconds, not minutes, on this path)...",
-                Xd.shape[0], Xd.shape[1],
-            )
             explainer = shap.TreeExplainer(model)
-            sv = explainer.shap_values(Xd, check_additivity=False)
+            calib_n = min(_TREE_EXPLAINER_CALIBRATION_ROWS, Xd.shape[0])
+            log.info(
+                "Computing SHAP values via shap.TreeExplainer -- calibrating "
+                "on %d of %d row(s) x %d feature(s) first (usually seconds, "
+                "not minutes, on this path) to bound this to a ~%.0fs budget "
+                "instead of running unbounded.",
+                calib_n, Xd.shape[0], Xd.shape[1], _TREE_EXPLAINER_TIME_BUDGET_S,
+            )
+            # If the process dies with THIS checkpoint as the last one logged
+            # (no matching "tree_explainer_calibrated" after it), the
+            # calibration call itself is what hung -- see the module
+            # docstring note on `_TREE_EXPLAINER_CALIBRATION_ROWS`: that is
+            # the one sub-step this budget cannot preempt, since it is timed
+            # only *after* it returns.
+            _checkpoint("tree_explainer_calibration_started", calib_rows=calib_n)
+            t0 = time.monotonic()
+            sv = explainer.shap_values(Xd[:calib_n], check_additivity=False)
+            calib_dt = time.monotonic() - t0
+            per_row = calib_dt / max(calib_n, 1)
+
+            if calib_n < Xd.shape[0] and per_row > 0:
+                extra_rows = max(
+                    0, int((_TREE_EXPLAINER_TIME_BUDGET_S - calib_dt) / per_row)
+                )
+                n_explain = min(Xd.shape[0], calib_n + extra_rows)
+            else:
+                n_explain = Xd.shape[0]
+            _checkpoint(
+                "tree_explainer_calibrated", calib_rows=calib_n,
+                calib_seconds=round(calib_dt, 3), seconds_per_row=round(per_row, 4),
+                planned_rows=int(n_explain), bounded=bool(n_explain < Xd.shape[0]),
+            )
+
+            if n_explain > calib_n:
+                log.info(
+                    "shap.TreeExplainer calibration: %.2fs for %d row(s) "
+                    "(~%.3fs/row) at %d feature(s); explaining %d of %d "
+                    "row(s) to stay near the %.0fs budget.",
+                    calib_dt, calib_n, per_row, Xd.shape[1], n_explain,
+                    Xd.shape[0], _TREE_EXPLAINER_TIME_BUDGET_S,
+                )
+                _checkpoint("tree_explainer_explain_started", planned_rows=int(n_explain))
+                sv = explainer.shap_values(Xd[:n_explain], check_additivity=False)
+            elif Xd.shape[0] > calib_n:
+                log.warning(
+                    "shap.TreeExplainer is too slow at %d feature(s) "
+                    "(~%.2fs/row, projected %.0fs for all %d rows); keeping "
+                    "only the %d calibration row(s) explained instead of "
+                    "running unbounded.",
+                    Xd.shape[1], per_row, per_row * Xd.shape[0], Xd.shape[0],
+                    calib_n,
+                )
             log.info("shap.TreeExplainer finished.")
+            _checkpoint("tree_explainer_done", rows_explained=int(min(n_explain, Xd.shape[0])))
             if isinstance(sv, list):  # some versions wrap in a list
                 sv = sv[0]
             shap_values = np.asarray(sv, dtype=np.float64)
             if shap_values.ndim == 3:  # (n, d, outputs)
                 shap_values = shap_values[..., 0]
+            if shap_values.shape[0] != Xd.shape[0]:
+                # The budget above may have explained fewer rows than Xd
+                # holds; keep the beeswarm plot's feature matrix row-aligned
+                # with the values actually computed.
+                Xd = Xd[:shap_values.shape[0]]
             used_path = "shap.TreeExplainer"
         except Exception as exc:  # noqa: BLE001 - version/support guard
             log.warning(
                 "shap.TreeExplainer unavailable for IsolationForest (%s); "
                 "falling back to model-agnostic Explainer.", exc,
             )
+            _checkpoint("tree_explainer_failed", error=str(exc))
 
         # -- path 2: model-agnostic Explainer over score_samples ------------ #
         if shap_values is None:
@@ -286,6 +395,7 @@ def shap_summary_iforest(
                     _MODEL_AGNOSTIC_TIME_BUDGET_S,
                 )
                 calib_n = min(_MODEL_AGNOSTIC_CALIBRATION_ROWS, Xd.shape[0])
+                _checkpoint("model_agnostic_calibration_started", calib_rows=calib_n)
                 t0 = time.monotonic()
                 explanation = explainer(Xd[:calib_n])
                 calib_dt = time.monotonic() - t0
@@ -297,6 +407,11 @@ def shap_summary_iforest(
                 else:
                     extra_rows = Xd.shape[0] - calib_n
                 n_explain = min(Xd.shape[0], calib_n + extra_rows)
+                _checkpoint(
+                    "model_agnostic_calibrated", calib_rows=calib_n,
+                    calib_seconds=round(calib_dt, 3), seconds_per_row=round(per_row, 4),
+                    planned_rows=int(n_explain), bounded=bool(n_explain < Xd.shape[0]),
+                )
                 if n_explain > calib_n:
                     log.info(
                         "Model-agnostic SHAP calibration: %.2fs for %d row(s) "
@@ -305,6 +420,7 @@ def shap_summary_iforest(
                         calib_dt, calib_n, per_row, Xd.shape[1], n_explain,
                         Xd.shape[0], _MODEL_AGNOSTIC_TIME_BUDGET_S,
                     )
+                    _checkpoint("model_agnostic_explain_started", planned_rows=int(n_explain))
                     explanation = explainer(Xd[:n_explain])
                 elif Xd.shape[0] > calib_n:
                     log.warning(
@@ -329,6 +445,7 @@ def shap_summary_iforest(
                     "shap.Explainer fallback failed (%s); using permutation "
                     "importance on score_samples.", exc,
                 )
+                _checkpoint("model_agnostic_failed", error=str(exc))
 
         # -- attribution + beeswarm when SHAP produced values --------------- #
         if shap_values is not None and shap_values.shape[1] == Xd.shape[1]:
@@ -343,6 +460,10 @@ def shap_summary_iforest(
                 log.info(
                     "Rendering SHAP beeswarm plot (%d rows x %d features)...",
                     Xd.shape[0], Xd.shape[1],
+                )
+                _checkpoint(
+                    "beeswarm_render_started", rows=int(Xd.shape[0]),
+                    features=int(Xd.shape[1]),
                 )
                 plt.figure()
                 # `shap.summary_plot` seeds the *global* NumPy RNG internally,
@@ -364,11 +485,13 @@ def shap_summary_iforest(
                 plt.savefig(out_path, dpi=120, bbox_inches="tight")
                 plt.close("all")
                 log.info("SHAP beeswarm plot saved.")
+                _checkpoint("beeswarm_render_done")
             except Exception as exc:  # noqa: BLE001 - beeswarm may be unavailable
                 log.warning(
                     "SHAP beeswarm plot failed (%s); writing mean|SHAP| bar "
                     "chart instead.", exc,
                 )
+                _checkpoint("beeswarm_render_failed", error=str(exc))
                 _save_bar_plot(
                     names, mean_abs, out_path,
                     title="Isolation Forest -- mean|SHAP| feature importance",
@@ -378,10 +501,12 @@ def shap_summary_iforest(
                 "SHAP summary (%s) saved to %s; top feature=%s.",
                 used_path, out_path, next(iter(importance)) if importance else "n/a",
             )
+            _checkpoint("completed", used_path=used_path)
             return importance
 
         # -- path 3: permutation importance fallback ------------------------ #
         used_path = "permutation_importance(score_samples)"
+        _checkpoint("permutation_importance_started")
         imp = _permutation_importance(detector, Xd, random_state=random_state)
         importance = _importance_dict(names, imp)
         _save_bar_plot(
@@ -393,6 +518,7 @@ def shap_summary_iforest(
             "Feature importance (%s) saved to %s; top feature=%s.",
             used_path, out_path, next(iter(importance)) if importance else "n/a",
         )
+        _checkpoint("completed", used_path=used_path)
         return importance
 
 

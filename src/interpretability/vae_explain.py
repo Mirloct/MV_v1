@@ -27,12 +27,30 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
-from src.utils import paths
+from src.utils import observability, paths
 from src.utils.logging_config import log_phase, setup_logging
 
 __all__ = ["latent_space_plot", "reconstruction_error_by_feature"]
 
 _DEFAULT_FIG_DIR = paths.FIGURES_DIR
+
+
+def _checkpoint(name: str, **observed) -> None:
+    """Always-passing progress checkpoint -- see the twin helper in
+    `iforest_explain.py` for why (diagnosing *where* a stall happened from
+    the last-recorded name in `run_events.jsonl`, not a pass/fail verdict).
+    """
+    observability.check(
+        name=f"interpretability.vae_explain.{name}",
+        category="validation",
+        definition="Progress checkpoint inside the VAE interpretability "
+                    "functions -- always passes; its presence (or absence) "
+                    "in the health-check log is the diagnostic.",
+        expected="reached without hanging",
+        severity="info",
+        passed=True,
+        observed=observed,
+    )
 
 
 def _densify(X) -> np.ndarray:
@@ -88,6 +106,7 @@ def latent_space_plot(
     out_path = os.path.join(out_dir, filename)
 
     with log_phase("interpretability.vae_latent", log):
+        _checkpoint("started", n_rows=int(_n_rows(X)))
         y_arr = None if y is None else np.asarray(y).ravel()
 
         n = _n_rows(X)
@@ -103,6 +122,7 @@ def latent_space_plot(
             X_sub = X
 
         latents = detector.encode(X_sub)  # (n_sub, latent_dim), encoder means
+        _checkpoint("encoded", n_rows=int(X_sub.shape[0]), latent_dim=int(latents.shape[1]))
 
         # Reduce to 2D: UMAP if importable, else PCA (1D latent -> pad).
         method = "raw"
@@ -131,14 +151,17 @@ def latent_space_plot(
                     "with no further log output until it finishes; this is normal.",
                     latents.shape[0], latents.shape[1],
                 )
+                _checkpoint("umap_started", n_points=int(latents.shape[0]))
                 # n_jobs=1 silences UMAP's own warning: a fixed random_state
                 # forces single-threaded execution internally regardless, and
                 # UMAP warns if n_jobs isn't already set to 1.
                 reducer = umap.UMAP(n_components=2, random_state=random_state, n_jobs=1)
                 coords = np.asarray(reducer.fit_transform(latents), dtype=np.float64)
                 method = "UMAP"
+                _checkpoint("umap_done")
             except Exception as exc:  # noqa: BLE001 - fall back to PCA
                 log.warning("UMAP unavailable (%s); using PCA for latent 2D.", exc)
+                _checkpoint("umap_failed", error=str(exc))
             if coords is None:
                 from sklearn.decomposition import PCA
 
@@ -180,6 +203,7 @@ def latent_space_plot(
         plt.close(fig)
 
         log.info("Saved VAE latent-space figure (%s) to %s.", method, out_path)
+        _checkpoint("completed", method=method)
         path = os.path.abspath(out_path)
         if not return_data:
             return path
@@ -241,6 +265,7 @@ def reconstruction_error_by_feature(
         n_rows, n_features = Xd.shape
         device = getattr(detector, "device", "cpu")
         batch_size = int(getattr(detector, "batch_size", 256) or 256)
+        _checkpoint("started", n_rows=int(n_rows), n_features=int(n_features))
 
         sq_err_sum = np.zeros(n_features, dtype=np.float64)
         model.eval()
@@ -254,6 +279,7 @@ def reconstruction_error_by_feature(
                 sq_err_sum += sq.sum(dim=0).cpu().numpy().astype(np.float64)
 
         mean_err = sq_err_sum / max(n_rows, 1)
+        _checkpoint("batches_done", n_rows=int(n_rows))
 
         if feature_names is not None and len(feature_names) == n_features:
             names = [str(f) for f in feature_names]
@@ -288,4 +314,5 @@ def reconstruction_error_by_feature(
             "worst feature=%s.", out_path,
             sel_names[0] if sel_names else "n/a",
         )
+        _checkpoint("completed")
         return result

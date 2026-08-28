@@ -897,3 +897,107 @@ environment/version-specific and outside what could be reproduced directly;
 the fix makes the fallback *safe to fall back to* regardless of why path 1
 was unavailable, rather than chasing why path 1 might fail in one specific
 environment.
+
+> **Superseded two days later (2026-08-28): path 1 needed the same fix.** A
+> real run hung on the exact log line `"Computing SHAP values via
+> shap.TreeExplainer..."` — i.e. inside path 1 itself, not a fallback — for
+> 6+ minutes. The "not changed" reasoning above turned out to be right that
+> path 1 never *failed* in any configuration tried, but wrong that it was
+> therefore safe: it can still be *slow* without failing. See the entry
+> below for the actual mechanism (found this time, not left unexplained) and
+> the fix, which finally closes this gap symmetrically across all three paths.
+
+---
+
+## 2026-08-28 — TreeExplainer itself needed budgeting too; root cause found
+
+**What happened.** A production run hung for 6+ minutes with the last log
+line being `"Computing SHAP values via shap.TreeExplainer over ... row(s) x
+... feature(s)..."` — inside path 1, the one path the 2026-08-26 fix
+deliberately left unbounded because it never failed in any test run against
+it. This time the cause was found and measured directly, not left as "some
+version/environment difference."
+
+**Root cause: `max_samples` as a float fraction, on a training block that
+spans several months.** `IsolationForest`'s `max_samples` this project tunes
+over `{"auto", int in {64,128,256}, float in [0.3, 1.0]}`
+(`src/models/iforest.py`). `"auto"` means `min(256, n)` rows per tree —
+**independent of total dataset size** — but a float means *that fraction of
+whatever training set is passed in*. `main.py` fits the Isolation Forest on
+the full train block, which spans several months, not one. A controlled
+sweep (`IsolationForestDetector`, 125 features, 100 trees) isolated this
+cleanly:
+
+| Training rows | `max_samples` | Tree depth | Leaves/tree | Projected cost (2000 rows, unbounded) |
+| ---: | --- | ---: | ---: | ---: |
+| 20,000 (1 month) | `"auto"` | 8 | 64 | 1.8s |
+| 20,000 (1 month) | `0.5` | 14 | 756 | 63.6s |
+| 200,000 (10 months) | `"auto"` | 8 | 56 | 1.8s |
+| **200,000 (10 months)** | **`0.5`** | **17** | **2,761** | **341s (5.7 min)** |
+
+`"auto"` stays at depth 8 regardless of total rows (confirming it is immune
+to dataset size); a float fraction on a large training block is what
+produces the deep, high-leaf-count trees `TreeExplainer`'s cost scales with.
+At 300 trees (still within this project's Optuna range, which goes to 600)
+the same 200,000-row/`max_samples=0.5` configuration measured **0.532s/row**,
+i.e. **~17.7 minutes unbounded for 2000 rows** — closely matching the "6+
+minutes and still running" symptom reported in production.
+
+**Two other hypotheses tested and ruled out** (same sweep): low-cardinality
+"numeric but effectively categorical" columns mixed into the Isolation
+Forest's numeric-only feature block (e.g. integer-coded regions/segments —
+these still route to the Isolation Forest under the dtype-based split in
+`CONTEXT.md`'s "Feature routing by dtype", since routing is by dtype, not
+semantic meaning) showed no measurable effect on tree depth or `Tree
+Explainer` cost at `max_samples="auto"` in this sweep; and feature count
+alone (125) at the default `max_samples="auto"` cost 1.8s regardless of
+whether the training set was 20,000 or 200,000 rows. Feature count still
+matters for paths 2/3 (2026-08-26 entry above) — it just is not what made
+path 1 slow here.
+
+**Fix.** `shap.TreeExplainer` (path 1, `src/interpretability/
+iforest_explain.py`) now gets the identical calibrate-then-bound treatment
+already applied to paths 2/3: times `_TREE_EXPLAINER_CALIBRATION_ROWS = 5`
+rows against the real model, extrapolates a per-row cost, and explains only
+as many additional rows as fit `_TREE_EXPLAINER_TIME_BUDGET_S = 90.0`
+seconds (a larger budget than path 2/3's 60s, since path 1 is legitimately
+expected to be the fast path in the common case and a real but moderate
+slowdown should not trigger premature bailout). Verified against the exact
+reconstructed scenario (200,000 rows, 125 features, 300 trees,
+`max_samples=0.5`): the full `shap_summary_iforest` call, which would have
+cost on the order of 17+ minutes for the TreeExplainer call alone, now
+completes in **110.2s** — calibration correctly measured 0.532s/row and
+capped the explanation to 169 of 2000 rows.
+
+**Stated residual limitation (not fixed, by design):** this bounds cost that
+scales with the number of rows explained *after* calibration returns. If
+even the `_TREE_EXPLAINER_CALIBRATION_ROWS` (or `_MODEL_AGNOSTIC_
+CALIBRATION_ROWS`) calibration rows themselves do not return — a genuine
+per-call pathology (e.g. an actual infinite loop or C-level defect) rather
+than "slow proportional to rows" — no in-process timing can preempt that; a
+hard kill would require running the call in a subprocess, which was
+considered and not implemented (added latency/complexity for every call,
+not just the pathological case, and no evidence yet that the "even
+calibration hangs" case is real rather than theoretical).
+
+**New: fine-grained health checkpoints, for exactly the "where did it stop"
+question.** Both `iforest_explain.py` and `vae_explain.py` now call a
+module-local `_checkpoint(name, **observed)` at every meaningful sub-step
+(calibration started/measured for all three paths, full-explain started/
+done, beeswarm render started/done/failed, UMAP started/done/failed,
+permutation-importance progress every ~25% of features, and a final
+`completed` per function) — each an always-passing `observability.check(...)`
+under `interpretability.iforest_shap.*` / `interpretability.vae_explain.*`.
+Verified end-to-end with a real `python main.py --quick --no-tune` run: 16
+checkpoints recorded in `artifacts/logs/run_events.jsonl` in the correct
+order with timestamps and per-step data (e.g. `tree_explainer_calibrated`
+carrying `calib_seconds`, `seconds_per_row`, `planned_rows`, `bounded`), and
+mirrored live to the console dashboard's existing "Supuestos (IF/VAE)" panel
+via `observability.add_check_observer` with zero changes needed there. The
+diagnostic use: whichever checkpoint name is *last* in the log when a run
+stalls is the exact sub-step in flight — a `tree_explainer_calibration_
+started` with no following `tree_explainer_calibrated` means the calibration
+call itself is the one hanging (the residual gap above), as opposed to a
+`tree_explainer_explain_started` with no `tree_explainer_done`, which means
+the budget-bounded continuation is unexpectedly slow (a calibration
+under-estimate, not a hang).

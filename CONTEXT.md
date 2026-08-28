@@ -336,22 +336,51 @@ arrangement (both models export their own Excel).
   UMAP compilation) and produces no deliverable of its own, so running it
   earlier would leave the VAE's Excel queue waiting behind the forest's SHAP
   computation.
-- **`shap_summary_iforest`'s two fallback paths are wall-clock/call budgeted,
-  not unbounded.** Both `shap.TreeExplainer` failing over to the
-  model-agnostic `shap.Explainer`, and that in turn failing over to manual
-  permutation importance, cost roughly `O(n_features)` work per row/repeat —
-  fine on this project's 20-70 feature synthetic panel, but at ~150-200
-  features (a realistic real-data feature count) the model-agnostic path
-  measured **~2.7 hours to explain 2000 rows**, which is what "the pipeline
-  hangs/crashes during interpretability" actually was. The model-agnostic
-  path now times a couple of calibration rows and explains only as many as
-  fit a ~60s budget (`_MODEL_AGNOSTIC_TIME_BUDGET_S`,
-  `src/interpretability/iforest_explain.py`); the permutation-importance
-  fallback subsamples rows and reduces `n_repeats` to keep total
-  `score_samples()` calls under a fixed budget
-  (`_PERM_IMPORTANCE_CALL_BUDGET`). Both degrade gracefully to a smaller,
-  still-representative sample rather than a smaller time — never the other
-  way around. See `CHANGELOG.md` 2026-08-26 for the measurements.
+- **All three of `shap_summary_iforest`'s paths (`shap.TreeExplainer`, the
+  model-agnostic `shap.Explainer`, and manual permutation importance) are
+  wall-clock/call budgeted, not unbounded.** Every path's cost scales with
+  tree complexity and/or feature count — fine on this project's small
+  synthetic panel and small training blocks, but confirmed (not just
+  theorized) to reach minutes-to-hours in two independent, realistic
+  scenarios: ~150-200 features (`src/interpretability/iforest_explain.py`,
+  paths 2/3), and — the actual root cause behind a real production hang —
+  **`max_samples` tuned to a float fraction (Optuna's search space allows
+  0.3-1.0) combined with a multi-month training block**. `max_samples` as a
+  fraction is relative to the *training set size*, not a fixed row count, so
+  a 200,000-row train block (e.g. 10 months × 20k entities) with
+  `max_samples=0.5` builds trees with ~100,000-row leaves and ~17 levels of
+  depth instead of the ~256-row/~8-level trees `max_samples="auto"` always
+  produces regardless of dataset size — and `shap.TreeExplainer`'s cost scales
+  with tree depth/leaf count, not just feature count. Measured: this
+  configuration alone projects to **~5.7-17+ minutes** to explain 2000 rows
+  unbounded, matching the reported symptom almost exactly. All three paths
+  now calibrate on a handful of rows against the real model/data, extrapolate
+  a per-row cost, and only explain as many rows as fit a fixed time/call
+  budget (`_TREE_EXPLAINER_TIME_BUDGET_S`, `_MODEL_AGNOSTIC_TIME_BUDGET_S`,
+  `_PERM_IMPORTANCE_CALL_BUDGET`, all in `iforest_explain.py`) — degrading to
+  a smaller, still-representative sample rather than a smaller time budget.
+  **Residual gap, stated plainly:** this only bounds cost that scales with
+  the number of rows explained *after* calibration; if even the calibration
+  batch itself (`_TREE_EXPLAINER_CALIBRATION_ROWS` / `_MODEL_AGNOSTIC_
+  CALIBRATION_ROWS` rows) does not return, that is a per-call pathology no
+  in-process timing can preempt — only a subprocess-level hard kill could,
+  which is not implemented. See `CHANGELOG.md` 2026-08-26 and 2026-08-28 for
+  the full measurements.
+- **Interpretability has fine-grained health checkpoints for exactly this
+  failure mode.** Both `iforest_explain.py` and `vae_explain.py` define a
+  module-local `_checkpoint(name, **observed)` that records an always-passing
+  `observability.check("interpretability.iforest_shap.<name>" / "...vae_
+  explain.<name>", ...)` at every meaningful sub-step (calibration started/
+  measured, full explain started/done, beeswarm render started/done, UMAP
+  started/done, permutation-importance progress every ~25% of features,
+  etc.) — appended to `artifacts/logs/run_events.jsonl` and mirrored live to
+  the console dashboard's "Supuestos (IF/VAE)" panel via the existing
+  `observability.add_check_observer` hook (no changes needed there). The
+  point is diagnosing a stall after the fact or live: whichever checkpoint
+  name is *last* in the log is exactly the sub-step that was in flight when
+  the process stopped advancing — e.g. a `tree_explainer_calibration_started`
+  with no matching `tree_explainer_calibrated` after it means the calibration
+  call itself hung (the one sub-step the budget above cannot preempt).
 - **Full feature-attribution workbook.** Each attribution chart (SHAP
   beeswarm, reconstruction-error bars) is cropped to its top 20 variables for
   readability; `export_attribution_workbook`

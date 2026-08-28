@@ -134,6 +134,21 @@ eval / no-grad in batches using the deterministic encoder mean (exactly as
 per column, and returns `{feature: mean_recon_error}` sorted descending. Saves a
 bar chart of the `top_n` worst-reconstructed features.
 
+**Optional `categorical_columns=[...]`** (the original, pre-transform
+categorical column names): since one-hot encoding turns one string column
+into one column per category, and this function's values sum directly into
+`score_samples`, a high-cardinality categorical can dominate both the chart
+and the score by column count alone. When given, the chart groups one-hot
+columns back under their source variable
+(`src/preprocessing/pipeline.py::aggregate_attribution_by_source`) and a
+`categorical_contribution` checkpoint records the categorical block's share
+of columns vs. share of total reconstruction error. The **returned dict
+stays ungrouped** regardless (grouping is chart/diagnostic-only). `main.py`
+always passes this. See `CONTEXT.md` "VAE feature attribution: categorical
+granularity" and `CHANGELOG.md` 2026-08-28 for the mechanism and the levers
+(`--rare-min-frequency`, `--categorical-encoding`) if the diagnostic shows a
+real problem.
+
 ---
 
 ## 3. Reporting API (`src/reporting`)

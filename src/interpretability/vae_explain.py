@@ -27,6 +27,10 @@ import numpy as np
 import scipy.sparse as sp
 import torch
 
+from src.preprocessing.pipeline import (
+    aggregate_attribution_by_source,
+    categorical_feature_mask,
+)
 from src.utils import observability, paths
 from src.utils.logging_config import log_phase, setup_logging
 
@@ -225,6 +229,7 @@ def reconstruction_error_by_feature(
     max_samples: int = 2000,
     top_n: int = 30,
     random_state: int = 42,
+    categorical_columns=None,
 ) -> dict:
     """Per-feature mean squared reconstruction error of the VAE.
 
@@ -235,8 +240,29 @@ def reconstruction_error_by_feature(
     therefore which drive the anomaly score. A bar chart of the top features is
     saved under ``reports/figures/interpretability/``.
 
+    Args:
+        categorical_columns: Optional list of the *original* (pre-transform)
+            categorical column names (e.g.
+            ``df.select_dtypes(include=["object", "category"]).columns``).
+            When given, two things change: (1) the bar chart ranks and labels
+            by *original* variable, summing one-hot-derived columns back
+            together, since a high-cardinality categorical otherwise crowds
+            the top-N purely by column count, not by how much it actually
+            costs to reconstruct; (2) a checkpoint records what share of the
+            total reconstruction error (and thus of the VAE's anomaly score,
+            since that error sums directly into it) comes from
+            categorical-derived columns vs. everything else, so "are my
+            string columns dominating the score, not just the report" is a
+            measured fact instead of a guess. Omit to keep the historical
+            per-column-only behavior (every existing caller's chart is
+            unaffected; only a caller that opts in gets the grouped view).
+
     Returns:
-        ``{feature: mean_recon_error}`` sorted descending.
+        ``{feature: mean_recon_error}`` sorted descending -- always the full,
+        ungrouped per-column detail, regardless of ``categorical_columns``
+        (the uncropped `attribution_export.py` workbook needs this; grouping
+        is applied only to the chart / diagnostic, never silently to the
+        returned data).
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -293,9 +319,50 @@ def reconstruction_error_by_feature(
         )
         result = {k: v for k, v in pairs}
 
-        sel_pairs = pairs[:top_n]
-        sel_names = [k for k, _ in sel_pairs]
-        sel_vals = [v for _, v in sel_pairs]
+        # -- categorical-vs-numeric contribution diagnostic ------------------ #
+        # This is not just a chart-cosmetics measurement: `mean_err` sums
+        # directly into `score_samples` (the VAE's anomaly score), so the
+        # categorical share of the total *is* the categorical share of what
+        # drives every ranking downstream, not only this chart's.
+        if categorical_columns:
+            cat_mask = categorical_feature_mask(names)
+            total_err = float(np.sum(mean_err))
+            cat_err = float(np.sum(mean_err[cat_mask])) if cat_mask.any() else 0.0
+            cat_share = (cat_err / total_err) if total_err > 0 else float("nan")
+            n_cat_cols = int(cat_mask.sum())
+            col_share = n_cat_cols / max(n_features, 1)
+            log.info(
+                "VAE reconstruction error by source: categorical-derived "
+                "columns are %d/%d (%.1f%%) of features but %.1f%% of total "
+                "reconstruction error (score contribution) -- %s.",
+                n_cat_cols, n_features, 100.0 * col_share, 100.0 * cat_share,
+                "over-represented" if cat_share > col_share + 0.10
+                else "roughly proportional" if abs(cat_share - col_share) <= 0.10
+                else "under-represented",
+            )
+            _checkpoint(
+                "categorical_contribution",
+                n_categorical_columns=n_cat_cols, n_total_columns=int(n_features),
+                column_share=round(col_share, 2), error_share=round(cat_share, 2),
+            )
+
+        # -- chart: grouped by original source column when available -------- #
+        # A high-cardinality categorical otherwise crowds the top-N purely by
+        # column count (20 one-hot slices of "region" vs. 1 "income" column),
+        # not by how much it actually costs to reconstruct.
+        if categorical_columns:
+            chart_values = aggregate_attribution_by_source(result, categorical_columns)
+            chart_title = (
+                "VAE reconstruction error by source variable "
+                "(categorical columns summed back together)"
+            )
+        else:
+            chart_values = result
+            chart_title = "VAE per-feature reconstruction error (worst-reconstructed first)"
+
+        chart_pairs = list(chart_values.items())[:top_n]
+        sel_names = [k for k, _ in chart_pairs]
+        sel_vals = [v for _, v in chart_pairs]
         height = max(3.0, 0.32 * len(sel_names) + 1.0)
         fig, ax = plt.subplots(figsize=(9, height))
         y_pos = np.arange(len(sel_names))
@@ -304,7 +371,7 @@ def reconstruction_error_by_feature(
         ax.set_yticklabels(sel_names)
         ax.invert_yaxis()
         ax.set_xlabel("mean squared reconstruction error")
-        ax.set_title("VAE per-feature reconstruction error (worst-reconstructed first)")
+        ax.set_title(chart_title)
         fig.tight_layout()
         fig.savefig(out_path, dpi=120)
         plt.close(fig)

@@ -25,9 +25,11 @@ from src.preprocessing.pipeline import (
     NUMERIC_TRANSFORMS,
     PanelFeatureEngineer,
     SignedLog1p,
+    aggregate_attribution_by_source,
     build_preprocessing_pipeline,
     categorical_feature_mask,
     fit_transform_panel,
+    group_name_by_source,
     make_numeric_transformer,
     split_matrix_for_model,
 )
@@ -52,6 +54,8 @@ __all__ = [
     "infer_numeric_features",
     "categorical_feature_mask",
     "split_matrix_for_model",
+    "group_name_by_source",
+    "aggregate_attribution_by_source",
     # -- stateless linear rescaling (src/preprocessing/linear_scaling.py) --
     "SCALING_METHODS",
     "select_continuous_columns",

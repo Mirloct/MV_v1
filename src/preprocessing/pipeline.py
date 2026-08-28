@@ -995,6 +995,56 @@ def categorical_feature_mask(feature_names: Sequence[str]) -> np.ndarray:
     )
 
 
+def group_name_by_source(name: str, categorical_columns: Sequence[str]) -> str:
+    """Map one transformed feature name back to its *reporting group*.
+
+    A categorical-derived name is grouped under its original source column
+    (e.g. ``cat__region_North`` and ``cat__region_South`` both group under
+    ``"region"``); everything else groups under itself unchanged. This exists
+    because one-hot encoding turns a single string column into one column
+    *per category*, and any per-feature ranking (VAE reconstruction error,
+    SHAP importance) that does not undo that split lets a single
+    high-cardinality categorical dominate a ranking by column *count*, not by
+    how informative it actually is -- see `docs/models_vae.md` and
+    `CONTEXT.md` on VAE feature attribution.
+
+    ``categorical_columns`` must be the *original* (pre-transform) categorical
+    column names (e.g. ``df.select_dtypes(include=["object", "category"]).
+    columns``) -- matched longest-first so a name like ``"region_type"`` is
+    preferred over ``"region"`` when both are real source columns and the
+    derived name is ``cat__region_type_X``.
+    """
+    if not name.startswith(CATEGORICAL_FEATURE_PREFIX):
+        return name
+    stripped = name[len(CATEGORICAL_FEATURE_PREFIX):]
+    for col in sorted(categorical_columns, key=len, reverse=True):
+        if stripped == col or stripped.startswith(col + "_"):
+            return col
+    return name  # defensive: unrecognized shape (e.g. a future encoding), keep as its own group
+
+
+def aggregate_attribution_by_source(
+    per_feature: dict, categorical_columns: Sequence[str],
+) -> dict:
+    """Sum a ``{feature: value}`` attribution dict's one-hot-derived entries
+    back under their original categorical source column.
+
+    Values are **summed**, not averaged: a per-feature reconstruction error
+    (or any additive attribution) is exactly what sums to the row's total
+    score, so summing a source column's one-hot slices back together answers
+    "how much of the total does reconstructing/attributing to *this original
+    variable* cost" -- the fair, apples-to-apples comparison against a single
+    numeric column that one-hot's column-count inflation otherwise breaks.
+    Non-categorical entries pass through unchanged. Returned sorted
+    descending, same convention as the ungrouped dict.
+    """
+    grouped: dict = {}
+    for name, value in per_feature.items():
+        key = group_name_by_source(name, categorical_columns)
+        grouped[key] = grouped.get(key, 0.0) + float(value)
+    return dict(sorted(grouped.items(), key=lambda kv: kv[1], reverse=True))
+
+
 def split_matrix_for_model(X, feature_names: Sequence[str], model: str):
     """Return ``(X_model, names_model)`` -- the view of ``X`` a detector may use.
 

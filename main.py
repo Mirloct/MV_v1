@@ -88,6 +88,16 @@ class PipelineConfig:
     console_ui: bool = True
     numeric_transform: str = "yeo-johnson"
     categorical_encoding: str = "onehot"
+    # Categories below this fraction of rows collapse into one "infrequent"
+    # bucket before encoding (`fit_transform_panel`'s own default, previously
+    # only reachable by calling the preprocessing module directly). Raising
+    # this shrinks how many one-hot columns a high-cardinality categorical
+    # expands into -- without abandoning one-hot's category-identity signal
+    # for the VAE the way switching to "frequency"/"ordinal" encoding would
+    # -- when the granularity is inflating the VAE's per-feature attribution
+    # or score contribution; see CONTEXT.md "VAE feature attribution:
+    # categorical granularity".
+    rare_min_frequency: float = 0.001
     # Numeric NaN fill. "zero" (default) is statistic-free: nothing is
     # estimated from the data, so it cannot leak across the train/test
     # boundary or shift when the fit window changes. Paired with
@@ -529,6 +539,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             fit_mask=train_mask,
             numeric_transform=config.numeric_transform,
             categorical_encoding=config.categorical_encoding,
+            rare_min_frequency=config.rare_min_frequency,
             impute_numeric=config.impute_numeric,
             add_panel_features=config.panel_features,
             random_state=config.seed,
@@ -1117,8 +1128,18 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 except Exception as exc:
                     logger.warning("latent_space_plot failed (%s); continuing.", exc)
                 try:
+                    # Original (pre-transform) categorical column names, so
+                    # the chart/diagnostic can sum one-hot-derived columns
+                    # back under their source variable instead of letting a
+                    # high-cardinality categorical dominate the ranking by
+                    # column count alone -- see CONTEXT.md "VAE feature
+                    # attribution: categorical granularity".
+                    categorical_columns = df.select_dtypes(
+                        include=["object", "category"]
+                    ).columns.tolist()
                     recon = reconstruction_error_by_feature(
-                        detector, X_model, feature_names=names_model
+                        detector, X_model, feature_names=names_model,
+                        categorical_columns=categorical_columns,
                     )
                     _add_fig(
                         figures, "VAE per-feature reconstruction error",
@@ -1138,7 +1159,12 @@ def run_pipeline(config: PipelineConfig) -> dict:
             from src.interpretability import export_attribution_workbook
 
             try:
-                attribution_path = export_attribution_workbook(model_attributions)
+                categorical_columns = df.select_dtypes(
+                    include=["object", "category"]
+                ).columns.tolist()
+                attribution_path = export_attribution_workbook(
+                    model_attributions, categorical_columns=categorical_columns,
+                )
                 observability.check(
                     name="artifact.attribution_workbook_written", category="artifact",
                     definition="The full per-feature SHAP/reconstruction-error "
@@ -1339,6 +1365,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Numeric transform for preprocessing (default 'yeo-johnson').")
     parser.add_argument("--categorical-encoding", default="onehot",
                         help="Categorical encoding for preprocessing (default 'onehot').")
+    parser.add_argument("--rare-min-frequency", type=float, default=0.001,
+                        help="Categories below this fraction of rows collapse into one "
+                             "'infrequent' bucket before encoding (default 0.001 = 0.1%%). "
+                             "Raise this if a high-cardinality categorical is inflating the "
+                             "VAE's per-feature attribution/score via one-hot column count "
+                             "-- see the 'vae_by_source' sheet in feature_attribution.xlsx "
+                             "to check first.")
     parser.add_argument("--no-zero-impute", action="store_true",
                         help="Fill numeric NaNs with the column MEDIAN instead of 0.0. "
                              "Zero-fill is the default because it estimates nothing "
@@ -1446,6 +1479,7 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         seed=args.seed,
         numeric_transform=args.numeric_transform,
         categorical_encoding=args.categorical_encoding,
+        rare_min_frequency=args.rare_min_frequency,
         impute_numeric=("median" if args.no_zero_impute else "zero"),
         supervised=args.supervised,
         live_view=args.live_view,

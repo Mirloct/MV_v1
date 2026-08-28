@@ -1140,3 +1140,83 @@ status=success`. Every function in all three interpretability modules that
 `main.py` calls now has at least a `started`/`completed` pair, so a stall
 anywhere in Phase 10 or 10b -- not just inside the SHAP paths -- is now
 diagnosable from `run_events.jsonl` alone.
+
+---
+
+## 2026-08-28 (same day, later still) — VAE attribution: categorical granularity measured and fixed
+
+**Report:** "mis campos strings que van al VAE son tan granulares que ocupan
+casi todo el [share] del score de anomalía" -- a real mechanism, not a bug in
+anything shipped earlier today. One-hot encoding turns one string column
+into one column *per category*; the VAE's score (`score_samples`) and its
+per-feature reconstruction-error attribution are both **sums over columns**,
+so a high-cardinality categorical (many one-hot slices) can out-weigh a
+single numeric column in the ranking, and -- if granular enough -- in the
+score itself, purely by column count, not by being more informative. This is
+the flip side of a deliberate, documented design choice (`CONTEXT.md`
+"Feature routing by dtype"): the VAE keeps categorical-derived columns
+specifically so category *identity* is available for the "contextual"
+anomaly definition; the failure mode here is that identity's cardinality was
+never checked against how much it ends up weighing.
+
+**Two things were genuinely unclear before fixing anything: whether this was
+a reporting artifact (A) or a real score-level skew (B).** Both turn out to
+be answerable from the *same* measurement, because the per-column
+reconstruction error already sums directly into `score_samples` -- there is
+no separate "score-level" quantity to check independently.
+
+**Added, all additive / opt-in (no existing caller's behavior changes):**
+
+1. **`src/preprocessing/pipeline.py::group_name_by_source` /
+   `aggregate_attribution_by_source`** -- maps a transformed feature name
+   (e.g. `cat__region_North`) back to its original source column (`region`),
+   longest-match-first against the known original categorical column names
+   so e.g. `region_type` is never mis-grouped under `region`, and sums a
+   `{feature: value}` attribution dict's one-hot-derived entries back
+   together under that source column. Unit-tested including the ambiguous
+   `region` vs. `region_type` case, and a conservation check (grouped total
+   == ungrouped total -- summing cannot lose or invent error mass).
+2. **`reconstruction_error_by_feature(..., categorical_columns=[...])`**
+   (new optional parameter, default `None` -- every existing caller is
+   unaffected) -- when given the original categorical column names: logs and
+   records a `categorical_contribution` checkpoint with the categorical
+   block's share of total *columns* vs. share of total *reconstruction
+   error* (over-represented / roughly proportional / under-represented), and
+   the bar chart ranks/labels by the grouped-by-source values instead of raw
+   one-hot slices. The **returned dict is unchanged** (still the full,
+   ungrouped per-column detail) -- grouping only touches the chart and the
+   diagnostic, never silently the data a caller stores.
+3. **`export_attribution_workbook(..., categorical_columns=[...])`** -- when
+   a `"vae"` entry is present, writes an additional `vae_by_source` sheet
+   (grouped) alongside the existing, still fully granular `vae` sheet.
+4. **`main.py` always passes `categorical_columns`** (`df.select_dtypes(
+   include=["object", "category"]).columns.tolist()`) to both call sites
+   above -- the diagnostic and the grouped views are on by default for every
+   run, not something a user has to remember to request.
+5. **`--rare-min-frequency`** (new CLI flag / `PipelineConfig.
+   rare_min_frequency`, default `0.001` -- `fit_transform_panel`'s own
+   pre-existing default, previously only reachable by calling the
+   preprocessing module directly) -- exposed as the lever to pull *if* the
+   diagnostic in (2) shows real over-representation: raising it collapses
+   more low-frequency categories into one "infrequent" bucket before
+   one-hot, shrinking column count per categorical while keeping identity
+   for the common ones. `--categorical-encoding frequency`/`ordinal`
+   (already available, no code change) is the more drastic option --
+   collapses each categorical to one column regardless of cardinality, at
+   the cost of losing category identity for the "contextual" anomaly
+   definition, so it is documented as a deliberate trade-off requiring a
+   re-tune, not pushed as the default fix.
+
+**Verified two ways.** (1) A synthetic scenario deliberately more granular
+than this project's own synthetic panel (three string columns with 40/60/25
+categories vs. this project's 10/4/6/4/6/4) against a real `VAEDetector`:
+grouping correctly reduced 140 columns to 18 report rows, all three source
+columns present with zero raw one-hot slices remaining, and the grouped
+ranking's top entry (`branch_id`, aggregated) differed from the ungrouped
+ranking's top entry (`num__income`) -- demonstrating the exact effect being
+fixed. (2) A full `python main.py --quick --no-tune` run against this
+project's own (much less granular) synthetic panel: categorical columns are
+64.7% of features and 67.0% of reconstruction error -- correctly diagnosed
+as "roughly proportional," i.e. **not** a real problem on this project's own
+data, confirming the diagnostic does not cry wolf when the effect is not
+actually present. 41/41 health checks passed.

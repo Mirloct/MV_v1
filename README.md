@@ -359,6 +359,10 @@ python main.py --top-n 100       # exporta los 100 individuos más riesgosos
 python main.py --panel-features  # reactiva lag/diff/ratio/own-z + estacionalidad
 python main.py --supervised      # usa ground truth para tuneo/métricas (default: no supervisado)
 python main.py --contamination 0.05   # punto de operación del Isolation Forest
+python main.py --rare-min-frequency 0.01   # agrupa más categorías raras antes del one-hot
+                                            # (si una categórica muy granular domina el
+                                            # ranking de atribución del VAE — ver feature_attribution.xlsx,
+                                            # hoja vae_by_source)
 python main.py --no-live-view    # no abre la vista de progreso local en el navegador
 python main.py --help
 ```

@@ -14,10 +14,11 @@ whole.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Optional, Sequence
 
 import pandas as pd
 
+from src.preprocessing.pipeline import aggregate_attribution_by_source
 from src.utils import observability, paths
 from src.utils.logging_config import log_phase, setup_logging
 
@@ -66,7 +67,9 @@ _SHEETS: dict = {
 
 
 def export_attribution_workbook(
-    per_model: dict, out_path: str = _DEFAULT_OUT,
+    per_model: dict,
+    out_path: str = _DEFAULT_OUT,
+    categorical_columns: Optional[Sequence[str]] = None,
 ) -> Optional[str]:
     """Write every model's full per-feature attribution to one ``.xlsx``.
 
@@ -77,6 +80,15 @@ def export_attribution_workbook(
             reconstruction_error_by_feature(...)}``. A model whose dict is
             empty or missing is skipped rather than writing a blank sheet.
         out_path: Destination ``.xlsx``.
+        categorical_columns: Optional original (pre-transform) categorical
+            column names. When given and a ``"vae"`` entry is present, an
+            additional ``vae_by_source`` sheet sums that model's
+            one-hot-derived columns back under their source variable
+            (`aggregate_attribution_by_source`) -- the uncropped ``"vae"``
+            sheet still lists every one-hot column individually (nothing
+            about the detailed sheet changes), this is a second, complementary
+            view for judging whether a categorical dominates by genuine
+            reconstruction cost or merely by column count.
 
     Returns:
         The written path, or ``None`` if no model had any attribution to
@@ -120,6 +132,30 @@ def export_attribution_workbook(
                     writer.sheets[sheet_name]["A1"] = description
                 sheets_written.append((sheet_name, len(df)))
                 _checkpoint("sheet_written", model=sheet_name, n_variables=len(df))
+
+                if model_name == "vae" and categorical_columns:
+                    grouped = aggregate_attribution_by_source(
+                        importances, categorical_columns
+                    )
+                    grouped_rows = list(grouped.items())
+                    grouped_df = pd.DataFrame(
+                        grouped_rows, columns=["variable", value_col]
+                    )
+                    grouped_sheet = "vae_by_source"
+                    grouped_df.to_excel(
+                        writer, sheet_name=grouped_sheet, index=False, startrow=2
+                    )
+                    writer.sheets[grouped_sheet]["A1"] = (
+                        "Igual que la hoja 'vae', pero las columnas derivadas de "
+                        "variables categóricas (one-hot) se suman de vuelta bajo "
+                        "su variable de origen -- comparación justa contra una "
+                        "columna numérica, sin que la cardinalidad de una "
+                        "categórica infle su lugar en el ranking."
+                    )
+                    sheets_written.append((grouped_sheet, len(grouped_df)))
+                    _checkpoint(
+                        "sheet_written", model=grouped_sheet, n_variables=len(grouped_df),
+                    )
 
         if not sheets_written:
             log.warning(

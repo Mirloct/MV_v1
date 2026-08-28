@@ -411,6 +411,47 @@ arrangement (both models export their own Excel).
   sheet per model (`mean_abs_shap` for the forest, `mean_reconstruction_error`
   for the VAE — not comparable across sheets, so each sheet's row 1 states
   its own methodology).
+- **VAE feature attribution: categorical granularity.** One-hot encoding
+  turns one string column into one column *per category*; since the VAE's
+  score and its per-feature reconstruction-error attribution are both sums
+  **over columns**, a high-cardinality categorical (many one-hot slices) can
+  out-weigh a single numeric column in both the ranking and, if granular
+  enough, the score itself — not because it is more informative, but because
+  there are more columns representing it. Two additive, non-breaking pieces
+  address this:
+  - `reconstruction_error_by_feature(..., categorical_columns=[...])`
+    (`src/interpretability/vae_explain.py`) — when given the *original*
+    (pre-transform) categorical column names, logs and checkpoints
+    (`interpretability.vae_explain.categorical_contribution`) what share of
+    total reconstruction error vs. column count the categorical-derived
+    block carries (over-represented / roughly proportional /
+    under-represented — a measured fact, not an assumption), and the bar
+    chart groups one-hot slices back under their source variable
+    (`src/preprocessing/pipeline.py::aggregate_attribution_by_source`,
+    `group_name_by_source`) so the ranking is a fair comparison. The
+    **returned dict stays the full, ungrouped detail** regardless — grouping
+    only touches the chart/diagnostic, never silently the data.
+    `main.py` always passes this (`df.select_dtypes(include=["object",
+    "category"]).columns`).
+  - `export_attribution_workbook(..., categorical_columns=[...])` writes an
+    additional `vae_by_source` sheet (grouped) alongside the existing
+    uncropped `vae` sheet (still fully granular) — both are always written
+    together when the run has categorical columns, so a reviewer can compare
+    either view.
+  - **If the diagnostic shows genuine over-representation and the ranking/
+    grouping above is not enough** (i.e. the *score itself*, not just the
+    report, is judged too categorical-driven): `--rare-min-frequency`
+    (`PipelineConfig.rare_min_frequency`, default `0.001`, threaded to
+    `fit_transform_panel`) collapses low-frequency categories into one
+    bucket *before* one-hot encoding, shrinking column count per categorical
+    while keeping identity for common categories — raise it. The more
+    drastic lever, `--categorical-encoding frequency` (or `ordinal`),
+    collapses each categorical to **one** numeric column regardless of
+    cardinality, eliminating the effect entirely — at the cost of the VAE
+    losing the specific category identity that the "contextual" anomaly
+    definition relies on (see "Feature routing by dtype" above); this
+    changes what the VAE is trained on and needs a re-tune, so treat it as a
+    deliberate trade-off, not a default fix.
 
 ## Observability, assumption gate, and tuning early-stopping
 

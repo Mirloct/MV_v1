@@ -931,9 +931,30 @@ def run_pipeline(config: PipelineConfig) -> dict:
             # a report that quietly showed ROC/PR against ground truth would be
             # claiming an evaluation the run did not perform. In the default
             # mode the report gets scores + threshold and nothing label-derived.
+            #
+            # `true_oot_entity_scores` is deliberately NOT `scores[eval_mask]`:
+            # `eval_mask` is the test block (see the Phase 3a comment on why
+            # `eval_mask`/`oot_mask` are kept distinct), and it is not
+            # deduplicated by entity -- an entity can appear more than once
+            # when `n_oot_periods > 1`. This dict is keyed by `entity_id` and
+            # holds each entity's max score across the genuine OOT window,
+            # the same dedup Phase 9's `export_oot_top_anomalies` applies --
+            # so the model-agreement chart below describes the exact same
+            # population as the alert queue: one row per real individual,
+            # drawn only from held-out OOT rows.
+            oot_ids = keys[entity_col].to_numpy()[oot_mask]
+            oot_entity_scores = scores[oot_mask]
+            true_oot_entity_scores: dict = {}
+            for eid, sc in zip(oot_ids, oot_entity_scores):
+                k = str(eid)
+                prev = true_oot_entity_scores.get(k)
+                if prev is None or sc > prev:
+                    true_oot_entity_scores[k] = float(sc)
+
             chart_data["models"][name] = {
                 "oot_scores": [float(v) for v in scores[eval_mask]],
                 "oot_labels": ([int(v) for v in labels[eval_mask]] if supervised else None),
+                "true_oot_entity_scores": true_oot_entity_scores,
                 "metrics": metrics,
                 "supervised": bool(supervised),
             }

@@ -174,17 +174,21 @@ FIGURE_NOTES: dict[str, str] = {
         "importa es la cola derecha, donde corta el umbral."
     ),
     "model_agreement": (
-        "Cada punto es un individuo, posicionado según su percentil de "
-        "rango bajo cada detector. Este es el diagnóstico central cuando no "
-        "hay etiquetas disponibles: los dos modelos se basan en principios "
-        "distintos (geometría de aislamiento frente a error de "
-        "reconstrucción) y ven conjuntos de features distintos, por lo que "
-        "un individuo con puntaje alto en ambos cuenta con evidencia "
-        "corroborada de forma independiente. Los puntos en la esquina "
-        "superior derecha son los candidatos más fuertes; los puntos altos "
-        "en un eje y bajos en el otro marcan casos donde los dos métodos "
+        "Mapa de densidad: cada celda cuenta cuántos individuos del bloque "
+        "OOT genuino (uno por entidad, no por fila) caen en ese par de "
+        "percentiles de rango bajo cada detector. Este es el diagnóstico "
+        "central cuando no hay etiquetas disponibles: los dos modelos se "
+        "basan en principios distintos (geometría de aislamiento frente a "
+        "error de reconstrucción) y ven conjuntos de features distintos, "
+        "por lo que un individuo con puntaje alto en ambos cuenta con "
+        "evidencia corroborada de forma independiente. La línea punteada "
+        "diagonal marca el acuerdo perfecto; el recuadro naranja señala el "
+        "cuadrante top-5% x top-5%, los candidatos más fuertes. Celdas "
+        "densas fuera de la diagonal marcan casos donde los dos métodos "
         "realmente discrepan, y vale la pena inspeccionarlos precisamente "
-        "porque un detector ve algo que el otro no."
+        "porque un detector ve algo que el otro no. El panel lateral "
+        "resume la misma población en una matriz de cuartiles 4x4 -- la "
+        "vista de tabla para una revisión rápida."
     ),
     "roc_pr": (
         "Ambos modelos en los mismos ejes, evaluados solo sobre el bloque "
@@ -786,52 +790,112 @@ def build_plotly_figures(chart_data: dict, log=None) -> list[dict]:
                 log.warning("Score-distribution chart for %s skipped (%s).", m, exc)
 
     # -- 2. Model agreement: the key label-free diagnostic ------------------- #
+    # A 2D density heatmap over the GENUINE held-out OOT block, one row per
+    # individual -- built from `true_oot_entity_scores` (main.py), which
+    # de-duplicates each entity to its max score across the OOT window, the
+    # same rule Phase 9's `export_oot_top_anomalies` uses for the alert
+    # queue. This deliberately replaces the historical `oot_scores` field
+    # (actually the *test* block -- see the Phase 3a comment on why
+    # `eval_mask`/`oot_mask` are kept distinct in main.py) so this chart and
+    # the exported queue describe the exact same population.
+    #
+    # Plotly has no Cartesian hexbin (its hexbin binning is mapbox-only), so
+    # `Histogram2d` is the direct equivalent for an x/y percentile pair.
     if len(ordered) >= 2:
         try:
             a, b = ordered[0], ordered[1]
-            sa = np.asarray(models[a].get("oot_scores") or [], dtype=float)
-            sb = np.asarray(models[b].get("oot_scores") or [], dtype=float)
-            if sa.size and sa.size == sb.size:
+            ea = models[a].get("true_oot_entity_scores") or {}
+            eb = models[b].get("true_oot_entity_scores") or {}
+            common = sorted(set(ea) & set(eb))
+            n = len(common)
+            if n >= 4:
                 from scipy.stats import rankdata, spearmanr
 
-                pa = 100.0 * rankdata(sa) / len(sa)
-                pb = 100.0 * rankdata(sb) / len(sb)
+                def _percentiles(entity_scores: dict) -> dict:
+                    ids = list(entity_scores.keys())
+                    vals = np.asarray([entity_scores[i] for i in ids], dtype=float)
+                    pct = 100.0 * rankdata(vals) / len(vals)
+                    return dict(zip(ids, pct))
+
+                pa_all, pb_all = _percentiles(ea), _percentiles(eb)
+                pa = np.asarray([pa_all[i] for i in common], dtype=float)
+                pb = np.asarray([pb_all[i] for i in common], dtype=float)
+                sa = np.asarray([ea[i] for i in common], dtype=float)
+                sb = np.asarray([eb[i] for i in common], dtype=float)
                 rho = float(spearmanr(sa, sb).statistic)
-                k = max(1, int(round(0.05 * len(sa))))
-                top_a = set(np.argsort(-sa)[:k].tolist())
-                top_b = set(np.argsort(-sb)[:k].tolist())
-                overlap = len(top_a & top_b)
-                fig = go.Figure()
-                # Density is the message here, so the marks stay small and
-                # semi-transparent: at ~1k points a full-size opaque dot with a
-                # surface ring would read as a solid block and hide exactly the
-                # crowding the chart exists to show.
-                fig.add_trace(go.Scattergl(
-                    x=pa, y=pb, mode="markers", name="individuo (fila OOT)",
-                    showlegend=False,
-                    marker=dict(size=_MARKER_SIZE, opacity=0.42),
-                    hovertemplate=(f"percentil {a} " + "%{x:.1f}<br>"
-                                   + f"percentil {b} " + "%{y:.1f}<extra></extra>"),
-                ))
-                for edge in (95,):
-                    fig.add_vline(x=edge, line=dict(dash="dot", width=1,
-                                                    color="rgba(128,138,160,0.7)"))
-                    fig.add_hline(y=edge, line=dict(dash="dot", width=1,
-                                                    color="rgba(128,138,160,0.7)"))
+                overlap = int(((pa >= 95.0) & (pb >= 95.0)).sum())
+
+                # 4x4 quartile confusion matrix -- 0=Q1 (0-25) .. 3=Q4 (75-100).
+                qa = np.clip((pa / 25.0).astype(int), 0, 3)
+                qb = np.clip((pb / 25.0).astype(int), 0, 3)
+                counts = np.zeros((4, 4), dtype=int)
+                np.add.at(counts, (qb, qa), 1)
+                pct_matrix = 100.0 * counts / max(n, 1)
+                q_labels = ["Q1 (0-25)", "Q2 (25-50)", "Q3 (50-75)", "Q4 (75-100)"]
+                cell_text = np.array([
+                    [f"{counts[i, j]}<br>{pct_matrix[i, j]:.1f}%" for j in range(4)]
+                    for i in range(4)
+                ])
+
+                fig = make_subplots(
+                    rows=1, cols=2, column_widths=[0.66, 0.34],
+                    horizontal_spacing=0.16,
+                    subplot_titles=("Densidad de individuos", "Cuartiles IF x VAE"),
+                )
+                # Density panel: count of individuals per percentile cell.
+                fig.add_trace(go.Histogram2d(
+                    x=pa, y=pb, xbins=dict(start=0, end=100, size=5),
+                    ybins=dict(start=0, end=100, size=5), colorscale="Viridis",
+                    colorbar=dict(title="individuos", x=0.585, len=0.92, thickness=13),
+                    hovertemplate=(f"percentil {a} " + "%{x}<br>"
+                                   + f"percentil {b} " + "%{y}<br>%{z} individuos<extra></extra>"),
+                ), row=1, col=1)
+                # y=x reference: perfect rank agreement between the two detectors.
+                fig.add_trace(go.Scatter(
+                    x=[0, 100], y=[0, 100], mode="lines", showlegend=False,
+                    hoverinfo="skip",
+                    line=dict(dash="dash", width=1.3, color="rgba(235,238,245,0.85)"),
+                ), row=1, col=1)
+                # Top-5% x top-5% quadrant, outlined so it reads against any
+                # density colour underneath it.
+                fig.add_shape(
+                    type="rect", x0=95, x1=100, y0=95, y1=100, row=1, col=1,
+                    line=dict(color="#ff5a36", width=2.2), fillcolor="rgba(0,0,0,0)",
+                )
                 fig.add_annotation(
-                    x=0.02, y=0.98, xref="paper", yref="paper", xanchor="left",
+                    x=0.015, y=0.985, xref="paper", yref="paper", xanchor="left",
                     yanchor="top", showarrow=False, align="left", font=dict(size=11),
                     text=(f"Spearman rho = {rho:.3f}<br>"
-                          f"solapamiento top-5%: {overlap} de {k} individuos"),
+                          f"solapamiento cuadrante top-5%: {overlap} individuos "
+                          f"({100.0 * overlap / n:.1f}% de {n})"),
                 )
+                # Side panel: same population, binned by quartile instead of
+                # percentile -- the coarse view a reviewer can read as a table.
+                fig.add_trace(go.Heatmap(
+                    z=counts, x=q_labels, y=q_labels, colorscale="Viridis",
+                    text=cell_text, texttemplate="%{text}", textfont=dict(size=10),
+                    colorbar=dict(title="individuos", x=1.02, len=0.92, thickness=13),
+                    hovertemplate=(f"cuartil {a} " + "%{x}<br>"
+                                   + f"cuartil {b} " + "%{y}<br>%{z} individuos<extra></extra>"),
+                ), row=1, col=2)
+
                 fig.update_layout(_base_layout(
-                    go, f"¿Coinciden los dos detectores? {a} vs {b} (OOT)", height=420,
+                    go, f"¿Coinciden los dos detectores? {a} vs {b} "
+                        f"(OOT genuino, {n} individuos únicos)", height=440,
                 ))
-                fig.update_xaxes(title_text=f"percentil de puntaje de {a}", range=[0, 100])
-                fig.update_yaxes(title_text=f"percentil de puntaje de {b}", range=[0, 100],
-                                 scaleanchor="x", scaleratio=1)
+                fig.update_xaxes(title_text=f"percentil de puntaje de {a}",
+                                  range=[0, 100], row=1, col=1)
+                fig.update_yaxes(title_text=f"percentil de puntaje de {b}",
+                                  range=[0, 100], scaleanchor="x", scaleratio=1, row=1, col=1)
+                fig.update_xaxes(title_text=f"cuartil {a}", row=1, col=2)
+                fig.update_yaxes(title_text=f"cuartil {b}", row=1, col=2)
                 emit(fig, "fig-agreement", "Concordancia entre detectores",
                      FIGURE_NOTES["model_agreement"], ["__neutral__"])
+            elif n and log:
+                log.warning(
+                    "Model-agreement chart skipped: only %d individuals common to "
+                    "both models' genuine OOT block (need >= 4).", n,
+                )
         except Exception as exc:
             if log:
                 log.warning("Model-agreement chart skipped (%s).", exc)

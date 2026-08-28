@@ -244,7 +244,8 @@ Applied uniformly so the figures read as one system (see
 | --- | --- |
 | Column / bar | 4px rounded data-end (`marker.cornerradius`), `bargap=0.28` leaving air in every band |
 | Line | 2px |
-| Scatter mark | 7px, semi-transparent — density is the message on the agreement plot |
+| Scatter mark | 7px, semi-transparent — used where individual points still carry the signal (e.g. the path-length-vs-score plot) |
+| Detector-agreement density | `go.Histogram2d`, Viridis colorscale, 5-percentile-point bins, y=x reference line, top-5%-x-top-5% quadrant outlined — see below |
 | Gridlines | hairline, one step off surface, recessive |
 | Legend | present for ≥2 series; **omitted for a single series** (the title already names it) |
 | Series colour | fixed per model, never cycled — iForest blue, VAE orange; CVD-validated |

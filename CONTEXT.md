@@ -565,11 +565,30 @@ arrangement (both models export their own Excel).
   own anomaly rate as its baseline, not 0.5), one score-distribution
   histogram **per model** (never a dual axis — the two detectors' scores
   live on different, non-comparable scales), a headline metric comparison,
-  recall by injected anomaly type, and a detector-agreement scatter (score
-  percentile under each detector, annotated with Spearman rho and top-5%
-  overlap) — the last is the central diagnostic when there is no ground
-  truth, since the two detectors use different principles and (per the
-  dtype-routing contract above) different feature sets.
+  recall by injected anomaly type, and a detector-agreement density heatmap
+  — the central diagnostic when there is no ground truth, since the two
+  detectors use different principles and (per the dtype-routing contract
+  above) different feature sets.
+  - **Population, made exact (2026-08-28):** built from
+    `chart_data["models"][name]["true_oot_entity_scores"]`
+    (`main.py` Phase 8) — `{entity_id: max score across the genuine
+    `oot_mask` window}` — the same one-row-per-individual dedup
+    `export_oot_top_anomalies` applies for the alert queue. This
+    deliberately does **not** reuse `oot_scores` (misleadingly named:
+    that's `scores[eval_mask]`, the **test** block — see the `eval_mask`
+    vs `oot_mask` split above — and not deduplicated by entity), so the
+    chart and the Excel deliverable are now provably the same population
+    (verified: with `n_oot_periods=2`, both report the identical entity
+    count).
+  - **Rendering:** a `go.Histogram2d` (Plotly's Cartesian equivalent of a
+    hexbin — true hexbin binning is mapbox-only) of rank percentile under
+    each detector, Viridis-coloured by individual count, with a y=x
+    reference line and the top-5%-x-top-5% quadrant (score ≥ its model's
+    95th percentile on both axes) outlined by a shape. Spearman rho and
+    the count of individuals inside that quadrant are kept as an
+    annotation. A second panel (`go.Heatmap`, `make_subplots`) shows the
+    same population as a 4x4 quartile confusion matrix (count + % per
+    cell) — the table view for a fast read.
 - Charts and the glossary are conditioned on `config.supervised`: a run that
   did not compute a supervised metric does not show it, and does not list it
   in the indicator glossary either.

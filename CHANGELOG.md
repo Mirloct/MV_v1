@@ -1277,3 +1277,71 @@ in the exported table (after every raw feature column), since
 promoting it next to SCORE/BAND for visibility would need a small change to
 `export_oot_top_anomalies`'s column ordering, not attempted here since it
 touches the headline deliverable's layout and was not asked for.
+
+---
+
+## 2026-08-28 (same day, later still still) — model-agreement chart rebuilt as a genuine-OOT density heatmap
+
+**Ask, three parts:** (1) confirm the per-row `top_5_variables` column from
+the entry above lands in *both* the IF P90 export and the VAE export, not
+just whichever one happens to be the deliverable; (2) confirm the alert
+queue is deduplicated to unique OOT `entity_id`s, matching what the anomaly
+report describes; (3) replace the IF-vs-VAE agreement scatterplot with a
+hexbin/2D-density heatmap: Viridis colour by count, the top-5%-x-top-5%
+quadrant outlined, Spearman rho + top-5% overlap kept as an annotation, a
+y=x reference line, and a side-panel 4x4 quartile confusion matrix.
+
+**(1) and (2) were already correct, verified rather than changed:** ran the
+full pipeline with `--no-stack-iforest-into-vae` (parallel mode, the only
+config that produces both `oot_p90_iforest.xlsx` and `oot_p90_vae.xlsx` in
+one run) -- both files carry `top_5_variables` with 0 nulls across their 50
+rows and genuinely different content per model (IF's queue and VAE's queue
+rank different individuals, as documented). `export_oot_top_anomalies`
+already deduplicates to one row per `entity_id` (keeps each entity's
+highest-scoring OOT month) before selecting the P90/P95/P99 bands, so the
+"unique entity_id" property already held.
+
+**(3) is a real fix, not just a redraw.** The old "Model agreement"
+scatterplot (`report_content.py`, `fig-agreement`) was titled "(OOT)" but
+actually plotted `oot_scores`, which is `scores[eval_mask]` -- `eval_mask`
+is the **test** block (`main.py`'s Phase 3a comment on why `eval_mask` and
+`oot_mask` are kept distinct), not the genuine held-out OOT window Phase 9's
+Excel draws from. With `n_oot_periods > 1` it was also not deduplicated by
+entity, so the same person could plot as two separate points. Both defects
+meant this chart could describe a different population than the one the
+alert queue and this very changelog entry's point (2) are about.
+
+**Fixed by adding a real entity-level field, not by patching the chart:**
+`main.py`'s Phase 8 loop now also computes `true_oot_entity_scores` --
+`{entity_id: max score across the genuine oot_mask window}`, the exact same
+dedup rule `export_oot_top_anomalies` uses -- for every model, stored in
+`chart_data["models"][name]`. Verified directly: running with
+`--n-oot-periods 2` (which puts 2 OOT months x 500 entities = 1000 rows into
+`oot_mask`), the export log reports "500 individuals in the OOT block" and
+the new chart's own title reports the identical "500 individuos" -- the
+chart and the deliverable now provably describe the same population.
+
+**The chart itself** (`build_plotly_figures`'s section 2 in
+`report_content.py`): the two models' `true_oot_entity_scores` are inner-
+joined on `entity_id`, each converted to a percentile rank via
+`scipy.stats.rankdata` over that model's own OOT population, then plotted
+as a `go.Histogram2d` (Plotly has no Cartesian hexbin binning -- only a
+mapbox one -- so a 2D histogram heatmap is the direct equivalent, and was
+explicitly accepted as an alternative) with the Viridis colorscale, a y=x
+`go.Scatter` reference line, and a `fig.add_shape` rectangle outlining the
+[95,100]x[95,100] quadrant. Spearman rho and the top-5%-x-top-5% overlap
+count (now defined by the same >=95th-percentile threshold the rectangle
+draws, rather than the old fixed-k rank intersection) are kept as an
+annotation. A second `go.Heatmap` panel bins the same population into a 4x4
+quartile confusion matrix (counts and % of total per cell, via
+`np.add.at`), built with `make_subplots` beside the density panel. Skips
+(with a logged warning, chart omitted rather than the report failing) if
+fewer than 4 entities are common to both models' OOT populations.
+
+**Verified with three full pipeline runs** (`python main.py --quick
+--no-tune`, once default-stacked, once `--no-stack-iforest-into-vae`, once
+`--n-oot-periods 2`): all three produced the `fig-agreement` chart with the
+new `Histogram2d`/`Heatmap` traces, the `Spearman rho` annotation, and the
+"OOT genuino, N individuos" title present in the rendered HTML; health
+checks passed in every run (42/42 parallel-mode, 41/41 stacked-mode); no
+"Model-agreement chart skipped" warning was logged in any run.

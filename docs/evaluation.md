@@ -187,7 +187,18 @@ headcount/fraction, the older behavior. Returns `(path, table_df)`.
 | **ID** (`entity_id`) | **PERIOD** (`time_col`) | **SCORE** (`anomaly_score`) | **BAND** (`p90`/`p95`/`p99`, the highest reached) | **VARIABLES** (raw, human-readable feature values) |
 
 An `alert` column is inserted after BAND when a calibrated `threshold` is
-passed. Percentile cut-offs (and the band assignment) are computed over the
+passed. `main.py` (Phase 9) also attaches a `top_5_variables` column — the
+per-row explanation of *why that individual* scored high (`explain_rows_
+iforest`/`explain_rows_vae`, `src/interpretability/`), as opposed to the
+population-level ranking `shap_summary_iforest`/`reconstruction_error_by_
+feature` produce — computed only for the OOT rows this deliverable draws
+from, not the whole panel. It lands among the VARIABLES columns (last, since
+`export_oot_top_anomalies` preserves `scored_df`'s existing column order),
+not in the fixed ID–PERIOD–SCORE–BAND layout above, and is best-effort: a
+failure computing it logs a warning and the export still proceeds without
+it. See `CONTEXT.md` "Per-row explanation" and `CHANGELOG.md` 2026-08-28.
+
+Percentile cut-offs (and the band assignment) are computed over the
 **full** de-duplicated OOT population before any selection — never over the
 exported subset, which would be circular. If `out_path` is left at the
 default and a `model_name` is given, the file becomes

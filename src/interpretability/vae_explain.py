@@ -9,6 +9,9 @@ Two entry points, both saving figures under ``reports/figures/interpretability/`
   reconstruction error, i.e. which columns the VAE reconstructs worst and thus
   which features drive the anomaly score. Runs the torch model in eval / no-grad
   in batches, densifying sparse input.
+* :func:`explain_rows_vae` -- *per-row* explanation (which features drove
+  *this specific* row's reconstruction error), the complement of
+  `reconstruction_error_by_feature`'s aggregate, population-level ranking.
 
 Score convention (project-wide): **higher score = more anomalous**, where the
 VAE score is the per-row MSE reconstruction error.
@@ -30,11 +33,16 @@ import torch
 from src.preprocessing.pipeline import (
     aggregate_attribution_by_source,
     categorical_feature_mask,
+    group_name_by_source,
 )
 from src.utils import observability, paths
 from src.utils.logging_config import log_phase, setup_logging
 
-__all__ = ["latent_space_plot", "reconstruction_error_by_feature"]
+__all__ = [
+    "latent_space_plot",
+    "reconstruction_error_by_feature",
+    "explain_rows_vae",
+]
 
 _DEFAULT_FIG_DIR = paths.FIGURES_DIR
 
@@ -383,3 +391,90 @@ def reconstruction_error_by_feature(
         )
         _checkpoint("completed")
         return result
+
+
+def explain_rows_vae(
+    detector,
+    X,
+    feature_names=None,
+    top_k: int = 5,
+    categorical_columns=None,
+    batch_size=None,
+):
+    """Per-row explanation: the ``top_k`` features (by squared reconstruction
+    error) driving *each individual row's* anomaly score.
+
+    Complement of `reconstruction_error_by_feature`: that function aggregates
+    over rows to answer "which features matter most overall"; this answers
+    "why is *this* row flagged" for a small, specific set of rows (typically
+    an OOT alert queue) -- suitable for a spreadsheet column read next to
+    each case. Unlike the Isolation Forest's SHAP-based
+    `explain_rows_iforest`, this is always exactly computable (no fallback
+    needed): squared reconstruction error is deterministic and additive by
+    construction, the same quantity `score_samples` sums.
+
+    Args:
+        detector: A fitted :class:`VAEDetector`.
+        X: Preprocessed feature matrix for exactly the rows to explain (dense
+            ndarray or scipy sparse) -- every row is used, not subsampled.
+        feature_names: Optional names aligned to ``X``'s columns.
+        top_k: How many feature names to report per row.
+        categorical_columns: Optional original (pre-transform) categorical
+            column names. When given, one-hot-derived columns are summed
+            back under their source variable **per row** before ranking --
+            same rationale as `reconstruction_error_by_feature`'s aggregate
+            diagnostic (`CONTEXT.md` "VAE feature attribution: categorical
+            granularity"), applied row-by-row instead of in aggregate.
+        batch_size: Rows per forward pass; defaults to the detector's own.
+
+    Returns:
+        A list of length ``len(X)``, same row order: each entry is a
+        comma-joined string of the ``top_k`` feature/source names for that
+        row (descending by squared reconstruction error).
+    """
+    model = getattr(detector, "model_", None)
+    n_rows_requested = int(np.asarray(X).shape[0]) if hasattr(X, "shape") else len(X)
+    if model is None or n_rows_requested == 0:
+        return [None] * n_rows_requested
+
+    Xd = _densify(X)
+    n_rows, n_features = Xd.shape
+    names = (
+        [str(f) for f in feature_names]
+        if feature_names is not None and len(feature_names) == n_features
+        else [f"f{i}" for i in range(n_features)]
+    )
+    device = getattr(detector, "device", "cpu")
+    bs = int(batch_size or getattr(detector, "batch_size", 256) or 256)
+    k = max(1, min(top_k, n_features))
+
+    # Precompute a per-column -> group-index map once, so per-row aggregation
+    # is a cheap segment-sum instead of recomputing string matching per row.
+    if categorical_columns:
+        groups = [group_name_by_source(n, categorical_columns) for n in names]
+        unique_groups = sorted(set(groups))
+        group_of = {g: i for i, g in enumerate(unique_groups)}
+        col_to_group = np.array([group_of[g] for g in groups], dtype=np.int64)
+        report_names = unique_groups
+    else:
+        col_to_group = None
+        report_names = names
+
+    explanations = []
+    model.eval()
+    with torch.no_grad():
+        for start in range(0, n_rows, bs):
+            chunk = Xd[start:start + bs]
+            xb = torch.from_numpy(chunk).to(device)
+            mu, _ = model.encode(xb)
+            x_recon = model.decode(mu)
+            sq = ((xb - x_recon) ** 2).cpu().numpy().astype(np.float64)  # (batch, n_features)
+            for row in sq:
+                if col_to_group is not None:
+                    grouped = np.zeros(len(report_names), dtype=np.float64)
+                    np.add.at(grouped, col_to_group, row)
+                    order = np.argsort(-grouped)[:k]
+                else:
+                    order = np.argsort(-row)[:k]
+                explanations.append(", ".join(report_names[j] for j in order))
+    return explanations

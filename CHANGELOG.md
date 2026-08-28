@@ -1220,3 +1220,60 @@ project's own (much less granular) synthetic panel: categorical columns are
 as "roughly proportional," i.e. **not** a real problem on this project's own
 data, confirming the diagnostic does not cry wolf when the effect is not
 actually present. 41/41 health checks passed.
+
+---
+
+## 2026-08-28 (same day, later still) — per-row "why is this one flagged" explanation
+
+**Ask:** for each record in the OOT alert queue, the top 5 variables driving
+*that specific row's* score, as a column in the Excel a reviewer already
+opens -- not the population-level ranking `shap_summary_iforest`/
+`reconstruction_error_by_feature` already produce, which answers "what
+matters overall," not "why did this one person get flagged."
+
+**Added, both new functions, no existing signature changed:**
+
+- **`explain_rows_iforest(detector, X, feature_names=None, top_k=5, ...)`**
+  (`src/interpretability/iforest_explain.py`) -- explains *exactly* the rows
+  given (not a subsample), reusing `shap.TreeExplainer` through the same
+  isolated-child-process, hard-kill-guarded path (`_run_with_hard_kill`,
+  `_tree_explainer_child`) that `shap_summary_iforest`'s path 1 already uses
+  -- the same tree-depth-driven slowness (2026-08-28 earlier entry) applies
+  here too, just against a small fixed row set instead of a 2000-row
+  subsample. Returns one comma-joined string of the `top_k` feature names
+  per row (by `|SHAP value|`), or `None` for a row that could not be
+  explained -- never raises, since this feeds a business deliverable.
+- **`explain_rows_vae(detector, X, feature_names=None, top_k=5,
+  categorical_columns=None, ...)`** (`vae_explain.py`) -- always exactly
+  computable (no fallback needed): per-row squared reconstruction error,
+  ranked per row. When `categorical_columns` is given, one-hot columns are
+  summed back under their source variable **per row** first
+  (`group_name_by_source`, same mechanism as the aggregate diagnostic two
+  entries above), so the column reports `region`, never `cat__region_North`.
+- **`main.py` Phase 9** computes this for exactly the OOT rows (via
+  `oot_period`, the same population `export_oot_top_anomalies` selects from
+  -- not the whole panel, which would be wasteful at real-data scale) right
+  after `build_scored_frame`, and attaches it as a new `top_5_variables`
+  column before the Excel export. Wrapped in its own try/except: a failure
+  here logs a warning and the export proceeds without the column, rather
+  than losing the headline deliverable over an interpretability add-on.
+
+**Verified two ways.** (1) Unit-level: deliberately injecting an extreme
+value into one known column of a handful of rows makes `explain_rows_
+iforest` and `explain_rows_vae` both name that exact column as the top
+explanation for that exact row; a categorical-grouping check confirms the
+per-row output never leaks a raw one-hot slice name. (2) A full `python
+main.py --quick --no-tune` run: log confirms "500 OOT row(s)" explained, and
+the real `oot_p90_vae.xlsx` output carries a `top_5_variables` column with
+**0 nulls across all 50 exported rows**, genuinely differentiated per
+individual (e.g. one row's top driver is a missing-value indicator, another's
+is the stacked Isolation Forest score, another's is `region`) -- not a
+placeholder or a repeated global ranking. 41/41 health checks passed.
+
+**Known limitation, not fixed here:** the column lands as the *last* column
+in the exported table (after every raw feature column), since
+`export_oot_top_anomalies` preserves `scored_df`'s column order and
+`top_5_variables` is appended after the raw columns already there --
+promoting it next to SCORE/BAND for visibility would need a small change to
+`export_oot_top_anomalies`'s column ordering, not attempted here since it
+touches the headline deliverable's layout and was not asked for.

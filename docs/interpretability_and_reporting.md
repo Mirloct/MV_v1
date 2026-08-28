@@ -117,6 +117,17 @@ the normalized average path length. Inverting gives the exact closed-form
 including `score_pathlen_corr` (the score↔path-length correlation, expected
 negative), score/path-length min/mean/max, `n_samples`, and `figure_path`.
 
+`explain_rows_iforest(detector, X, feature_names=None, top_k=5, ...) -> list`
+
+**Per-row**, not aggregate: the `top_k` feature names (by `|SHAP value|`) for
+*each* row of `X`, same order — the complement of `shap_summary_iforest`'s
+population-level ranking, meant for a small, specific row set (an alert
+queue), not a representative subsample. Reuses `shap.TreeExplainer` through
+the same isolated-process, hard-kill-guarded path as `shap_summary_iforest`.
+Returns one comma-joined string per row, or `None` for a row that could not
+be explained — never raises. `main.py` uses this to populate the OOT
+deliverable's `top_5_variables` column (see `docs/evaluation.md`).
+
 ### VAE — `vae_explain.py`
 
 `latent_space_plot(detector, X, out_dir=..., y=None, ...) -> str`
@@ -148,6 +159,16 @@ always passes this. See `CONTEXT.md` "VAE feature attribution: categorical
 granularity" and `CHANGELOG.md` 2026-08-28 for the mechanism and the levers
 (`--rare-min-frequency`, `--categorical-encoding`) if the diagnostic shows a
 real problem.
+
+`explain_rows_vae(detector, X, feature_names=None, top_k=5, categorical_columns=None, ...) -> list`
+
+**Per-row** complement of `reconstruction_error_by_feature`, same rationale
+as `explain_rows_iforest` above: the `top_k` feature/source names by squared
+reconstruction error for *each* row, always exactly computable (no
+fallback). `categorical_columns` groups one-hot columns back under their
+source variable **per row** (`group_name_by_source`) so the result never
+names a raw one-hot slice. `main.py` uses this for the same
+`top_5_variables` column as the Isolation Forest's version.
 
 ---
 

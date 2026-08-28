@@ -1030,9 +1030,48 @@ def run_pipeline(config: PipelineConfig) -> dict:
         # stacked feature is doing any work.
         if name in config.deliverable_models:
             with log_phase(f"Phase 9: top-N Excel deliverable [{name}]"):
-                from src.evaluation import build_scored_frame, export_oot_top_anomalies
+                from src.evaluation import build_scored_frame, export_oot_top_anomalies, oot_period
 
                 scored_df = build_scored_frame(df, keys, scores, schema)
+
+                # Per-row "why is this individual flagged" explanation, for
+                # exactly the OOT rows this deliverable can select from (not
+                # the whole panel -- an alert queue is small, a real panel
+                # is not). `build_scored_frame` returns one row per `keys`
+                # row in `keys` order, so `oot_mask` computed against `keys`
+                # indexes `scored_df`/`X_model` positionally correctly.
+                try:
+                    time_col = schema.time_col or "period"
+                    oot_periods = oot_period(
+                        keys, time_col=time_col, n_oot_periods=config.n_oot_periods
+                    )
+                    oot_row_mask = keys[time_col].isin(oot_periods).to_numpy()
+                    if oot_row_mask.any():
+                        if name == "iforest":
+                            from src.interpretability import explain_rows_iforest
+                            top_vars = explain_rows_iforest(
+                                detector, X_model[oot_row_mask], feature_names=names_model,
+                            )
+                        else:
+                            from src.interpretability import explain_rows_vae
+                            categorical_columns = df.select_dtypes(
+                                include=["object", "category"]
+                            ).columns.tolist()
+                            top_vars = explain_rows_vae(
+                                detector, X_model[oot_row_mask], feature_names=names_model,
+                                categorical_columns=categorical_columns,
+                            )
+                        scored_df.loc[oot_row_mask, "top_5_variables"] = top_vars
+                        logger.info(
+                            "[%s] per-row top-5 explanation computed for %d OOT row(s).",
+                            name, int(oot_row_mask.sum()),
+                        )
+                except Exception as exc:  # noqa: BLE001 - never block the deliverable
+                    logger.warning(
+                        "[%s] per-row explanation failed (%s); the Excel export "
+                        "will not carry a top_5_variables column.", name, exc,
+                    )
+
                 # `n_oot_periods=config.n_oot_periods` (NOT `n_test_periods`):
                 # `export_oot_top_anomalies` derives its own OOT population as
                 # the trailing `n_oot_periods` distinct periods of `scored_df`

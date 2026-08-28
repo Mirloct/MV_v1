@@ -453,6 +453,41 @@ arrangement (both models export their own Excel).
     changes what the VAE is trained on and needs a re-tune, so treat it as a
     deliberate trade-off, not a default fix.
 
+- **Per-row explanation: "why is this individual flagged" as a column in
+  the OOT deliverable, not just an aggregate ranking.** Every attribution
+  function above (`shap_summary_iforest`, `reconstruction_error_by_feature`)
+  explains a *representative subsample* to build one population-level
+  ranking — it never answers "what drove this specific person's score."
+  `explain_rows_iforest` (`src/interpretability/iforest_explain.py`) and
+  `explain_rows_vae` (`vae_explain.py`) are the per-row complement: given
+  exactly the rows to explain (not subsampled — an alert queue, not a
+  population sample), they return one comma-joined string of the top-`k`
+  feature names **per row**, in the same order. `main.py` (Phase 9) computes
+  this for exactly the OOT rows (`oot_period`-derived mask, the same
+  population `export_oot_top_anomalies` selects from — not the whole panel)
+  right after scoring and attaches it to `scored_df` as **`top_5_variables`**
+  before the Excel export, so it rides along as an ordinary column (it lands
+  last, after the raw feature columns, since `export_oot_top_anomalies`
+  preserves `scored_df`'s column order).
+  - **Isolation Forest**: reuses `shap.TreeExplainer` via the *same*
+    isolated-child-process, hard-kill-guarded path as `shap_summary_
+    iforest`'s path 1 (`_run_with_hard_kill`) — the same tree-depth-driven
+    slowness applies here too, just against a much smaller, fixed row set.
+    Ranked by `|SHAP value|` per row. Never blocks the deliverable: on any
+    failure or a hard-kill, affected rows get `None` rather than raising,
+    and a warning names how many rows were left unexplained.
+  - **VAE**: always exactly computable, no fallback needed — per-row
+    squared reconstruction error `(x_ij - x̂_ij)^2`, ranked per row. When
+    `categorical_columns` is given (`main.py` always passes it), one-hot
+    columns are summed back under their source variable **per row** first
+    (same `group_name_by_source` mechanism as the aggregate diagnostic
+    above), so the column never leaks a raw one-hot slice name like
+    `cat__region_North` — it reports `region`.
+  - Verified: injecting a deliberately extreme value into a known column
+    makes that column top the explanation for that exact row (both
+    detectors); a full pipeline run's real OOT export carries a fully
+    populated (0 nulls), per-row-differentiated `top_5_variables` column.
+
 ## Observability, assumption gate, and tuning early-stopping
 
 - **`src/utils/observability.py`** — a second, JSON Lines event channel

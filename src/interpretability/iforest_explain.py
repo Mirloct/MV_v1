@@ -14,6 +14,10 @@ so reporting can dump them straight to JSON/YAML:
 * :func:`path_length_analysis` -- ties the anomaly score back to the paper's
   isolation mechanism (anomalies have *shorter* normalized average path
   lengths) using scikit-learn's exact closed-form score, and saves a figure.
+* :func:`explain_rows_iforest` -- *per-row* explanation (which features drove
+  *this specific* row's score), for a small, specific set of rows (typically
+  an alert queue) rather than a representative subsample -- the complement of
+  :func:`shap_summary_iforest`'s aggregate, population-level ranking.
 
 Score convention (project-wide): **higher score = more anomalous**
 (``detector.score_samples`` = ``-sklearn.score_samples``).
@@ -36,7 +40,7 @@ import scipy.sparse as sp
 from src.utils import observability, paths
 from src.utils.logging_config import log_phase, setup_logging
 
-__all__ = ["shap_summary_iforest", "path_length_analysis"]
+__all__ = ["shap_summary_iforest", "path_length_analysis", "explain_rows_iforest"]
 
 _DEFAULT_FIG_DIR = paths.FIGURES_DIR
 
@@ -795,3 +799,103 @@ def path_length_analysis(
         )
         _checkpoint("path_length_completed", n_rows=int(scores.size))
         return summary
+
+
+def explain_rows_iforest(
+    detector,
+    X,
+    feature_names=None,
+    top_k: int = 5,
+    time_budget_s: int = _TREE_EXPLAINER_TIME_BUDGET_S,
+    hard_kill_s: int = _TREE_EXPLAINER_HARD_KILL_S,
+):
+    """Per-row explanation: the ``top_k`` features (by ``|SHAP value|``)
+    driving *each individual row's* anomaly score.
+
+    This is the complement of :func:`shap_summary_iforest`: that function
+    explains a representative *subsample* to build one aggregate,
+    population-level ranking ("which features matter most overall"). This
+    function explains the exact rows it is given -- meant for a small,
+    specific set such as an OOT alert queue -- and returns one answer *per
+    row* ("why is *this* individual flagged"), suitable for a spreadsheet
+    column a reviewer reads next to each case.
+
+    Reuses `shap.TreeExplainer` via the same isolated-child-process,
+    hard-kill-guarded path as `shap_summary_iforest` (`_run_with_hard_kill`,
+    `_tree_explainer_child`) -- the same tree-depth-driven slowness that
+    motivated that safety net applies here too, just against a (usually much
+    smaller) fixed row set instead of a subsample size.
+
+    Args:
+        detector: A fitted :class:`IsolationForestDetector`.
+        X: Preprocessed feature matrix for exactly the rows to explain (dense
+            ndarray or scipy sparse) -- not subsampled internally, unlike
+            `shap_summary_iforest`. Keep this to the rows that actually need
+            an answer (e.g. the alert queue), not the whole panel.
+        feature_names: Optional names aligned to ``X``'s columns.
+        top_k: How many feature names to report per row.
+        time_budget_s / hard_kill_s: Same soft-budget/hard-kill-ceiling
+            meaning as `shap_summary_iforest`'s path 1. If the ceiling fires
+            or SHAP is unavailable, every row gets ``None`` rather than
+            raising -- this must never block the business deliverable it
+            feeds.
+
+    Returns:
+        A list of length ``len(X)``, same row order: each entry is a
+        comma-joined string of the ``top_k`` feature names for that row
+        (descending by ``|SHAP value|``), or ``None`` for a row that could
+        not be explained (SHAP unavailable, or cut off by the hard-kill
+        ceiling on an unusually large/slow request).
+    """
+    log = setup_logging()
+    n_rows_requested = int(np.asarray(X).shape[0]) if hasattr(X, "shape") else len(X)
+    if n_rows_requested == 0:
+        return []
+
+    model = getattr(detector, "model_", None)
+    if model is None:
+        log.warning("explain_rows_iforest: detector has no fitted model_; skipping.")
+        return [None] * n_rows_requested
+
+    Xd = _densify(X)
+    names = _resolve_feature_names(feature_names, Xd.shape[1])
+    calib_rows = min(_TREE_EXPLAINER_CALIBRATION_ROWS, Xd.shape[0])
+
+    try:
+        import shap  # noqa: F401 - import check before spending a subprocess
+
+        result = _run_with_hard_kill(
+            _tree_explainer_child, (model, Xd, calib_rows, time_budget_s), hard_kill_s,
+        )
+        if result.get("stage") != "done":
+            log.warning(
+                "explain_rows_iforest: TreeExplainer unavailable or too slow "
+                "for %d row(s) (%s); no per-row explanations.",
+                n_rows_requested, result.get("error", result.get("stage")),
+            )
+            return [None] * n_rows_requested
+
+        sv = result["sv"]
+        if isinstance(sv, list):
+            sv = sv[0]
+        sv = np.asarray(sv, dtype=np.float64)
+        if sv.ndim == 3:
+            sv = sv[..., 0]
+    except Exception as exc:  # noqa: BLE001 - never block the deliverable this feeds
+        log.warning("explain_rows_iforest failed (%s); no per-row explanations.", exc)
+        return [None] * n_rows_requested
+
+    n_explained = sv.shape[0]
+    if n_explained < n_rows_requested:
+        log.warning(
+            "explain_rows_iforest: only %d of %d requested row(s) were explained "
+            "within the %ds soft budget; the rest get no explanation.",
+            n_explained, n_rows_requested, time_budget_s,
+        )
+    k = max(1, min(top_k, len(names)))
+    explanations = []
+    for i in range(n_explained):
+        order = np.argsort(-np.abs(sv[i]))[:k]
+        explanations.append(", ".join(names[j] for j in order))
+    explanations.extend([None] * (n_rows_requested - n_explained))
+    return explanations

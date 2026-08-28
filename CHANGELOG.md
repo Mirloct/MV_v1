@@ -1000,4 +1000,94 @@ started` with no following `tree_explainer_calibrated` means the calibration
 call itself is the one hanging (the residual gap above), as opposed to a
 `tree_explainer_explain_started` with no `tree_explainer_done`, which means
 the budget-bounded continuation is unexpectedly slow (a calibration
-under-estimate, not a hang).
+under-estimate, not a hang). **This residual gap is closed by the entry
+below, the same day.**
+
+---
+
+## 2026-08-28 (later the same day) — real hard-kill: a production run still hung 3+ hours
+
+**What happened.** The fix above (calibrate-then-bound) was deployed, and a
+real run still hung for **3+ hours with no forward progress**, past every
+soft budget defined. This is exactly the residual gap the previous entry
+named explicitly: a soft time budget only protects cost that scales with the
+number of rows explained *after* calibration returns -- it cannot do
+anything if the *calibration call itself* (or the subsequent bounded explain
+call) simply does not return within a reasonable time, because Python cannot
+preempt a blocked call into a native C/Cython library (shap's internals)
+from a timer, a thread, or a signal handler running in the same process. The
+requirement stated directly: implement an actual, enforced kill.
+
+**Design.** `shap.TreeExplainer` and the model-agnostic `shap.Explainer`
+(paths 1 and 2) now each run inside a freshly spawned child process
+(`multiprocessing`, `"spawn"` context -- required on Windows, and confirmed
+safe here since `main.py`'s entry logic already lives behind `if __name__ ==
+"__main__":`, so re-importing `__main__` in the child cannot re-trigger the
+pipeline). The parent polls the child (`_run_with_hard_kill`,
+`_HARD_KILL_POLL_S = 1` second) up to a hard ceiling
+(`_TREE_EXPLAINER_HARD_KILL_S = 180`, `_MODEL_AGNOSTIC_HARD_KILL_S = 150`);
+if the child has not sent a final result by then, it is forcibly terminated
+(`Process.terminate()`, then `Process.kill()` after a `_HARD_KILL_GRACE_S =
+5`-second grace period) and that path is treated as failed -- the next path
+is tried, exactly as if it had raised an exception. Both ceilings, the grace
+period, and the poll interval are plain integer seconds; no tunable in this
+change is a fraction, since none of them needed to be.
+
+**The child still reports progress before the risk point.** Rather than
+having the child do everything silently and only report a final result
+(which would mean a kill erases the calibration measurement too, undoing the
+2026-08-26 checkpoint work), each child sends a `"calibrated"` message
+*before* attempting the bounded full explain. The parent's polling loop
+processes that message immediately (`on_progress` callback) and emits the
+normal `*_calibrated` / `*_explain_started` checkpoints from it -- so a kill
+during the full-explain phase still leaves the calibration numbers in
+`run_events.jsonl`, only the final `*_done` checkpoint is missing, replaced
+by a new `*_hard_killed` one recording the ceiling that fired.
+
+**Why a subprocess and not a thread.** A `threading.Thread` with
+`join(timeout=...)` can only stop *waiting*; the thread itself keeps running
+in the background (Python has no API to forcibly stop a thread), consuming
+CPU and holding whatever memory it allocated, for as long as the blocked
+call takes to return on its own -- which, per the 3+ hour report, may be
+never within a practical session. Only a separate OS process can be
+unconditionally terminated regardless of what it is doing.
+
+**Verified three ways:**
+
+1. **The kill mechanism itself**, isolated from shap entirely: a worker that
+   sleeps 2s under a 30s ceiling returns normally; a worker that would sleep
+   300s under a 5s ceiling is confirmed killed at ~5.0s (not left running to
+   300s); `multiprocessing.active_children()` shows zero lingering processes
+   afterward.
+2. **The exact reconstructed real-world scenario** (200,000 rows, 125
+   features, `max_samples=0.5`, 300 trees -- the 2026-08-28 entry above)
+   still completes correctly through the now-isolated path: **112.9s**,
+   consistent with the 110.2s measured before subprocess isolation (the
+   ~2.7s difference is process-spawn/pickling overhead, not a regression).
+3. **A real (not simulated) forced kill**, using a tight ceiling
+   (`_TREE_EXPLAINER_HARD_KILL_S = 2`) against a genuinely expensive
+   real model (600 trees, 190 features): path 1 was killed mid-explain,
+   correctly fell through to path 2, which was *also* killed (tight
+   `_MODEL_AGNOSTIC_HARD_KILL_S = 30`), correctly fell through to path 3
+   (permutation importance, already budget-capped since 2026-08-26), and the
+   whole call still returned a valid, non-empty importance dict in 42.8s
+   total -- proving the fallback chain survives two consecutive hard kills,
+   not just one.
+
+**Numeric-argument convention applied to this change** (and worth stating
+as a going-forward rule for this module): every new timing/count constant is
+a plain integer -- `_TREE_EXPLAINER_HARD_KILL_S`, `_MODEL_AGNOSTIC_HARD_
+KILL_S`, `_HARD_KILL_GRACE_S`, `_HARD_KILL_POLL_S`, `_MODEL_AGNOSTIC_
+BACKGROUND_ROWS` -- and every value logged for a human (`calib_seconds`,
+`seconds_per_row`) is rounded to at most 2 decimal places. The one
+pre-existing constant that did not follow this (`_MODEL_AGNOSTIC_TIME_
+BUDGET_S`, previously `60.0`) was tightened to `60` in the same pass.
+
+**Still not, and will not be, fully closed:** if a hard-killed process
+leaves the OS itself in a bad state (not observed, but not provable absent),
+or if `multiprocessing.Process.kill()` fails on a given platform/Python
+build, this degrades to the previous behavior for that one call. This is
+believed sufficient -- `Process.kill()` sends `SIGKILL`-equivalent
+termination, which the OS itself, not this process, enforces -- but it is
+stated rather than assumed given how wrong the "path 1 never needs this"
+assumption from 2026-08-26 turned out to be.

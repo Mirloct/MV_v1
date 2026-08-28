@@ -81,19 +81,30 @@ falling through on failure, and logs which tier fired:
 1. **`shap.TreeExplainer`** on `detector.model_` — native, exact tree SHAP.
    Whether the installed `shap` version accepts a scikit-learn
    `IsolationForest` is version-dependent, so this may raise and trigger the
-   fallback.
+   fallback. Cost scales with **tree depth/leaf count** (driven by
+   `max_samples`, especially as a float fraction of a large training set —
+   see `CONTEXT.md`), not just feature count.
 2. **Model-agnostic `shap.Explainer`** over `detector.score_samples` with a
    small subsample masker — used when tier 1 raises. Cost scales with the
    **feature count** (each evaluation re-scores the forest ~`2*n_features+1`
-   times), so this tier times a couple of calibration rows first and only
-   explains as many more as fit inside a ~60s budget rather than running to
-   completion unbounded — see `CONTEXT.md` and `CHANGELOG.md` 2026-08-26 for
-   why (measured at ~2.7+ hours unbounded at ~180-190 features).
+   times).
 3. **Permutation importance** on `detector.score_samples` — the last resort;
    each feature column is shuffled and the mean absolute change in the anomaly
    score is recorded. Also budgeted: rows are subsampled and `n_repeats` is
    reduced so total `score_samples()` calls stay under a fixed cap regardless
    of feature count.
+
+Tiers 1 and 2 both time a handful of calibration rows against the real
+model first and only explain as many more as fit a soft time budget (~90s /
+~60s), **and** run inside an isolated child process with a hard, enforced
+kill ceiling (~180s / ~150s) — a soft budget alone only protects cost that
+scales with rows explained *after* calibration returns; a real production
+run hung 3+ hours past every soft budget, which only a forced process
+termination can actually stop. A kill is treated like any other failure of
+that tier: the next one is tried. See `CONTEXT.md` and `CHANGELOG.md`
+2026-08-26 / 2026-08-28 for the measurements and the reconstructed real-world
+scenario (a multi-month training block combined with a tuned `max_samples`
+fraction, not feature count alone, turned out to be the actual trigger).
 
 `path_length_analysis(detector, X, out_dir=..., max_samples=20000, ...) -> dict`
 

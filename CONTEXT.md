@@ -359,19 +359,33 @@ arrangement (both models export their own Excel).
   budget (`_TREE_EXPLAINER_TIME_BUDGET_S`, `_MODEL_AGNOSTIC_TIME_BUDGET_S`,
   `_PERM_IMPORTANCE_CALL_BUDGET`, all in `iforest_explain.py`) — degrading to
   a smaller, still-representative sample rather than a smaller time budget.
-  **Residual gap, stated plainly:** this only bounds cost that scales with
-  the number of rows explained *after* calibration; if even the calibration
-  batch itself (`_TREE_EXPLAINER_CALIBRATION_ROWS` / `_MODEL_AGNOSTIC_
-  CALIBRATION_ROWS` rows) does not return, that is a per-call pathology no
-  in-process timing can preempt — only a subprocess-level hard kill could,
-  which is not implemented. See `CHANGELOG.md` 2026-08-26 and 2026-08-28 for
-  the full measurements.
+- **`shap.TreeExplainer` and the model-agnostic `shap.Explainer` run in an
+  isolated child process with a real, enforced kill ceiling** —
+  `_TREE_EXPLAINER_HARD_KILL_S` / `_MODEL_AGNOSTIC_HARD_KILL_S`
+  (`_run_with_hard_kill`, `iforest_explain.py`). The soft time budget above
+  only protects against slowness *after* the calibration call returns; a
+  real production run hung 3+ hours with no forward progress, past every
+  soft budget, proving that assumption wrong. No in-process timer (a thread
+  with a timeout, a signal handler) can stop a blocked call into shap's
+  C/Cython internals from Python — the only way is to run it in a separate
+  OS process and forcibly terminate that process (`SIGTERM`, then
+  `Process.kill()` after a grace period) if it does not finish in time. Both
+  paths are wrapped this way; a kill is treated exactly like an exception —
+  the next path is tried. The child still reports its calibration
+  measurement back to the parent before attempting the (budget-bounded) full
+  explain, so a kill does not erase the fine-grained checkpoints below, only
+  the final "done" one never arrives. Verified: a worker that would block for
+  300s is confirmed killed at the configured ceiling (not left running), with
+  no child process left behind afterward; the exact reconstructed
+  200,000-row/`max_samples=0.5` scenario above still completes in ~113s
+  through the isolated path.
 - **Interpretability has fine-grained health checkpoints for exactly this
   failure mode.** Both `iforest_explain.py` and `vae_explain.py` define a
   module-local `_checkpoint(name, **observed)` that records an always-passing
   `observability.check("interpretability.iforest_shap.<name>" / "...vae_
   explain.<name>", ...)` at every meaningful sub-step (calibration started/
-  measured, full explain started/done, beeswarm render started/done, UMAP
+  measured, full explain started/done, a `*_hard_killed` name when the
+  ceiling above actually fires, beeswarm render started/done, UMAP
   started/done, permutation-importance progress every ~25% of features,
   etc.) — appended to `artifacts/logs/run_events.jsonl` and mirrored live to
   the console dashboard's "Supuestos (IF/VAE)" panel via the existing

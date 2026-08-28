@@ -25,6 +25,7 @@ isolated with shorter average path lengths); no verbatim copy.
 
 from __future__ import annotations
 
+import multiprocessing as mp
 import os
 import time
 import warnings
@@ -79,8 +80,9 @@ def _checkpoint(name: str, **observed) -> None:
 # feature synthetic panel this project was developed against never spent
 # enough time in either fallback to notice. Both fallbacks are therefore kept
 # time/call-budgeted below instead of running unbounded.
-_MODEL_AGNOSTIC_TIME_BUDGET_S = 60.0
+_MODEL_AGNOSTIC_TIME_BUDGET_S = 60
 _MODEL_AGNOSTIC_CALIBRATION_ROWS = 2
+_MODEL_AGNOSTIC_BACKGROUND_ROWS = 100
 _PERM_IMPORTANCE_MAX_SAMPLES = 1000
 _PERM_IMPORTANCE_CALL_BUDGET = 150  # total score_samples() calls across (features x repeats)
 
@@ -88,15 +90,164 @@ _PERM_IMPORTANCE_CALL_BUDGET = 150  # total score_samples() calls across (featur
 # true on every configuration measured directly (up to 600 trees, 200
 # features, max_features down to 0.3, bootstrap either way: 2-23s). Confirmed
 # in production against a real feature-rich dataset that it can still hang
-# well past that on tree/data shapes not reproduced in those tests, so it now
-# gets the same calibrate-then-bound treatment as path 2. This does NOT fully
-# close the gap: it only bounds cost that scales with the number of rows
-# explained. If even `_TREE_EXPLAINER_CALIBRATION_ROWS` rows do not return
-# within the budget, that points to a per-call pathology independent of row
-# count (e.g. a shap/IsolationForest tree-shape interaction), which no
-# in-process timing can preempt -- see the fallback-to-path-2 branch below.
-_TREE_EXPLAINER_TIME_BUDGET_S = 90.0
+# well past that on tree/data shapes not reproduced in those tests (root
+# cause found 2026-08-28: `max_samples` tuned as a float fraction of a
+# multi-month training block builds much deeper trees than the `"auto"`
+# default, and TreeExplainer's cost scales with tree depth/leaf count), so it
+# now gets the same calibrate-then-bound treatment as path 2.
+_TREE_EXPLAINER_TIME_BUDGET_S = 90
 _TREE_EXPLAINER_CALIBRATION_ROWS = 5
+
+# A soft time budget only protects against slowness *after* calibration
+# returns. Confirmed in production (2026-08-28) that this is not always
+# enough on its own: a real run hung 3+ hours with no forward progress, past
+# every soft budget above. No in-process timer can stop a blocked native
+# call (shap's C/Cython internals) from Python -- the only way to actually
+# stop one is to run it in a separate OS process and kill that process if it
+# overruns. Both `shap.TreeExplainer` and the model-agnostic `shap.Explainer`
+# therefore run in a child process (`_run_with_hard_kill`), forcibly
+# terminated (SIGTERM, then `Process.kill()` after a grace period) if they
+# have not sent a final result within their ceiling -- at which point that
+# path is treated as failed and the next one is tried, exactly as if it had
+# raised an exception. The child still reports its calibration measurement
+# back before starting the (bounded) full explain, so a kill does not erase
+# the fine-grained checkpoints -- only the "done" one never arrives.
+_TREE_EXPLAINER_HARD_KILL_S = 180   # ~2x the soft budget + spawn/pickling overhead margin
+_MODEL_AGNOSTIC_HARD_KILL_S = 150
+_HARD_KILL_GRACE_S = 5              # time given to exit cleanly after terminate() before kill()
+_HARD_KILL_POLL_S = 1               # how often the parent checks the child for a message
+
+
+def _tree_explainer_child(model, Xd, calib_rows, time_budget_s, conn) -> None:
+    """Runs in a child process spawned by `_run_with_hard_kill`.
+
+    Isolated so the parent can enforce a real, wall-clock kill on
+    `shap.TreeExplainer` that no in-process timer could apply to itself.
+    Sends a `"calibrated"` progress message before attempting the full
+    (budget-bounded) explain, so a later hard-kill still leaves the parent
+    with that measurement instead of nothing.
+    """
+    try:
+        import shap
+
+        explainer = shap.TreeExplainer(model)
+        calib_n = min(calib_rows, Xd.shape[0])
+        t0 = time.monotonic()
+        sv = explainer.shap_values(Xd[:calib_n], check_additivity=False)
+        calib_dt = time.monotonic() - t0
+        per_row = calib_dt / max(calib_n, 1)
+
+        if calib_n < Xd.shape[0] and per_row > 0:
+            extra_rows = max(0, int((time_budget_s - calib_dt) / per_row))
+            n_explain = min(Xd.shape[0], calib_n + extra_rows)
+        else:
+            n_explain = Xd.shape[0]
+        conn.send({
+            "stage": "calibrated", "calib_n": calib_n, "calib_dt": calib_dt,
+            "per_row": per_row, "n_explain": n_explain,
+        })
+
+        if n_explain > calib_n:
+            sv = explainer.shap_values(Xd[:n_explain], check_additivity=False)
+        conn.send({"stage": "done", "sv": sv, "n_explain": n_explain})
+    except Exception as exc:  # noqa: BLE001 - reported to the parent, not raised here
+        conn.send({"stage": "error", "error": str(exc)})
+    finally:
+        conn.close()
+
+
+def _model_agnostic_child(
+    detector, Xd, calib_rows, time_budget_s, bg_rows, random_state, conn,
+) -> None:
+    """Same isolation/kill rationale as `_tree_explainer_child`, for the
+    model-agnostic `shap.Explainer` fallback."""
+    try:
+        import shap
+
+        bg_n = min(bg_rows, Xd.shape[0])
+        bg_idx = np.random.default_rng(random_state).choice(
+            Xd.shape[0], size=bg_n, replace=False
+        )
+        background = Xd[bg_idx]
+
+        def _score_fn(data):
+            return np.asarray(detector.score_samples(data), dtype=np.float64)
+
+        masker = shap.maskers.Independent(background)
+        explainer = shap.Explainer(_score_fn, masker)
+
+        calib_n = min(calib_rows, Xd.shape[0])
+        t0 = time.monotonic()
+        explanation = explainer(Xd[:calib_n])
+        calib_dt = time.monotonic() - t0
+        per_row = calib_dt / max(calib_n, 1)
+
+        if per_row > 0:
+            extra_rows = max(0, int((time_budget_s - calib_dt) / per_row))
+        else:
+            extra_rows = Xd.shape[0] - calib_n
+        n_explain = min(Xd.shape[0], calib_n + extra_rows)
+        conn.send({
+            "stage": "calibrated", "calib_n": calib_n, "calib_dt": calib_dt,
+            "per_row": per_row, "n_explain": n_explain,
+        })
+
+        if n_explain > calib_n:
+            explanation = explainer(Xd[:n_explain])
+        values = np.asarray(explanation.values, dtype=np.float64)
+        conn.send({"stage": "done", "values": values, "n_explain": n_explain})
+    except Exception as exc:  # noqa: BLE001 - reported to the parent, not raised here
+        conn.send({"stage": "error", "error": str(exc)})
+    finally:
+        conn.close()
+
+
+def _run_with_hard_kill(target, args, hard_timeout_s, on_progress=None):
+    """Run ``target(*args, conn)`` in a fresh child process; force-kill it if
+    it has not sent a final (``"done"``/``"error"``) message within
+    ``hard_timeout_s``.
+
+    ``on_progress(msg)`` runs in the parent for every non-final message the
+    child sends (its calibration measurement) -- this is what keeps this
+    project's fine-grained checkpoints (`_checkpoint`, above) working even
+    when the child is eventually killed for taking too long overall: whatever
+    it reported before being killed is not lost.
+
+    Returns the child's final message dict, or ``{"stage": "hard_killed"}``
+    if the ceiling was reached with no final message received.
+    """
+    ctx = mp.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(target=target, args=(*args, child_conn))
+    proc.start()
+    child_conn.close()
+
+    deadline = time.monotonic() + hard_timeout_s
+    final = None
+    try:
+        while final is None and time.monotonic() < deadline:
+            remaining = max(0.0, deadline - time.monotonic())
+            if parent_conn.poll(timeout=min(_HARD_KILL_POLL_S, remaining)):
+                try:
+                    msg = parent_conn.recv()
+                except (EOFError, OSError):
+                    break
+                if msg.get("stage") in ("done", "error"):
+                    final = msg
+                elif on_progress is not None:
+                    on_progress(msg)
+            elif not proc.is_alive():
+                break  # child exited without a final message (e.g. a crash)
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(_HARD_KILL_GRACE_S)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+        parent_conn.close()
+
+    return final if final is not None else {"stage": "hard_killed"}
 
 
 def _densify(X) -> np.ndarray:
@@ -281,63 +432,76 @@ def shap_summary_iforest(
         shap_values = None
         used_path = None
 
-        # -- path 1: native TreeExplainer (version-dependent) --------------- #
+        # -- path 1: native TreeExplainer, isolated + hard-kill guarded ----- #
         try:
-            import shap
+            import shap  # import check now; the real work runs in a child process
 
-            explainer = shap.TreeExplainer(model)
             calib_n = min(_TREE_EXPLAINER_CALIBRATION_ROWS, Xd.shape[0])
             log.info(
-                "Computing SHAP values via shap.TreeExplainer -- calibrating "
-                "on %d of %d row(s) x %d feature(s) first (usually seconds, "
-                "not minutes, on this path) to bound this to a ~%.0fs budget "
-                "instead of running unbounded.",
+                "Computing SHAP values via shap.TreeExplainer in an isolated "
+                "process -- calibrating on %d of %d row(s) x %d feature(s) "
+                "first to bound this to a ~%ds soft budget, with a hard %ds "
+                "kill ceiling if even that does not return.",
                 calib_n, Xd.shape[0], Xd.shape[1], _TREE_EXPLAINER_TIME_BUDGET_S,
+                _TREE_EXPLAINER_HARD_KILL_S,
             )
-            # If the process dies with THIS checkpoint as the last one logged
-            # (no matching "tree_explainer_calibrated" after it), the
-            # calibration call itself is what hung -- see the module
-            # docstring note on `_TREE_EXPLAINER_CALIBRATION_ROWS`: that is
-            # the one sub-step this budget cannot preempt, since it is timed
-            # only *after* it returns.
+            # If the process is killed with THIS checkpoint as the last one
+            # logged (no matching "tree_explainer_calibrated" after it), the
+            # calibration call itself is what hung inside the child -- the
+            # one sub-step no soft budget can preempt, which is exactly why
+            # the hard kill below exists as a backstop.
             _checkpoint("tree_explainer_calibration_started", calib_rows=calib_n)
-            t0 = time.monotonic()
-            sv = explainer.shap_values(Xd[:calib_n], check_additivity=False)
-            calib_dt = time.monotonic() - t0
-            per_row = calib_dt / max(calib_n, 1)
 
-            if calib_n < Xd.shape[0] and per_row > 0:
-                extra_rows = max(
-                    0, int((_TREE_EXPLAINER_TIME_BUDGET_S - calib_dt) / per_row)
+            n_total_rows = Xd.shape[0]
+
+            def _on_progress(msg, _n_total=n_total_rows):
+                _checkpoint(
+                    "tree_explainer_calibrated", calib_rows=msg["calib_n"],
+                    calib_seconds=round(msg["calib_dt"], 2),
+                    seconds_per_row=round(msg["per_row"], 2),
+                    planned_rows=int(msg["n_explain"]),
+                    bounded=bool(msg["n_explain"] < _n_total),
                 )
-                n_explain = min(Xd.shape[0], calib_n + extra_rows)
-            else:
-                n_explain = Xd.shape[0]
-            _checkpoint(
-                "tree_explainer_calibrated", calib_rows=calib_n,
-                calib_seconds=round(calib_dt, 3), seconds_per_row=round(per_row, 4),
-                planned_rows=int(n_explain), bounded=bool(n_explain < Xd.shape[0]),
-            )
-
-            if n_explain > calib_n:
                 log.info(
                     "shap.TreeExplainer calibration: %.2fs for %d row(s) "
-                    "(~%.3fs/row) at %d feature(s); explaining %d of %d "
-                    "row(s) to stay near the %.0fs budget.",
-                    calib_dt, calib_n, per_row, Xd.shape[1], n_explain,
-                    Xd.shape[0], _TREE_EXPLAINER_TIME_BUDGET_S,
+                    "(~%.2fs/row) at %d feature(s); explaining %d of %d row(s).",
+                    msg["calib_dt"], msg["calib_n"], msg["per_row"], Xd.shape[1],
+                    msg["n_explain"], _n_total,
                 )
-                _checkpoint("tree_explainer_explain_started", planned_rows=int(n_explain))
-                sv = explainer.shap_values(Xd[:n_explain], check_additivity=False)
-            elif Xd.shape[0] > calib_n:
-                log.warning(
-                    "shap.TreeExplainer is too slow at %d feature(s) "
-                    "(~%.2fs/row, projected %.0fs for all %d rows); keeping "
-                    "only the %d calibration row(s) explained instead of "
-                    "running unbounded.",
-                    Xd.shape[1], per_row, per_row * Xd.shape[0], Xd.shape[0],
-                    calib_n,
+                if msg["n_explain"] > msg["calib_n"]:
+                    _checkpoint(
+                        "tree_explainer_explain_started",
+                        planned_rows=int(msg["n_explain"]),
+                    )
+                elif _n_total > msg["calib_n"]:
+                    log.warning(
+                        "shap.TreeExplainer is too slow at %d feature(s) "
+                        "(~%.2fs/row); keeping only the %d calibration "
+                        "row(s) explained instead of running unbounded.",
+                        Xd.shape[1], msg["per_row"], msg["calib_n"],
+                    )
+
+            result = _run_with_hard_kill(
+                _tree_explainer_child,
+                (model, Xd, _TREE_EXPLAINER_CALIBRATION_ROWS, _TREE_EXPLAINER_TIME_BUDGET_S),
+                _TREE_EXPLAINER_HARD_KILL_S,
+                on_progress=_on_progress,
+            )
+
+            if result["stage"] == "hard_killed":
+                _checkpoint(
+                    "tree_explainer_hard_killed",
+                    hard_timeout_s=_TREE_EXPLAINER_HARD_KILL_S,
                 )
+                raise RuntimeError(
+                    f"shap.TreeExplainer did not finish within the hard "
+                    f"{_TREE_EXPLAINER_HARD_KILL_S}s ceiling and was force-killed."
+                )
+            if result["stage"] == "error":
+                raise RuntimeError(result["error"])
+
+            sv = result["sv"]
+            n_explain = result["n_explain"]
             log.info("shap.TreeExplainer finished.")
             _checkpoint("tree_explainer_done", rows_explained=int(min(n_explain, Xd.shape[0])))
             if isinstance(sv, list):  # some versions wrap in a list
@@ -358,80 +522,83 @@ def shap_summary_iforest(
             )
             _checkpoint("tree_explainer_failed", error=str(exc))
 
-        # -- path 2: model-agnostic Explainer over score_samples ------------ #
+        # -- path 2: model-agnostic Explainer, isolated + hard-kill guarded - #
         if shap_values is None:
             try:
-                import shap
+                import shap  # import check now; the real work runs in a child process
 
-                # Background: a small subsample as the masker reference.
-                bg_n = min(100, Xd.shape[0])
-                bg_idx = np.random.default_rng(random_state).choice(
-                    Xd.shape[0], size=bg_n, replace=False
-                )
-                background = Xd[bg_idx]
-
-                def _score_fn(data):
-                    return np.asarray(detector.score_samples(data), dtype=np.float64)
-
-                masker = shap.maskers.Independent(background)
-                explainer = shap.Explainer(_score_fn, masker)
-                # This path calls `_score_fn` (which re-scores the whole
+                # This path calls `score_samples` (which re-scores the whole
                 # forest) roughly `2 * n_features + 1` times *per explained
                 # row*, so its cost scales with the feature count, not just
                 # the row count -- measured at ~4.8s/row for 180 features,
                 # i.e. ~2.7 hours to explain 2000 rows unbounded. That is the
                 # "the pipeline hangs/crashes during interpretability" failure
                 # on a feature-rich real dataset; it never showed up on this
-                # project's ~20-70 feature synthetic panel. Rather than guess
-                # a static feature-count cutoff (which would not generalize
-                # across hardware/tree size), time a couple of rows and
-                # extrapolate how many fit in a fixed wall-clock budget.
+                # project's ~20-70 feature synthetic panel.
+                calib_n = min(_MODEL_AGNOSTIC_CALIBRATION_ROWS, Xd.shape[0])
                 log.info(
                     "shap.TreeExplainer unavailable -- falling back to the "
-                    "model-agnostic Explainer over up to %d row(s) x %d "
-                    "feature(s); calibrating on %d row(s) first to bound this "
-                    "to a ~%.0fs budget instead of running unbounded.",
-                    Xd.shape[0], Xd.shape[1], min(_MODEL_AGNOSTIC_CALIBRATION_ROWS, Xd.shape[0]),
-                    _MODEL_AGNOSTIC_TIME_BUDGET_S,
+                    "model-agnostic Explainer (isolated process) over up to "
+                    "%d row(s) x %d feature(s); calibrating on %d row(s) "
+                    "first to bound this to a ~%ds soft budget, with a hard "
+                    "%ds kill ceiling if even that does not return.",
+                    Xd.shape[0], Xd.shape[1], calib_n,
+                    _MODEL_AGNOSTIC_TIME_BUDGET_S, _MODEL_AGNOSTIC_HARD_KILL_S,
                 )
-                calib_n = min(_MODEL_AGNOSTIC_CALIBRATION_ROWS, Xd.shape[0])
                 _checkpoint("model_agnostic_calibration_started", calib_rows=calib_n)
-                t0 = time.monotonic()
-                explanation = explainer(Xd[:calib_n])
-                calib_dt = time.monotonic() - t0
-                per_row = calib_dt / max(calib_n, 1)
-                if per_row > 0:
-                    extra_rows = max(
-                        0, int((_MODEL_AGNOSTIC_TIME_BUDGET_S - calib_dt) / per_row)
+
+                n_total_rows = Xd.shape[0]
+
+                def _on_progress(msg, _n_total=n_total_rows):
+                    _checkpoint(
+                        "model_agnostic_calibrated", calib_rows=msg["calib_n"],
+                        calib_seconds=round(msg["calib_dt"], 2),
+                        seconds_per_row=round(msg["per_row"], 2),
+                        planned_rows=int(msg["n_explain"]),
+                        bounded=bool(msg["n_explain"] < _n_total),
                     )
-                else:
-                    extra_rows = Xd.shape[0] - calib_n
-                n_explain = min(Xd.shape[0], calib_n + extra_rows)
-                _checkpoint(
-                    "model_agnostic_calibrated", calib_rows=calib_n,
-                    calib_seconds=round(calib_dt, 3), seconds_per_row=round(per_row, 4),
-                    planned_rows=int(n_explain), bounded=bool(n_explain < Xd.shape[0]),
-                )
-                if n_explain > calib_n:
                     log.info(
                         "Model-agnostic SHAP calibration: %.2fs for %d row(s) "
-                        "(~%.2fs/row) at %d feature(s); explaining %d of %d "
-                        "row(s) to stay near the %.0fs budget.",
-                        calib_dt, calib_n, per_row, Xd.shape[1], n_explain,
-                        Xd.shape[0], _MODEL_AGNOSTIC_TIME_BUDGET_S,
+                        "(~%.2fs/row) at %d feature(s); explaining %d of %d row(s).",
+                        msg["calib_dt"], msg["calib_n"], msg["per_row"],
+                        Xd.shape[1], msg["n_explain"], _n_total,
                     )
-                    _checkpoint("model_agnostic_explain_started", planned_rows=int(n_explain))
-                    explanation = explainer(Xd[:n_explain])
-                elif Xd.shape[0] > calib_n:
-                    log.warning(
-                        "Model-agnostic SHAP is too slow at %d feature(s) "
-                        "(~%.2fs/row, projected %.0fs for all %d rows); keeping "
-                        "only the %d calibration row(s) explained instead of "
-                        "running unbounded.",
-                        Xd.shape[1], per_row, per_row * Xd.shape[0], Xd.shape[0],
-                        calib_n,
+                    if msg["n_explain"] > msg["calib_n"]:
+                        _checkpoint(
+                            "model_agnostic_explain_started",
+                            planned_rows=int(msg["n_explain"]),
+                        )
+                    elif _n_total > msg["calib_n"]:
+                        log.warning(
+                            "Model-agnostic SHAP is too slow at %d feature(s) "
+                            "(~%.2fs/row); keeping only the %d calibration "
+                            "row(s) explained instead of running unbounded.",
+                            Xd.shape[1], msg["per_row"], msg["calib_n"],
+                        )
+
+                result = _run_with_hard_kill(
+                    _model_agnostic_child,
+                    (detector, Xd, _MODEL_AGNOSTIC_CALIBRATION_ROWS,
+                     _MODEL_AGNOSTIC_TIME_BUDGET_S, _MODEL_AGNOSTIC_BACKGROUND_ROWS,
+                     random_state),
+                    _MODEL_AGNOSTIC_HARD_KILL_S,
+                    on_progress=_on_progress,
+                )
+
+                if result["stage"] == "hard_killed":
+                    _checkpoint(
+                        "model_agnostic_hard_killed",
+                        hard_timeout_s=_MODEL_AGNOSTIC_HARD_KILL_S,
                     )
-                shap_values = np.asarray(explanation.values, dtype=np.float64)
+                    raise RuntimeError(
+                        f"model-agnostic shap.Explainer did not finish within "
+                        f"the hard {_MODEL_AGNOSTIC_HARD_KILL_S}s ceiling and "
+                        f"was force-killed."
+                    )
+                if result["stage"] == "error":
+                    raise RuntimeError(result["error"])
+
+                shap_values = np.asarray(result["values"], dtype=np.float64)
                 if shap_values.ndim == 3:
                     shap_values = shap_values[..., 0]
                 if shap_values.shape[0] != Xd.shape[0]:

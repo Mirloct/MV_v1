@@ -842,6 +842,13 @@ def build_plotly_figures(chart_data: dict, log=None) -> list[dict]:
                     horizontal_spacing=0.16,
                     subplot_titles=("Densidad de individuos", "Cuartiles IF x VAE"),
                 )
+                # The quartile panel is narrow (34% of the figure) with four
+                # wide tick labels per axis ("Q4 (75-100)") -- the default
+                # 12-14px annotation/tick font overlaps itself there even
+                # though it fits fine on the wider density panel. Shrunk only
+                # for this subplot's own title/ticks/colorbar, not the rest
+                # of the figure.
+                fig.layout.annotations[1].font = dict(size=11)
                 # Density panel: count of individuals per percentile cell.
                 fig.add_trace(go.Histogram2d(
                     x=pa, y=pb, xbins=dict(start=0, end=100, size=5),
@@ -873,8 +880,11 @@ def build_plotly_figures(chart_data: dict, log=None) -> list[dict]:
                 # percentile -- the coarse view a reviewer can read as a table.
                 fig.add_trace(go.Heatmap(
                     z=counts, x=q_labels, y=q_labels, colorscale="Viridis",
-                    text=cell_text, texttemplate="%{text}", textfont=dict(size=10),
-                    colorbar=dict(title="individuos", x=1.02, len=0.92, thickness=13),
+                    text=cell_text, texttemplate="%{text}", textfont=dict(size=9),
+                    colorbar=dict(
+                        title=dict(text="individuos", font=dict(size=10)),
+                        x=1.02, len=0.92, thickness=13, tickfont=dict(size=9),
+                    ),
                     hovertemplate=(f"cuartil {a} " + "%{x}<br>"
                                    + f"cuartil {b} " + "%{y}<br>%{z} individuos<extra></extra>"),
                 ), row=1, col=2)
@@ -887,8 +897,10 @@ def build_plotly_figures(chart_data: dict, log=None) -> list[dict]:
                                   range=[0, 100], row=1, col=1)
                 fig.update_yaxes(title_text=f"percentil de puntaje de {b}",
                                   range=[0, 100], scaleanchor="x", scaleratio=1, row=1, col=1)
-                fig.update_xaxes(title_text=f"cuartil {a}", row=1, col=2)
-                fig.update_yaxes(title_text=f"cuartil {b}", row=1, col=2)
+                fig.update_xaxes(title_text=f"cuartil {a}", title_font=dict(size=11),
+                                  tickfont=dict(size=9), row=1, col=2)
+                fig.update_yaxes(title_text=f"cuartil {b}", title_font=dict(size=11),
+                                  tickfont=dict(size=9), row=1, col=2)
                 emit(fig, "fig-agreement", "Concordancia entre detectores",
                      FIGURE_NOTES["model_agreement"], ["__neutral__"])
             elif n and log:

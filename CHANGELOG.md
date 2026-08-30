@@ -1430,3 +1430,90 @@ dashboard description still called the panel "Assumptions (IF/VAE)" fed by
 no longer accurate now that interpretability's checks are routed elsewhere.
 Both are corrected in place rather than appended as a second, conflicting
 note.
+
+---
+
+## 2026-08-30 — Downstream analyst dashboard: three mockups, two rounds of correction
+
+**Ask:** design mockups of an analyst-facing dashboard "like" a reference
+fraud-dashboard HTML file the user attached, fed *only* by this project's
+own output columns (no data from elsewhere), covering: the top variables
+driving each individual's score plus their IF **and** VAE score together,
+and a count of which months (out of the last 3, since OOT should widen to
+3 months) each individual was flagged in. Explicitly deferred: no real
+pipeline run/validation yet, no `main.py`/`oot_report.py` code changes —
+mockups first.
+
+**Round 1 — three designs, one shared mock dataset.** Built a Python
+generator (`gen_mock_data.py`, not committed to the repo — lives in the
+session scratchpad) producing ~84 illustrative individuals with this
+project's real schema vocabulary (`CUST_NNNNNN` ids, `num__`/`cat__`/
+`missing__`-prefixed variable names, the actual synthetic-panel columns)
+rather than the reference file's fictional fraud fields, plus three
+distinct HTML layouts sharing one token system (IF-blue/VAE-orange taken
+directly from `report_content.py`'s already-validated `SERIES_COLORS`; a
+separately validated red/amber/green status triad,
+`node scripts/validate_palette.js` from the dataviz skill run against both
+light and dark surfaces until it passed): a queue-style table ("Cola de
+Revisión"), an executive/aggregate view ("Panorama Ejecutivo"), and a
+recurrence-kanban ("Mesa de Persistencia"). Published as three Claude
+Artifacts for review. A concurrent, unrelated fix in this same session
+shrank the model-agreement chart's quartile-panel font sizes in
+`report_content.py` (title/ticks/colorbar, ~9-11px instead of 12-14px) so
+they stop overlapping in the narrow 34%-width panel.
+
+**Round 2 — the grouping was fabricated, cut entirely.** The first round
+grouped `top_5_variables` into five named business categories
+("Comportamiento transaccional", "Perfil financiero", ...) for a
+"driver principal/secundario" pair of table columns and a "share by
+category" sidebar chart. Correctly flagged: that taxonomy exists nowhere
+in the real project output — `explain_rows_iforest`/`explain_rows_vae`
+return raw variable names only. Removed both the two driver columns (now
+one column showing the literal comma-joined `top_5_variables` string,
+exactly as the real Excel export would) and the sidebar chart built on
+top of the same invented grouping, from the chosen "Cola de Revisión"
+design and from its underlying embedded data model (not just hidden in
+the view — the fields were dropped from the JSON payload entirely).
+
+**Round 3 — the flat per-entity profile was time-ambiguous, cut entirely.**
+The modal's per-entity "profile" (region, segment, age, income, account
+balance, transaction counts, ...) was flagged with a sharp, correct
+question: *which month does this refer to?* Those are real input-CSV
+columns, but they are genuinely time-varying in the panel (one value per
+`(entity_id, period)`, not per `entity_id`), and an entity can be flagged
+in more than one OOT month — a flat, undated value is ambiguous. Cut
+entirely, along with the two other pieces the user identified as
+computed extras beyond a single raw feed: the "Cobertura mensual OOT"
+sidebar bar chart (a population-level aggregate) and the "Concordancia
+IF↔VAE (ρ Spearman)" KPI tile (a statistic over the whole shown
+population, not a per-row field). The modal now shows, at most: identity,
+IF/VAE score + percentile + band, months present, and the raw top-5
+variable list — every one of those is a genuine per-row model output, not
+a derived or externally-sourced concept.
+
+**End-to-end validation of the corrected mockup** (static, since there is
+no browser in this environment): verified with an HTML parser that every
+tag closes correctly; verified every `document.getElementById(...)` call
+in the page's JS resolves to an id that actually exists in the markup
+(catches a dangling reference from a removed section); grepped the
+embedded `PROFILES` JSON payload sent to the browser and confirmed it
+contains exactly the 9 intended keys (`id`, `if_score`, `vae_score`,
+`if_pctl`, `vae_pctl`, `band`, `months`, `months_count`, `top5`) and none
+of the removed ones; confirmed every string used elsewhere in the earlier
+rounds ("Concordancia IF", "Cobertura mensual", `primary_cat`, `mFields`,
+...) no longer appears anywhere in the output file.
+
+**Target architecture, now written down** (`CONTEXT.md` "Downstream
+analyst dashboard"): this dashboard is meant to be a separate consumer
+outside this repo, fed by one output table "similar to an API" — no
+categorization layer added inside Modelo v0.1, no undated per-period
+field shown flat. The single-feed contract the chosen mockup validates,
+and what is still missing to produce it for real
+(`n_oot_periods` still defaults to 1, the review/alert count still uses
+the POT-calibrated `threshold` that can degenerate to zero rather than a
+fixed P95-of-unique-individuals rule, and per-entity month-recurrence has
+no query in the real pipeline yet since `export_oot_top_anomalies`
+deliberately collapses to one row per entity), are recorded there rather
+than implemented blind — each needs its own validation run before it
+becomes real pipeline behavior, which was explicitly deferred throughout
+this exercise.

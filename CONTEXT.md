@@ -637,6 +637,66 @@ arrangement (both models export their own Excel).
   team-health line (RAM/CPU, always with the number visible, never color
   alone).
 
+## Downstream analyst dashboard (target architecture, not yet built)
+
+An analyst-facing dashboard is planned as a **separate consumer, outside this
+repo** — Modelo v0.1's job stops at producing one output table; the dashboard
+reads it the way it would read any other upstream feed, "similar to an API":
+one input, no back-channel into this pipeline's internals. Concretely that
+means two things this project must keep true, verified against three review
+rounds of dashboard mockups (2026-08-30, see `CHANGELOG.md`):
+
+- **Never invent a categorization layer over the model's own output.** An
+  early mockup grouped `top_5_variables` into named business buckets
+  ("Cartera de productos y saldos", "Endeudamiento", ...) for readability —
+  that taxonomy does not exist anywhere in this project's real output
+  (`explain_rows_iforest`/`explain_rows_vae` return the raw, comma-joined
+  variable names and nothing else) and was cut entirely, including the
+  derived "share by category" aggregate built on top of it. If a downstream
+  system wants that kind of business labeling, it is the downstream
+  system's job to add it against its own taxonomy — Modelo v0.1 ships raw
+  variable names, never a story about them.
+- **Never present a per-(entity, period) panel field without its period.**
+  A second mockup pass added a flat "profile" per `entity_id` (age, income,
+  account balance, transaction counts, ...) pulled from the panel. Every one
+  of those columns is genuinely time-varying in the panel (`docs/leakage_
+  free_pipeline.md`), and an entity can be flagged in more than one OOT
+  month (see below) — a single undated value is ambiguous about which
+  month it describes, and was removed. The one exception that survives is
+  the model's own score/percentile/band: `export_oot_top_anomalies` already
+  resolves this exact ambiguity for scores by keeping each entity's single
+  **highest-scoring** OOT month and recording that month explicitly — the
+  same resolution any other per-period field would need before it could be
+  shown flat, which nothing currently does for raw panel columns.
+
+**The single-feed contract, as validated by the chosen mockup ("Cola de
+Revisión"):** `entity_id`, the anomaly score + percentile **per detector**
+(today's real export carries only one model's score per row — see "IF → VAE
+stacking" above; a feed with both IF and VAE side by side per entity does
+not exist yet and would need the same `true_oot_entity_scores`-style join
+`report_content.py`'s agreement chart already builds in-memory, made
+persistent), the percentile band (`p90`/`p95`/`p99`), the raw `top_5_
+variables` string, and — once the two items below land — which of the OOT
+months an entity cleared the review threshold in.
+
+**Not yet implemented, explicitly deferred pending validation runs:**
+- `PipelineConfig.n_oot_periods` is still `1` (default unchanged); the
+  mockups model a 3-month OOT window (`--n-oot-periods 3`) as the target,
+  not the current behavior.
+- The "in review" / alert count is still whatever `export_oot_top_
+  anomalies`'s `threshold` param (the POT-calibrated cut) produces, which
+  **can degenerate to zero** on real, differently-shaped data — the
+  calibration is fitted on validation and has no floor. The mockups instead
+  fix this to "score ≥ the P95 of the full OOT block, counted as unique
+  individuals" — a percentile-based definition than cannot collapse to
+  zero the way a calibrated one can — but this has not been ported into
+  `oot_report.py` yet.
+- Per-entity, per-month recurrence ("flagged in 2 of the last 3 OOT
+  months") has no equivalent in the real pipeline today: `export_oot_top_
+  anomalies` deliberately collapses to one row per entity (its best month)
+  and discards the rest. Surfacing recurrence would need a second, additive
+  query over the OOT block that does NOT replace that dedup rule.
+
 ## Known open problems
 
 - **`local`-type anomalies are unrecovered.** The Isolation Forest ranks a

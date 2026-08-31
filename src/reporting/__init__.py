@@ -15,11 +15,14 @@ phases, not part of the anomaly-detection report itself.
 :func:`src.reporting.flow_visualization.start_live_view` serves the same view
 live, on localhost only, while the run is still in progress.
 
-:func:`src.reporting.analyst_dashboard.build_analyst_dashboard` renders a
-separate, self-contained "Cola de Revisión" HTML per deliverable model, fed
-exclusively by that model's own OOT Excel table and the OOT block's
-per-month recurrence -- no other data source, no business categorization
-layered on top. See `CONTEXT.md` "Downstream analyst dashboard".
+:func:`src.reporting.analyst_dashboard.build_analyst_dashboard` renders one
+self-contained "Cola de Revisión" HTML (not one per model -- both Isolation
+Forest and VAE percentiles are shown for every individual, joined in memory
+from each detector's own `true_oot_entity_scores`) fed exclusively by this
+project's own OOT block: the primary deliverable's OOT Excel table plus the
+OOT block's per-month recurrence -- no other data source, no business
+categorization layered on top. See `CONTEXT.md` "Downstream analyst
+dashboard".
 """
 
 from src.reporting.analyst_dashboard import build_analyst_dashboard

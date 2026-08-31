@@ -330,7 +330,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
 
     figures: list = []
     oot_excels: dict = {}
-    analyst_dashboards: dict = {}
+    deliverable_tables: dict = {}
+    analyst_dashboard_path: Optional[str] = None
     model_specs: dict = {}
     chart_data: dict = {"models": {}}
     # Numeric payloads behind the charts that used to be embedded PNGs. The
@@ -1172,63 +1173,105 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     "unique OOT individuals.",
                     name, out_path, oot_review_count, len(true_oot_entity_scores),
                 )
-
-                # -- Analyst dashboard: a rendering of this exact export, --- #
-                # -- nothing more (CONTEXT.md "Downstream analyst dashboard") #
-                try:
-                    from scipy.stats import rankdata
-
-                    from src.evaluation import months_present_by_entity
-                    from src.reporting import build_analyst_dashboard
-
-                    # Recomputed rather than reusing the per-row-explanation
-                    # try block's `oot_periods` above: that block can fail
-                    # before assigning it, and this dashboard must not
-                    # inherit a failure unrelated to it. `oot_period` itself
-                    # is already imported at the top of this Phase 9 block.
-                    oot_periods = oot_period(
-                        keys, time_col=(schema.time_col or "period"),
-                        n_oot_periods=config.n_oot_periods,
-                    )
-                    dash_score_col = "anomaly_score"  # build_scored_frame's default
-                    entity_ids_oot = list(true_oot_entity_scores.keys())
-                    scores_oot = np.asarray(
-                        [true_oot_entity_scores[e] for e in entity_ids_oot], dtype=float
-                    )
-                    p95_cutoff = float(np.percentile(scores_oot, 95.0))
-                    percentile_by_entity = dict(zip(
-                        entity_ids_oot, 100.0 * rankdata(scores_oot) / len(scores_oot),
-                    ))
-                    months_present = months_present_by_entity(
-                        scored_df, schema, oot_periods, cutoff=p95_cutoff,
-                        score_col=dash_score_col,
-                    )
-                    dashboard_path = build_analyst_dashboard(
-                        _table, schema, name, oot_periods,
-                        percentile_by_entity, months_present, score_col=dash_score_col,
-                    )
-                    analyst_dashboards[name] = dashboard_path
-                    _dash_ok = os.path.isfile(dashboard_path) and os.path.getsize(dashboard_path) > 0
-                    observability.check(
-                        name=f"artifact.analyst_dashboard_written[{name}]", category="artifact",
-                        definition="The analyst review-queue dashboard HTML exists and is non-empty.",
-                        expected="file exists and size_bytes > 0", severity="warning",
-                        passed=_dash_ok,
-                        observed={"path": dashboard_path,
-                                  "size_bytes": os.path.getsize(dashboard_path) if _dash_ok else 0},
-                        failure_action="Best-effort artifact; the OOT Excel deliverable above is "
-                                       "unaffected. Check the log for the dashboard-build error.",
-                        evidence=dashboard_path,
-                    )
-                except Exception as exc:  # noqa: BLE001 - never block the Excel deliverable
-                    logger.warning(
-                        "[%s] analyst dashboard failed (%s); the Excel deliverable above "
-                        "is unaffected.", name, exc,
-                    )
+                # Kept for the single, unified analyst dashboard built after
+                # this loop -- see below. Not built per-model: the dashboard
+                # shows both detectors' scores for the same individual side
+                # by side, so it is one file, not one per deliverable.
+                deliverable_tables[name] = _table
         else:
             logger.info(
                 "[%s] no Excel deliverable: the VAE trains on the stacked matrix, "
                 "so its queue already reflects this detector's score.", name,
+            )
+
+    # -- Analyst dashboard: ONE file, IF + VAE scores together -------------- #
+    # Not one per deliverable model: the dashboard shows both detectors'
+    # scores for the same individual side by side (an in-memory join on
+    # `true_oot_entity_scores`, Phase 8 -- both detectors are always
+    # evaluated regardless of `--stack-iforest-into-vae`), so a single
+    # dashboard covers stacked and parallel modes alike. Selection, row
+    # order, `band`, and `top_5_variables` all come from the *primary*
+    # deliverable's own export table (`config.deliverable_models[-1]`, always
+    # "vae" today) -- the other detector's score is attached, not re-selected
+    # on. See CONTEXT.md "Downstream analyst dashboard".
+    with log_phase("Phase 9b: analyst dashboard"):
+        try:
+            from scipy.stats import rankdata
+
+            from src.evaluation import (
+                build_scored_frame,
+                months_present_by_entity,
+                oot_period,
+            )
+            from src.reporting import build_analyst_dashboard
+
+            primary_name = config.deliverable_models[-1]
+            other_name = "iforest" if primary_name == "vae" else "vae"
+            if primary_name not in deliverable_tables:
+                raise RuntimeError(
+                    f"no OOT export found for the primary deliverable model {primary_name!r}"
+                )
+
+            def _entity_scores(model_name: str) -> dict:
+                return chart_data["models"].get(model_name, {}).get(
+                    "true_oot_entity_scores"
+                ) or {}
+
+            def _percentiles(entity_scores: dict) -> dict:
+                if not entity_scores:
+                    return {}
+                ids = list(entity_scores.keys())
+                vals = np.asarray([entity_scores[i] for i in ids], dtype=float)
+                pct = 100.0 * rankdata(vals) / len(vals)
+                return dict(zip(ids, pct))
+
+            if_scores_by_entity = _entity_scores("iforest")
+            vae_scores_by_entity = _entity_scores("vae")
+            primary_scores_by_entity = (
+                vae_scores_by_entity if primary_name == "vae" else if_scores_by_entity
+            )
+
+            time_col = schema.time_col or "period"
+            oot_periods = oot_period(
+                keys, time_col=time_col, n_oot_periods=config.n_oot_periods,
+            )
+            dash_score_col = "anomaly_score"  # build_scored_frame's default
+            p95_cutoff = (
+                float(np.percentile(list(primary_scores_by_entity.values()), 95.0))
+                if primary_scores_by_entity else float("nan")
+            )
+            scored_df_primary = build_scored_frame(
+                df, keys, models[primary_name][1], schema,
+            )
+            months_present = months_present_by_entity(
+                scored_df_primary, schema, oot_periods, cutoff=p95_cutoff,
+                score_col=dash_score_col,
+            )
+
+            dashboard_path = build_analyst_dashboard(
+                deliverable_tables[primary_name], schema, primary_name, oot_periods,
+                _percentiles(if_scores_by_entity), _percentiles(vae_scores_by_entity),
+                if_scores_by_entity, vae_scores_by_entity, months_present,
+                n_total_oot=len(primary_scores_by_entity), score_col=dash_score_col,
+            )
+            analyst_dashboard_path = dashboard_path
+            _dash_ok = os.path.isfile(dashboard_path) and os.path.getsize(dashboard_path) > 0
+            observability.check(
+                name="artifact.analyst_dashboard_written", category="artifact",
+                definition="The unified analyst review-queue dashboard HTML exists "
+                           "and is non-empty.",
+                expected="file exists and size_bytes > 0", severity="warning",
+                passed=_dash_ok,
+                observed={"path": dashboard_path,
+                          "size_bytes": os.path.getsize(dashboard_path) if _dash_ok else 0},
+                failure_action="Best-effort artifact; the OOT Excel deliverable(s) above "
+                               "are unaffected. Check the log for the dashboard-build error.",
+                evidence=dashboard_path,
+            )
+        except Exception as exc:  # noqa: BLE001 - never block the Excel deliverable(s)
+            logger.warning(
+                "Analyst dashboard failed (%s); the OOT Excel deliverable(s) above "
+                "are unaffected.", exc,
             )
 
     # -- Phase 10: interpretability, AFTER every Excel deliverable ---------- #
@@ -1434,7 +1477,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
 
     artifacts = {
         "oot_excels": oot_excels,
-        "analyst_dashboards": analyst_dashboards,
+        "analyst_dashboard": analyst_dashboard_path,
         "p95_checkpoint": p95_path,
         "attribution_workbook": attribution_path,
         "reports": report_paths,
@@ -1448,7 +1491,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         "PIPELINE COMPLETE - artifact locations:",
         f"  IF P95 checkpoint: {p95_path}",
         f"  OOT Excel(s)   : {', '.join(oot_excels.values()) or '(none)'}",
-        f"  Analyst dashboard(s): {', '.join(analyst_dashboards.values()) or '(none)'}",
+        f"  Analyst dashboard: {analyst_dashboard_path or '(none)'}",
         f"  Feature attribution (xlsx): {attribution_path}",
         f"  Report (html)  : {report_paths.get('html')}",
         f"  Report (md)    : {report_paths.get('md')}",

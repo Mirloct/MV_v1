@@ -140,10 +140,10 @@ VAE_BEST_PARAMS = os.path.join(TUNING_DIR, "best_params_vae.yaml")
 # -- reports ---------------------------------------------------------------- #
 OOT_REPORT_DEFAULT = os.path.join(REPORTS_DIR, "oot_top_anomalies.xlsx")
 FLOW_VISUALIZATION_DEFAULT = os.path.join(REPORTS_DIR, "flow_visualization.html")
-# `{model}` is filled in by the caller (one dashboard per deliverable model,
-# same convention as the OOT Excel's `oot_p90_<model>.xlsx` naming) -- see
-# `src/reporting/analyst_dashboard.py`.
-ANALYST_DASHBOARD_DEFAULT = os.path.join(REPORTS_DIR, "analyst_dashboard_{model}.html")
+# One dashboard, not one per model: it shows both detectors' scores for the
+# same individual side by side, so there is exactly one file regardless of
+# `--stack-iforest-into-vae` -- see `src/reporting/analyst_dashboard.py`.
+ANALYST_DASHBOARD_DEFAULT = os.path.join(REPORTS_DIR, "analyst_dashboard.html")
 
 # -- observability ------------------------------------------------------------ #
 # Structured JSON-Lines event stream (src/utils/observability.py); the source

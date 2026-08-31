@@ -654,79 +654,82 @@ arrangement (both models export their own Excel).
 
 ## Downstream analyst dashboard
 
-**Built and wired into Phase 9** (`src/reporting/analyst_dashboard.py::
-build_analyst_dashboard`, 2026-08-31) — one self-contained HTML per
-deliverable model, `artifacts/reports/analyst_dashboard_<model>.html`. Its
-target architecture, worked out across three review rounds of mockups first
-(2026-08-30, see `CHANGELOG.md`): the dashboard is meant to be a **separate
-consumer, outside this repo**, reading Modelo v0.1's output the way it
-would read any upstream feed, "similar to an API" — one input, no
-back-channel into this pipeline's internals. The shipped renderer already
-honors both rules the reviews surfaced, because it is fed *exclusively* by
-`export_oot_top_anomalies`'s own returned table plus the one additive query
-below — no other source, ever:
+**Built and wired in as its own step right after the per-model loop**
+(`src/reporting/analyst_dashboard.py::build_analyst_dashboard`, "Phase 9b:
+analyst dashboard" in `main.py`, corrected 2026-08-31) — **exactly one**
+file, `artifacts/reports/analyst_dashboard.html`, regardless of
+`--stack-iforest-into-vae`. Its layout is a direct, byte-for-byte port of
+the "Cola de Revisión" mockup reviewed and approved across three rounds
+(2026-08-30, see `CHANGELOG.md`) — same shell/header/two-KPI-tile/table/
+modal/footer structure, same Archivo + Public Sans + IBM Plex Mono type
+system, same `--if`/`--vae` accent colors — only the data source changed,
+from mock to real. **A same-day correction**, also recorded in
+`CHANGELOG.md`: a first pass built one dashboard *per deliverable model* in
+a plainer, re-derived visual style and dropped the side-by-side IF+VAE
+score view. Both were wrong and are fixed here.
 
-- **No categorization layer over the model's own output.** The table shows
-  `top_5_variables` verbatim (the raw, comma-joined string
+**One dashboard, both detectors' scores, per individual.** `main.py`'s
+Phase 8 already computes `true_oot_entity_scores` for *both* Isolation
+Forest and VAE every run (the same in-memory join
+`report_content.py`'s agreement chart uses), regardless of which model(s)
+ship an Excel. The dashboard reuses that: row selection, order, `band`, and
+`top_5_variables` all come from the *primary* deliverable's own export
+table (`config.deliverable_models[-1]`, always `"vae"` today), and the
+*other* detector's score/percentile is attached from its own
+`true_oot_entity_scores` dict — an in-memory join on `entity_id`, never a
+second file. Verified directly: in parallel mode (`--no-stack-iforest-into-
+vae`, two separate Excel exports), the dashboard's `if_score` for every
+overlapping entity matches `oot_p90_iforest.xlsx`'s own score column
+exactly (0 mismatches across 35 entities checked), while row
+selection/order/band still come from `oot_p90_vae.xlsx`.
+
+**Still fed exclusively by this project's own OOT block, nothing
+external** — the two rules the mockup reviews established still hold,
+just now correctly scoped to "no data outside the OOT block" rather than
+"no data outside a single exported file":
+- **No categorization layer over the model's own output.** `top_5_
+  variables` is shown verbatim (the raw, comma-joined string
   `explain_rows_iforest`/`explain_rows_vae` return) — never grouped into
   named business buckets. An early mockup did group them ("Cartera de
   productos y saldos", "Endeudamiento", ...); that taxonomy does not exist
-  anywhere in the real project output and was cut entirely before this was
-  built, including the derived "share by category" aggregate on top of it.
+  anywhere in the real project output and was cut entirely.
 - **No per-(entity, period) panel field without its period.** The
-  dashboard shows identity, score, percentile, band, `top_5_variables`,
-  and OOT-month presence — nothing pulled from the panel's raw feature
-  columns (age, income, account balance, transaction counts, ...), since
-  those are genuinely time-varying and an entity can be flagged in more
-  than one OOT month; a flat, undated value would be ambiguous about which
-  month it describes. The one exception, which does survive, is the
-  model's own score: `export_oot_top_anomalies` already resolves that
-  exact ambiguity by keeping each entity's single **highest-scoring** OOT
-  month and recording it explicitly.
+  dashboard shows identity, both detectors' score/percentile, band,
+  `top_5_variables`, and OOT-month presence — nothing pulled from the
+  panel's raw feature columns (age, income, account balance, transaction
+  counts, ...), since those are genuinely time-varying and an entity can
+  be flagged in more than one OOT month; a flat, undated value would be
+  ambiguous about which month it describes.
 
-**What it actually renders**, per model, from `_table` (the DataFrame
-`export_oot_top_anomalies` already returns) and one new additive helper:
-- Identity/score/band/`top_5_variables` — read straight off `_table`'s own
-  columns, in its own row order (already sorted score-descending).
-- Percentile — recomputed via `rankdata` over that model's own
-  `true_oot_entity_scores` (the same de-duplicated OOT population
-  `report_content.py`'s agreement chart already builds for the same
-  reason; not persisted anywhere else, so each caller rebuilds it cheaply).
-- Month-recurrence ("flagged in 2 of the last 3 OOT months") —
+**What it renders, concretely:**
+- Identity/band/`top_5_variables`/row order — read straight off the
+  primary deliverable's own exported table.
+- Both percentiles — `rankdata` over each detector's own
+  `true_oot_entity_scores` (not persisted; rebuilt per run, cheap).
+- Month-recurrence ("flagged in 2 of the last N OOT months") —
   `src/evaluation/oot_report.py::months_present_by_entity(scored_df, schema,
   oot_periods, cutoff, score_col)`, a **second, additive** query over the
   *undeduplicated* OOT block (every row, every period) that does **not**
-  change what `export_oot_top_anomalies` exports or how it deduplicates —
-  it answers a different question (which months, not just the best one)
-  from the same underlying data. `cutoff` is the P95 of the same
-  `true_oot_entity_scores` population, so "present" means the same thing
-  the review-count KPI below means.
-- The "en revisión" KPI is the **same fixed P95 count** described next
-  (not the calibrated `threshold`), and "recurrentes" counts entities with
-  `len(months_present) >= 2` among the exported rows.
+  change what `export_oot_top_anomalies` exports or how it deduplicates.
+  `cutoff` is the P95 of the *primary* detector's own
+  `true_oot_entity_scores`, so "present this month" means the same
+  threshold the "en revisión" KPI uses.
+- "En revisión" KPI = count of primary-table rows with `band` in
+  `("p95","p99")` (the same fixed-P95 fix described next, not the
+  calibrated `threshold`); "recurrentes" = rows with `months_count >= 2`.
 
-Visually it reuses this project's own report design system verbatim
-(`_HTML_CSS`/`_THEME_TOGGLE_JS`/`_stat_tile_html` imported directly from
-`src/reporting/report.py` — same `--series-1`/`--series-2` iForest/VAE
-colors, same light/dark tokens, same good/warning/serious vocabulary for
-recurrence severity) rather than a separate visual identity, so it reads as
-part of the same product. Best-effort: wrapped in its own try/except in
-`main.py`, never blocks the OOT Excel deliverable it is built from.
-
-**Multi-model note:** under the default stacking config there is one
-dashboard (VAE); under `--no-stack-iforest-into-vae` there are two, one per
-model, each built strictly from *that model's own* export — there is still
-no cross-model join (IF and VAE score side by side for the same entity)
-anywhere in this project, deliberately, since that would violate "fed
-exclusively by one resulting table."
+Best-effort: wrapped in its own try/except in `main.py` ("Phase 9b"), never
+blocks the OOT Excel deliverable(s) it reads from.
 
 **Verified** (2026-08-31, both `--quick --no-tune` and
-`--no-stack-iforest-into-vae` runs): HTML parses with balanced tags; the
-embedded per-entity JSON's `band`/`score` match the real exported Excel
-row-for-row; the "en revisión" KPI counted from the dashboard's own data
-equals `df["percentil"].isin(["p95","p99"]).sum()` computed independently
-from the just-written Excel; 50-58/50-58 health checks passed depending on
-mode.
+`--no-stack-iforest-into-vae` runs): HTML parses with balanced tags in both
+modes; exactly one `analyst_dashboard.html` produced in both (no per-model
+files); every profile carries a real, non-NaN score for *both* detectors;
+row selection matches the primary export's `entity_id` set exactly; the
+"en revisión" KPI equals an independent count of P95/P99 rows from the
+just-written primary Excel (25 in every run tried); the cross-model
+`if_score` join was verified byte-exact against the separate IF export in
+parallel mode; 50/50 (stacked) and 57/57 (parallel) health checks passed.
 
 ## Known open problems
 

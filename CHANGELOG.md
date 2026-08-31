@@ -1625,3 +1625,88 @@ directly from the "exclusively from the resulting csv" constraint:
 architecture, not yet built" to describe what is now actually shipped and
 verified, including the two constraints above and how each is enforced in
 the code (not just asserted in prose).
+
+---
+
+## 2026-08-31 (same day, later) — the dashboard integration corrected: right format, one file with both scores
+
+**Ask, verbatim in spirit:** "this is wrong -- I didn't ask for this
+analyst dashboard, it's not in the 'cola de revisión' format we saw
+yesterday, fix that. Also there shouldn't be 2, one for IF and one for
+VAE -- you already have the VAE score for that, integrate the
+information." Two real mistakes in the integration entry above, both
+fixed here.
+
+**Mistake 1: wrong visual format.** The integration re-derived the
+dashboard's HTML/CSS from `report.py`'s own design system (`_HTML_CSS`,
+`_stat_tile_html`, `.hero`/`.tile` classes) instead of reusing the actual
+approved mockup. That produced a plainer, differently-structured page --
+not what was reviewed and signed off on 2026-08-30. Fixed by throwing that
+version away and porting the approved mockup's HTML/CSS/JS **verbatim**:
+same shell, sticky header with brand mark/live clock/"PIPELINE OK" pill,
+the same two KPI tiles, the same single priority table (idx/ID/Banda/
+Percentil IF/Percentil VAE/Top-5 variables/Meses), the same profile modal,
+the same footer legend, same Archivo + Public Sans + IBM Plex Mono type
+system loaded from Google Fonts, same `--if`/`--vae`/severity color
+tokens. Only the data-population logic is new; the page itself is the
+approved design, not a reinterpretation of it.
+
+**Mistake 2: split into two dashboards.** The integration built one
+`analyst_dashboard_<model>.html` per deliverable model and, worse, dropped
+the side-by-side IF+VAE score view entirely -- misreading "fed exclusively
+by the resulting csv" as "never join two models' scores," when the actual
+ask (several turns earlier: "adjuntale también cual fue su score IF y
+VAE") was always for both scores together. The fix does not need a second
+exported file to satisfy this: `main.py` Phase 8 already computes
+`true_oot_entity_scores` for **both** detectors every run, regardless of
+`--stack-iforest-into-vae` (the same in-memory join `report_content.py`'s
+model-agreement chart already relies on) -- an in-memory join on
+`entity_id`, not a new data source.
+
+**What changed, concretely:**
+- `src/reporting/analyst_dashboard.py` -- rewritten. `build_analyst_
+  dashboard` now takes the *primary* deliverable's export table (selection/
+  order/`band`/`top_5_variables` source -- `config.deliverable_models[-1]`,
+  always `"vae"`) plus **both** detectors' `{entity_id: score}` /
+  `{entity_id: percentile}` dicts, and renders one page with both
+  "Percentil IF" and "Percentil VAE" columns per row, and both score bars
+  in the modal.
+- `main.py` -- the per-model Phase 9 loop no longer builds a dashboard
+  per iteration; it only records each deliverable's table into
+  `deliverable_tables[name]`. A new step, "Phase 9b: analyst dashboard",
+  runs once after the whole per-model loop: picks
+  `primary_name = config.deliverable_models[-1]`, pulls both models'
+  `true_oot_entity_scores` from `chart_data["models"]`, computes
+  `months_present_by_entity` against the primary's own P95 cut-off, and
+  calls the renderer exactly once. `analyst_dashboards: dict` (one entry
+  per model) replaced with `analyst_dashboard_path: Optional[str]` (one
+  path, or `None`).
+- `src/utils/paths.py` -- `ANALYST_DASHBOARD_DEFAULT` is now a fixed
+  `artifacts/reports/analyst_dashboard.html`, not a `{model}`-templated
+  name.
+
+**Verified, both `python main.py --quick --no-tune` (stacked, one Excel)
+and `--no-stack-iforest-into-vae` (parallel, two Excels):**
+- Exactly one `analyst_dashboard.html` produced in both modes -- confirmed
+  by directory listing, not just by reading the code. (Two stale
+  `analyst_dashboard_<model>.html` files left over from the previous,
+  now-superseded code were found and deleted from the local `artifacts/`
+  during this same check -- not something the corrected code produces.)
+- HTML parses with balanced tags; the embedded per-entity JSON has a
+  non-NaN `if_score` **and** a non-NaN `vae_score` for all 50 rows in both
+  modes -- the cross-model join is real, not a placeholder.
+- In parallel mode specifically: the dashboard's `if_score` for every one
+  of the 35 entities that appear in *both* separately-exported Excels
+  matches `oot_p90_iforest.xlsx`'s own score column exactly (0
+  mismatches), while row selection/order/`band` still come from
+  `oot_p90_vae.xlsx` -- proving the join pulls the real IF export's
+  numbers, not a re-derived or fabricated value.
+- "En revisión" KPI (25 in both modes) matches an independent count of
+  `df["percentil"].isin(["p95","p99"])` from the just-written primary
+  Excel, same check as the previous entry, re-run after the rewrite.
+- Health checks: 50/50 (stacked), 57/57 (parallel).
+
+`CONTEXT.md` "Downstream analyst dashboard" rewritten again to describe
+the corrected, unified design -- explicitly naming both mistakes and how
+each is now prevented in the code, not just narrating the current state
+as if it had always been this way.

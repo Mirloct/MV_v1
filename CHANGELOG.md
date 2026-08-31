@@ -1517,3 +1517,111 @@ deliberately collapses to one row per entity), are recorded there rather
 than implemented blind — each needs its own validation run before it
 becomes real pipeline behavior, which was explicitly deferred throughout
 this exercise.
+
+---
+
+## 2026-08-31 — the deferred items land: real 0-anomaly fix, explicit 3-month OOT, and the analyst dashboard actually integrated
+
+**Ask:** three items, no longer deferred. (1) The real pipeline still showed
+"0 anomalías marcadas para revisión" on a real run -- fix it so the count
+comes from the OOT export's own P95/P99 rows, as specified two days ago.
+(2) Make the OOT window explicitly 3 months in `main.py`. (3) Integrate
+"Cola de Revisión" for real, fed *exclusively* by the resulting CSV/table
+-- not the mockup's fabricated data.
+
+**Root cause of the 0, confirmed by reading the code, not guessed:**
+`src/reporting/report.py::_hero_html` reads `dataset["n_anomalies"]`, which
+`main.py` set to `n_pos = int(labels.sum())` -- a **ground-truth positive
+count** (Phase 3). Real production data has no ground-truth file, so
+`labels` is all zero and `n_pos` is always 0 there, regardless of what the
+model actually flagged. The hero was answering "how many rows are truly
+anomalous" (unknowable in production) when its own label says "anomalías
+marcadas para revisión" (an alert-queue question). This was latent since
+whenever the hero code was written; the synthetic panel's own ground truth
+masked it in every test run to date.
+
+**Fix:** `main.py` Phase 9 now computes, right after `export_oot_top_
+anomalies` writes the file, `oot_review_count = int(_table[BAND_COL].isin(
+("p95", "p99")).sum())` -- read directly off the just-written export, so
+the number is always exactly what a reviewer would get by opening that
+file and counting P95+ rows. `context["dataset"]["n_anomalies"]`/
+`"anomaly_rate"` now prefer this over `n_pos`/`anomaly_rate`, falling back
+to the ground-truth pair only if no deliverable ran. `chart_data["anomaly_
+rate"]` (the PR-curve baseline, a genuinely different, still-ground-truth
+quantity) is untouched -- verified by grepping for the two separate
+dict-key assignments after the change. `src/evaluation/__init__.py` now
+re-exports `BAND_COL`/`PERCENTILE_BANDS` from `oot_report.py` so `main.py`
+can import them without reaching into the submodule directly.
+
+**`n_oot_periods` default: 1 -> 3, explicit**, in both `PipelineConfig`
+(`main.py`) and the `--n-oot-periods` CLI default -- comments and the
+`_QUICK` preset's period-budget note updated to the new actual split
+(5/2/3/3 train/val/test/OOT under `--quick`'s 13 periods, still comfortably
+above the `n_periods >= n_oot_periods + 3` floor `chronological_split`
+enforces).
+
+**The analyst dashboard, integrated for real**
+(`src/reporting/analyst_dashboard.py::build_analyst_dashboard`, wired into
+`main.py` Phase 9, one file per deliverable model at `artifacts/reports/
+analyst_dashboard_<model>.html`). Two design decisions made explicit,
+directly from the "exclusively from the resulting csv" constraint:
+
+- **No cross-model score join.** The mockup showed IF and VAE scores side
+  by side per entity; that join does not exist as a real, single output
+  table (each model's OOT export carries only its own score), so building
+  it would mean fabricating data outside "the resulting csv." Dropped for
+  the real integration -- each dashboard shows exactly one model's own
+  score/percentile, built strictly from that model's own export. Under
+  default stacking this is a non-issue (VAE is the only deliverable
+  anyway); under `--no-stack-iforest-into-vae` there are simply two
+  dashboards, one per model, never merged.
+- **Month-recurrence needed one small, additive real function**, since
+  `export_oot_top_anomalies` deliberately discards every OOT month but an
+  entity's best one. Added `src/evaluation/oot_report.py::
+  months_present_by_entity(scored_df, schema, oot_periods, cutoff,
+  score_col)`: given the *undeduplicated* OOT block and a score cutoff,
+  returns `{entity_id: [period_str, ...]}` -- which months that entity's
+  score cleared the cutoff in. Does not touch `export_oot_top_anomalies`'s
+  own dedup or return contract; a second view over the same data, nothing
+  replaced. The cutoff passed is the same P95 value the review-count KPI
+  uses (`np.percentile` of `true_oot_entity_scores.values()`, the exact
+  same de-duplicated population `_percentile_band_labels` grades against),
+  so "present in this month" and "counted as in review" mean the same
+  threshold everywhere.
+- Percentile-per-row (needed for the score bar, not present in the
+  exported table as a column) is recomputed via `rankdata` over
+  `true_oot_entity_scores` -- the same population, same method
+  `report_content.py`'s model-agreement chart already uses; not persisted,
+  cheap enough to rebuild per call.
+- Visually reuses `report.py`'s own design system verbatim
+  (`_HTML_CSS`/`_THEME_TOGGLE_JS`/`_stat_tile_html` imported directly, not
+  copied) rather than the mockup's separate Google-Fonts identity, so the
+  shipped artifact reads as part of this project's actual report rather
+  than a one-off style. Wrapped in its own try/except in `main.py`; a
+  failure here logs a warning and never blocks the OOT Excel deliverable.
+
+**Verified, both `python main.py --quick --no-tune` (default, stacked) and
+`--no-stack-iforest-into-vae` (parallel, two dashboards):**
+- OOT export log confirms 3 distinct months selected (e.g.
+  `period(s)=['2026-04-01...', '2026-05-01...', '2026-06-01...']`).
+- The report's hero figure (grepped from the rendered
+  `anomaly_report.html`) exactly equals `df["percentil"].isin(["p95",
+  "p99"]).sum()` computed independently from the just-written
+  `oot_p90_<model>.xlsx` -- 25 in every run tried, both modes.
+- The analyst dashboard's embedded per-entity JSON has exactly one entry
+  per exported row, entity-id-for-entity-id identical to the Excel's own
+  `entity_id` column; its "en revisión"/"recurrentes" KPI tiles match an
+  independent count from that same JSON; HTML parses with zero unclosed
+  tags in both the IF and VAE dashboards.
+- A found-and-fixed bug during this same verification pass: the two stat
+  tiles' labels used the `&ge;` HTML entity inside a string later passed
+  through `html.escape()` (`_stat_tile_html`), which escaped the `&` a
+  second time into literal `&amp;ge;` text in the browser. Fixed by using
+  the literal `≥` character instead (escaping a real Unicode symbol is a
+  no-op); re-verified in the regenerated output.
+- Health checks: 50/50 (stacked) and 58/58 (parallel).
+
+`CONTEXT.md` "Downstream analyst dashboard" section rewritten from "target
+architecture, not yet built" to describe what is now actually shipped and
+verified, including the two constraints above and how each is enforced in
+the code (not just asserted in prose).

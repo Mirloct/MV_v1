@@ -12,10 +12,13 @@ from src.evaluation.metrics import (
     unsupervised_metrics,
 )
 from src.evaluation.oot_report import (
+    BAND_COL,
     DEFAULT_TOP_N,
+    PERCENTILE_BANDS,
     export_oot_top_anomalies,
     export_oot_top_decile,
     export_p95_checkpoint,
+    months_present_by_entity,
 )
 from src.evaluation.scoring import build_scored_frame
 from src.evaluation.splits import (
@@ -41,6 +44,8 @@ __all__ = [
     "THRESHOLD_METHODS",
     "export_oot_top_anomalies",
     "DEFAULT_TOP_N",
+    "BAND_COL",
+    "PERCENTILE_BANDS",
     "load_ground_truth_labels",
     "load_ground_truth_types",
     "supervised_metrics",
@@ -49,6 +54,7 @@ __all__ = [
     "build_scored_frame",
     "export_oot_top_decile",
     "export_p95_checkpoint",
+    "months_present_by_entity",
     "plot_embedding",
     "plot_roc_pr",
 ]

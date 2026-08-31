@@ -207,6 +207,21 @@ default and a `model_name` is given, the file becomes
 `oot_top<N>_<model>.xlsx` under the fixed-headcount mode. The `.xlsx` write
 uses the `openpyxl` engine. Output lands under `artifacts/reports/`.
 
+`months_present_by_entity(scored_df, schema, oot_periods, cutoff,
+score_col="anomaly_score")` (2026-08-31) — a second, **additive** query over
+the same OOT block, for when the deliverable's own one-row-per-entity dedup
+throws away real signal: which of the OOT months an entity's score cleared
+`cutoff` in. Unlike `export_oot_top_anomalies`, this reads `scored_df`
+**undeduplicated** (every OOT row, every period) — it does not change what
+gets exported or how, it answers a different question ("which months," not
+just "the best one") from the same underlying data. Returns
+`{entity_id: [period_str, ...]}`, ascending, entities with zero qualifying
+months omitted. `main.py` (Phase 9) calls this with `cutoff` set to the P95
+of the model's own de-duplicated OOT scores, so "present this month" means
+the same threshold the review-count KPI and `build_analyst_dashboard`
+(`src/reporting/analyst_dashboard.py`) both use — see `CONTEXT.md`
+"Downstream analyst dashboard".
+
 ---
 
 ## 5. Figures

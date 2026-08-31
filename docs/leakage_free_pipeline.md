@@ -58,10 +58,10 @@ what goes wrong otherwise.
 
 | Block | Periods (16-month default) | Job |
 | --- | --- | --- |
-| train | 1–10 | fits preprocessing statistics and the models |
-| validation | 11–12 | selects hyperparameters **and** calibrates the threshold |
-| test | 13–15 | read exactly once, at the end, to report model metrics (ROC-AUC/PR-AUC/threshold diagnostics) |
-| oot | 16 | reserved exclusively for the `export_oot_top_anomalies` Excel deliverable |
+| train | 1–8 | fits preprocessing statistics and the models |
+| validation | 9–10 | selects hyperparameters **and** calibrates the threshold |
+| test | 11–13 | read exactly once, at the end, to report model metrics (ROC-AUC/PR-AUC/threshold diagnostics) |
+| oot | 14–16 | reserved exclusively for the `export_oot_top_anomalies` Excel deliverable (and the analyst dashboard built from it) |
 
 > Each block is spent on a different decision, and mixing them is the classic
 > leak. Validation is *consumed* by model selection and threshold fitting, so it
@@ -70,7 +70,11 @@ what goes wrong otherwise.
 > further: it is untouched even by *reporting*. Aliasing it to `test` (the
 > historical behaviour, `n_oot_periods=0`) made the "OOT Excel" describe the
 > exact same rows the test-set metrics were computed from — `n_oot_periods > 0`
-> (default 1) carves it off as its own, strictly later, never-reported-on block.
+> carves it off as its own, strictly later, never-reported-on block.
+> **Default is 3** (the last 3 months) as of 2026-08-31 — wide enough that an
+> entity's OOT presence can be tracked month-to-month (recurring vs. a
+> one-off), not just its single best-scoring month; `--n-oot-periods`
+> overrides.
 
 There is no random splitting anywhere in the pipeline. Short panels shrink the
 train/val/test blocks rather than failing (a 6-period panel with no OOT block

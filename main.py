@@ -126,7 +126,11 @@ class PipelineConfig:
     # seen, so the "OOT Excel" never describes the same rows as "test".
     # `0` would collapse OOT back onto test (the historical, since-removed
     # behaviour) -- see `src.evaluation.splits.chronological_split`.
-    n_oot_periods: int = 1
+    # Explicit business requirement (2026-08-30): the OOT window is the last
+    # 3 months, not 1 -- wide enough to see whether an individual is a
+    # one-off or a recurring case across the window, which the last-3-months
+    # analyst dashboard depends on. `--n-oot-periods` overrides.
+    n_oot_periods: int = 3
     # Headline deliverable: everyone at or above this percentile of the OOT
     # score distribution, each row graded p90/p95/p99 so the queue can be
     # triaged. A percentile rather than a fixed headcount because the cut then
@@ -326,6 +330,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
 
     figures: list = []
     oot_excels: dict = {}
+    analyst_dashboards: dict = {}
     model_specs: dict = {}
     chart_data: dict = {"models": {}}
     # Numeric payloads behind the charts that used to be embedded PNGs. The
@@ -903,6 +908,17 @@ def run_pipeline(config: PipelineConfig) -> dict:
         "iforest": (if_detector, if_scores, if_best_params, X_if, names_if),
         "vae": (vae_detector, vae_scores, vae_best_params, X_vae, vae_feature_names),
     }
+    # Headline "flagged for review" count for the report's hero figure --
+    # deliberately NOT the ground-truth positive count (`n_pos` above): that
+    # answers "how many are truly anomalous," which is unknowable on real,
+    # unlabeled data and is exactly why this number came back 0 on a real
+    # run with no ground-truth file. Set from the deliverable model's own
+    # OOT export below (last deliverable processed wins, i.e. the VAE's
+    # under stacking or in parallel mode, since it always runs last in this
+    # loop) and left None if no deliverable ran, so Phase 11 can fall back
+    # to the ground-truth count rather than showing nothing.
+    oot_review_count: Optional[int] = None
+    oot_review_rate: Optional[float] = None
 
     for name, (detector, scores, best_params, X_model, names_model) in models.items():
         # -- Phase 8: evaluation -------------------------------------------- #
@@ -1051,7 +1067,12 @@ def run_pipeline(config: PipelineConfig) -> dict:
         # stacked feature is doing any work.
         if name in config.deliverable_models:
             with log_phase(f"Phase 9: top-N Excel deliverable [{name}]"):
-                from src.evaluation import build_scored_frame, export_oot_top_anomalies, oot_period
+                from src.evaluation import (
+                    BAND_COL,
+                    build_scored_frame,
+                    export_oot_top_anomalies,
+                    oot_period,
+                )
 
                 scored_df = build_scored_frame(df, keys, scores, schema)
 
@@ -1128,6 +1149,82 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     failure_action="The headline deliverable for this model is missing or empty -- treat the run as failed.",
                     evidence=out_path,
                 )
+
+                # Headline "flagged for review" count for the report -- read
+                # directly off the exported table's own `percentil` column
+                # rather than recomputed independently, so the number on the
+                # report always matches what a reviewer would get by opening
+                # this exact file and counting P95+ rows themselves. `p95`
+                # and `p99` are both >= the P95 cut-off (bands are cumulative
+                # -- see `_percentile_band_labels`), so summing both bands is
+                # the full P95+ count. Deliberately NOT the calibrated
+                # `threshold`/`alert` count above: that can degenerate to
+                # zero on real data with no floor, which is the exact bug
+                # this replaces. Denominator is this model's own
+                # `true_oot_entity_scores` (Phase 8, same OOT dedup rule).
+                oot_review_count = int(_table[BAND_COL].isin(("p95", "p99")).sum())
+                oot_review_rate = (
+                    oot_review_count / len(true_oot_entity_scores)
+                    if true_oot_entity_scores else None
+                )
+                logger.info(
+                    "[%s] flagged for review (score >= P95, from %s): %d of %d "
+                    "unique OOT individuals.",
+                    name, out_path, oot_review_count, len(true_oot_entity_scores),
+                )
+
+                # -- Analyst dashboard: a rendering of this exact export, --- #
+                # -- nothing more (CONTEXT.md "Downstream analyst dashboard") #
+                try:
+                    from scipy.stats import rankdata
+
+                    from src.evaluation import months_present_by_entity
+                    from src.reporting import build_analyst_dashboard
+
+                    # Recomputed rather than reusing the per-row-explanation
+                    # try block's `oot_periods` above: that block can fail
+                    # before assigning it, and this dashboard must not
+                    # inherit a failure unrelated to it. `oot_period` itself
+                    # is already imported at the top of this Phase 9 block.
+                    oot_periods = oot_period(
+                        keys, time_col=(schema.time_col or "period"),
+                        n_oot_periods=config.n_oot_periods,
+                    )
+                    dash_score_col = "anomaly_score"  # build_scored_frame's default
+                    entity_ids_oot = list(true_oot_entity_scores.keys())
+                    scores_oot = np.asarray(
+                        [true_oot_entity_scores[e] for e in entity_ids_oot], dtype=float
+                    )
+                    p95_cutoff = float(np.percentile(scores_oot, 95.0))
+                    percentile_by_entity = dict(zip(
+                        entity_ids_oot, 100.0 * rankdata(scores_oot) / len(scores_oot),
+                    ))
+                    months_present = months_present_by_entity(
+                        scored_df, schema, oot_periods, cutoff=p95_cutoff,
+                        score_col=dash_score_col,
+                    )
+                    dashboard_path = build_analyst_dashboard(
+                        _table, schema, name, oot_periods,
+                        percentile_by_entity, months_present, score_col=dash_score_col,
+                    )
+                    analyst_dashboards[name] = dashboard_path
+                    _dash_ok = os.path.isfile(dashboard_path) and os.path.getsize(dashboard_path) > 0
+                    observability.check(
+                        name=f"artifact.analyst_dashboard_written[{name}]", category="artifact",
+                        definition="The analyst review-queue dashboard HTML exists and is non-empty.",
+                        expected="file exists and size_bytes > 0", severity="warning",
+                        passed=_dash_ok,
+                        observed={"path": dashboard_path,
+                                  "size_bytes": os.path.getsize(dashboard_path) if _dash_ok else 0},
+                        failure_action="Best-effort artifact; the OOT Excel deliverable above is "
+                                       "unaffected. Check the log for the dashboard-build error.",
+                        evidence=dashboard_path,
+                    )
+                except Exception as exc:  # noqa: BLE001 - never block the Excel deliverable
+                    logger.warning(
+                        "[%s] analyst dashboard failed (%s); the Excel deliverable above "
+                        "is unaffected.", name, exc,
+                    )
         else:
             logger.info(
                 "[%s] no Excel deliverable: the VAE trains on the stacked matrix, "
@@ -1247,6 +1344,16 @@ def run_pipeline(config: PipelineConfig) -> dict:
         from src.reporting import build_report
 
         oot_note = "; ".join(f"{k}: {v}" for k, v in oot_excels.items())
+        # The report's hero figure ("anomalías marcadas para revisión") is a
+        # review-queue count, not a ground-truth count: `n_pos`/`anomaly_rate`
+        # (Phase 3) answer "how many rows are truly anomalous," which is
+        # unknown on real, unlabeled data and is why this hero showed 0 on a
+        # real run with no ground-truth file. `oot_review_count` (Phase 9,
+        # read directly off the deliverable's own P95/P99 band) is what a
+        # reviewer would actually work from, so it takes priority; falling
+        # back to the ground-truth count only if no deliverable ran at all.
+        hero_n_anomalies = oot_review_count if oot_review_count is not None else n_pos
+        hero_anomaly_rate = oot_review_rate if oot_review_count is not None else anomaly_rate
         context = {
             "title": "Reporte de Detección de Anomalías del Panel Bancario",
             "generated_at": generated_at,
@@ -1257,8 +1364,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 "periods": n_periods,
                 "features": n_features,
                 "oot_period": oot_period_str,
-                "anomaly_rate": anomaly_rate,
-                "n_anomalies": n_pos,
+                "anomaly_rate": hero_anomaly_rate,
+                "n_anomalies": hero_n_anomalies,
                 "evaluation_mode": "supervised" if supervised else "unsupervised",
                 "in_time_rows": int(in_mask.sum()),
                 "oot_rows": int(oot_mask.sum()),
@@ -1327,6 +1434,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
 
     artifacts = {
         "oot_excels": oot_excels,
+        "analyst_dashboards": analyst_dashboards,
         "p95_checkpoint": p95_path,
         "attribution_workbook": attribution_path,
         "reports": report_paths,
@@ -1340,6 +1448,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         "PIPELINE COMPLETE - artifact locations:",
         f"  IF P95 checkpoint: {p95_path}",
         f"  OOT Excel(s)   : {', '.join(oot_excels.values()) or '(none)'}",
+        f"  Analyst dashboard(s): {', '.join(analyst_dashboards.values()) or '(none)'}",
         f"  Feature attribution (xlsx): {attribution_path}",
         f"  Report (html)  : {report_paths.get('html')}",
         f"  Report (md)    : {report_paths.get('md')}",
@@ -1389,11 +1498,11 @@ _BASE = {
     "n_individuals": 2000, "n_periods": 16,
     "iforest_trials": 15, "vae_trials": 10, "vae_epochs": 15, "tune": True,
 }
-# --quick still needs >= 4 periods for the chronological split with the
-# default `n_oot_periods=1` (train/val/test/OOT); 13 keeps a 8/2/2/1 split and
-# the 7-month training block big enough for the h=6 contrast horizon (h=6 is
-# dropped automatically by PanelFeatureEngineer when the training block is
-# too short).
+# --quick still needs `n_periods >= n_oot_periods + 3` for the chronological
+# split (train/val/test/OOT); with the default `n_oot_periods=3`, 13 periods
+# gives a 5/2/3/3 split (train/val/test/OOT) -- short enough that
+# PanelFeatureEngineer automatically drops the h=6 contrast horizon (needs a
+# deeper training block), which is expected for a quick smoke test, not a bug.
 _QUICK = {
     "n_individuals": 500, "n_periods": 13,
     "iforest_trials": 5, "vae_trials": 5, "vae_epochs": 5,
@@ -1501,10 +1610,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Validation months for tuning + threshold calibration (default 2).")
     parser.add_argument("--n-test-periods", type=int, default=3,
                         help="Trailing test months, reported but never tuned on (default 3).")
-    parser.add_argument("--n-oot-periods", type=int, default=1,
+    parser.add_argument("--n-oot-periods", type=int, default=3,
                         help="Trailing months reserved AFTER test, exclusively for the OOT "
                              "Excel deliverable -- never used for fitting, tuning, threshold "
-                             "calibration, or test-set metrics (default 1).")
+                             "calibration, or test-set metrics (default 3: the last 3 months).")
     parser.add_argument("--threshold-method", default="pot", choices=["pot", "percentile"],
                         help="Threshold calibration on validation scores (default 'pot').")
     parser.add_argument("--threshold-percentile", type=float, default=99.0,

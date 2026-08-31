@@ -34,7 +34,8 @@ from src.utils.logging_config import log_phase, setup_logging
 
 __all__ = [
     "export_oot_top_anomalies", "export_oot_top_decile", "DEFAULT_TOP_N",
-    "export_p95_checkpoint",
+    "export_p95_checkpoint", "months_present_by_entity", "BAND_COL",
+    "PERCENTILE_BANDS",
 ]
 
 _DEFAULT_OUT = paths.OOT_REPORT_DEFAULT
@@ -99,6 +100,56 @@ def _percentile_band_labels(
     for p in ordered:
         labels[scores >= cutoffs[p]] = f"p{int(round(p))}"
     return labels, cutoffs
+
+
+def months_present_by_entity(
+    scored_df: pd.DataFrame,
+    schema: PanelSchema,
+    oot_periods,
+    cutoff: float,
+    score_col: str = "anomaly_score",
+) -> dict:
+    """Which of the OOT months each entity's score cleared ``cutoff`` in.
+
+    Unlike :func:`export_oot_top_anomalies` (which deliberately collapses to
+    one row per entity -- its single best-scoring OOT month), this looks at
+    *every* OOT row: an entity flagged in more than one month is a materially
+    different case (recurring, not a one-off), and the deliverable's own
+    dedup throws that signal away. Additive -- does not change what
+    ``export_oot_top_anomalies`` exports, only reports a second view of the
+    same OOT block.
+
+    Args:
+        scored_df: The full scored frame (every period), as built by
+            :func:`src.evaluation.scoring.build_scored_frame` -- NOT the
+            already-deduplicated table `export_oot_top_anomalies` returns.
+        schema: Panel schema (for ``entity_col``/``time_col``).
+        oot_periods: The OOT period value(s) to check, e.g. from
+            :func:`src.evaluation.splits.oot_period`.
+        cutoff: Score threshold a month counts as "present" at or above.
+            Pass the same P95 cut-off used elsewhere so this stays "which of
+            these months was this entity in the top 5% for," not an
+            unrelated threshold.
+        score_col: Name of the score column.
+
+    Returns:
+        ``{entity_id: [period_str, ...]}``, ascending -- only entities with
+        at least one qualifying month appear. Period values are stringified
+        (``str(period)[:10]``, a clean date for a Timestamp column) so the
+        result is directly JSON/HTML-safe.
+    """
+    entity_col = schema.entity_col or "entity_id"
+    time_col = schema.time_col or "period"
+    oot_mask = scored_df[time_col].isin(np.atleast_1d(oot_periods)).to_numpy()
+    sub = scored_df.loc[oot_mask, [entity_col, time_col, score_col]]
+    hits = sub.loc[sub[score_col].to_numpy(dtype=float) >= float(cutoff)]
+
+    result: dict = {}
+    for eid, period_val in zip(hits[entity_col], hits[time_col]):
+        result.setdefault(str(eid), []).append(str(period_val)[:10])
+    for key in result:
+        result[key].sort()
+    return result
 
 
 def export_oot_top_anomalies(

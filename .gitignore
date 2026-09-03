@@ -20,6 +20,11 @@ venv/
 # never hand-edit.
 docs/documentation.html
 
+# Diagnostic-suite run outputs (CSVs/reports it writes when run against this
+# project's data) -- reproducible from
+# `python tools/export_diagnostic_suite_inputs.py`, same as artifacts/.
+tools/if_vae_diagnostic_suite/build/
+
 # OS noise
 Thumbs.db
 .DS_Store

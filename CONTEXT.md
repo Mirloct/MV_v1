@@ -41,12 +41,18 @@ Modelo-v0.1/
 │   ├── reporting/          # HTML/MD report builder + flow visualization (no PDF)
 │   └── utils/              # paths, logging, observability, assumptions gate, atomic_io
 ├── docs/                   # *.md sources + generated documentation.html
+├── tools/                  # external/adjacent tooling -- NOT part of the
+│   │                       # pipeline import graph; see "IF-VAE Diagnostic
+│   │                       # Suite integration" below
+│   ├── export_diagnostic_suite_inputs.py
+│   └── if_vae_diagnostic_suite/   # vendored external package (own venv-less
+│                                  # pip install -e ., own tests/, own AGENTS.md)
 └── artifacts/              # EVERYTHING the pipeline writes (gitignored)
     ├── data/               # data.csv + ground_truth.parquet (hidden labels)
     ├── logs/               # execution.log + run_events.jsonl
     ├── models/             # iforest.joblib, vae_best.pt, vae/, vae_tuning/
     ├── tuning/             # optuna_*.db, best_params_*.yaml (Optuna outputs)
-    └── reports/            # anomaly_report.{html,md}, model_documentation.md, oot_p90_*.xlsx, feature_attribution.xlsx, flow_visualization.html
+    └── reports/            # anomaly_report.{html,md}, model_documentation.md, oot_p90_*.xlsx, feature_attribution.xlsx, flow_visualization.html, analyst_dashboard.html
         └── figures/        # ALL figures, flat (see rule below)
 ```
 
@@ -731,16 +737,180 @@ just-written primary Excel (25 in every run tried); the cross-model
 `if_score` join was verified byte-exact against the separate IF export in
 parallel mode; 50/50 (stacked) and 57/57 (parallel) health checks passed.
 
+**Client-side search + responsive table (2026-09-03).** The priority table
+has a text filter (`#tableSearch`, matches the query against every visible
+cell of a row — ID, band, both percentiles, top-5 variables, meses — not
+just the ID column) and its wrapper scrolls both axes on its own
+(`.tablewrap{overflow:auto}`) rather than widening the page, since a real
+`entity_id` can run far longer than this project's own synthetic
+`CUST_000123` format; the ID cell wraps (`overflow-wrap:anywhere`) instead
+of forcing the table wider for one long value.
+
+## IF-VAE Diagnostic Suite integration
+
+**What it is.** A third-party, standalone Python package (`tools/
+if_vae_diagnostic_suite/`, v1.0.0, own `pyproject.toml`/CLI/tests/AGENTS.md)
+that diagnoses *why* an Isolation Forest and a VAE disagree, given exported
+reconstructions/latents/scores — not a component of this pipeline's own
+import graph, `main.py` never imports it. Installed editable
+(`pip install -e tools/if_vae_diagnostic_suite`) into the same environment.
+Vendored in-repo (not a git submodule) so the two integration fixes below
+travel with this project rather than living only on one machine's Downloads
+folder.
+
+**How to run it against this project:**
+```
+py tools/export_diagnostic_suite_inputs.py --out tools/if_vae_diagnostic_suite/build/modelo_run
+cd tools/if_vae_diagnostic_suite
+PYTHONPATH=src py -m ifvae_diag run --reference build/modelo_run/reference.csv \
+  --scored build/modelo_run/scored.csv --config build/modelo_run/modelo_config.yaml \
+  --out build/modelo_run/report
+```
+`export_diagnostic_suite_inputs.py` mirrors `main.py`'s own Phases 2→3a→4→6→
+6b→7 (same functions, same seed, stacking on) to fit a real, fresh IF+VAE
+pair and export the suite's exact contract: `reference.csv` = train block
+(no labels — not required there), `scored.csv` = the true OOT block
+(`n_oot_periods=3`), one row per **(entity, period)** — deliberately *not*
+deduplicated to one row per entity the way the OOT Excel is, since the
+suite has no concept of "each entity's best month" and more rows give its
+drift/family diagnostics more to work with. Ground truth
+(`load_ground_truth_labels`/`_types`) is attached to `scored.csv` for this
+integration only, from this project's own synthetic labels — see
+"Label-free mode" below for why a real production run cannot do this.
+
+**Two real, root-caused fixes made to the vendored copy** (both covered by
+new tests, full `make chore-lint` green — `31 passed`, `compile=True
+tests=True mutations=True`):
+
+- **`scripts/mutation_probe.py` was silently broken on Windows.** It built
+  the mutated-copy `PYTHONPATH` with a hardcoded POSIX `:` separator
+  (`f"{source_root}:{ROOT}"`). On Windows, `os.pathsep` is `;`, and a
+  drive-letter path (`C:\Users\...`) already contains a colon, so the join
+  produced one unparseable string; Python silently fell back to importing
+  the real, pip-installed (unmutated) package for every mutant, and
+  `_mutant_is_killed` always returned `False` — a false "the gate is
+  broken" reading with nothing to do with test quality. Fixed with
+  `os.pathsep.join(...)`; all 4 mutants (`percentile_tie_direction`,
+  `if_quadrant_threshold_exclusive`, `vae_quadrant_threshold_exclusive`,
+  `lift_formula`) are now genuinely killed. Regression-tested
+  (`tests/test_mutation_probe.py`) by actually running one mutant end to
+  end and asserting it is caught — not a tautology.
+- **No label-free mode existed.** The data contract hard-required a binary
+  `label_col` in `scored.csv` (`contracts.py::_require_columns`), and every
+  supervised computation (`metrics.py`, autopsies, coverage,
+  orientation-risk warnings) read `config.label_col` unconditionally. This
+  project's **official, real-data runs are unsupervised and carry no
+  target at all** — a real production run could not produce a valid
+  `scored.csv` for this tool as shipped. Added `label_col: str | None`
+  (`config.py`); `contracts.py`/`pipeline.py` skip every label-dependent
+  computation (`metrics.csv`, `autopsies.csv`, `coverage.json`,
+  `metrics_by_group.csv`, the two orientation-risk warnings) when it is
+  `None`, while percentiles, quadrants, latent diagnostics, and drift —
+  the genuinely label-free half of the suite — still run and still write
+  `report.md`/`disagreement.png`. Covered by
+  `tests/test_pipeline_unsupervised.py` (asserts both the label-free
+  degrade *and* that supplying a real label column still enforces the
+  existing binary-label validation — the fix must not weaken the
+  supervised path). Verified against this project's own real export in
+  both modes: identical quadrant counts (77/115/132/1176) with and without
+  labels, proving quadrant assignment is genuinely label-independent.
+
+**Report enhancement: per-layer performance chart.** `report.md` originally
+carried only `disagreement.png` (a percentile-agreement scatter — shows
+where IF and VAE *agree*, not which one *performs*). Added
+`metrics_bar_plot()` (`reporting.py`) — a precision@k bar chart grouped by
+alert budget (k=10/25/50), one bar per score candidate
+(`if_percentile`/`vae_percentile`/`ensemble_max`/`ensemble_mean`, fixed
+colors so a candidate is visually stable across runs) — as the visual
+counterpart to `metrics.csv`, so monitoring each detection layer's
+operational performance doesn't require reading a table. TDD: wrote
+`tests/test_reporting_metrics_plot.py` first (Red —
+`ImportError: cannot import name 'metrics_bar_plot'`), implemented, both
+tests green. Wired into `pipeline.py::_write_outputs`, which now also
+passes a `has_metrics_plot` flag into `write_markdown_report` so the
+markdown embeds `![...](metrics.png)` when the chart exists and a plain
+sentence explaining its absence when it does not — this chart is
+inherently label-dependent (precision/recall need known positives), so it
+is correctly skipped, not broken, on a real unsupervised run
+(`report_unsupervised/`: no `metrics.png` written, `report.md` reads "no
+label column (label-free mode)"). Verified against this project's real
+export in both modes: labeled run's `report/` has `metrics.png` embedded
+after "Operational metrics"; label-free run's `report_unsupervised/`
+correctly has neither the file nor a broken image reference.
+
+**What still does NOT apply to an official (unsupervised, real-data) run,
+by design of the underlying method** — the label-free mode above makes
+these *not crash*, not makes them meaningful:
+- `metrics.csv`/`coverage.json`/`metrics_by_group.csv`
+  (Precision@K/Recall@K/Lift@K/AP, unique/shared coverage, segment/family
+  cohorts) — need known positives to mean anything.
+- `autopsies.csv` (known-positive feature autopsies) — selects rows by
+  `label_col == 1`; nothing to select without one.
+- The two `*_percentile_orientation` warnings — need both classes present.
+- `if_stability.json` — unrelated to labels, but unavailable whenever
+  `if_score_col` is set (diagnosing the *production* forest), regardless
+  of label mode; see "No cross-seed stability measurement" below.
+
+**What DOES apply and was validated against this project's real, freshly-
+fitted IF+VAE (2026-09-03, synthetic labels used only to prove the numbers
+line up, not as a production measurement):**
+- `scored_diagnostics.csv` (percentiles, `if_percentile`/`vae_percentile`,
+  `ensemble_max`/`ensemble_mean`, disagreement quadrant per row).
+- `drift.csv` (KS/Wasserstein/out-of-range population shift, reference vs.
+  scored).
+- Latent diagnostics (`summary.json::latent_diagnostics`) — active units,
+  collapsed fraction, per-unit KL.
+- `report.md` + `disagreement.png`.
+
+**Findings from that run** (500 individuals × 13 months, `--quick`-scale,
+20 VAE epochs, stacking on — a smoke-scale run, not a production
+measurement; treat magnitudes as directional):
+- **VAE dominates IF on `global` anomalies** (AP 0.82 vs. 0.08, recall@10 ≈
+  89% vs. 11%) but **both are near-random on `local` and `contextual`**
+  (AP ≈ 0.01–0.02, recall@10 = 0% for almost every score/ensemble
+  combination) — see "Known open problems" below, now with an independent,
+  differently-coded confirmation.
+- **IF contributed zero unique hits to the top-10/25 queue that VAE did
+  not already find** (`coverage.json`: `a_only_positive_hits: 0` at every
+  budget tried) — on this run, a simple mean ensemble was *worse* than VAE
+  alone (AP 0.24 vs. 0.28), exactly the risk the suite's own README warns
+  about ("do not use `IF AND VAE` as the default... compare against
+  IF-only, VAE-only, max, mean").
+- **No posterior collapse** (`collapsed_fraction: 0.0`, 8/8 active units)
+  — an independent, external confirmation that the 2026-08-22/23
+  loss-scaling fix (see "Known open problems") is holding.
+- **The drift table's top entries are dominated by calendar/lag-feature
+  artifacts, not genuine concerning drift**: `cyc__period_month_sin/cos`
+  and every `*_lag3`/`*_diff3`/`*_ratio3` panel feature show KS ≈ 0.37–1.0
+  simply because `reference` (train months) and `scored` (strictly later
+  OOT months) cover different calendar months by construction — any
+  chronological split will "drift" on month-of-year. Read this table with
+  calendar-derived and panel-lag features filtered out, or expect them to
+  dominate meaninglessly.
+- **The `collective` anomaly family had zero known positives in this
+  particular 3-month OOT window** (`metrics_by_group.csv` only has
+  `local`/`contextual`/`global` rows) — with only ~33 total positives
+  spread over one 3-month slice, a family-level breakdown can miss an
+  entire family by chance. A longer or repeated OOT window would be needed
+  before reading "family X has 0 recall" as evidence rather than absence.
+
 ## Known open problems
 
-- **`local`-type anomalies are unrecovered.** The Isolation Forest ranks a
-  `local` anomaly at roughly the population median (recall@10% ≈ 0 across
-  every numeric transform tried), because by construction a `local` anomaly
-  sits inside the population's normal band and is anomalous only against the
+- **`local`-type anomalies are unrecovered — and, independently confirmed
+  2026-09-03, so is `contextual`.** The Isolation Forest ranks a `local`
+  anomaly at roughly the population median (recall@10% ≈ 0 across every
+  numeric transform tried), because by construction a `local` anomaly sits
+  inside the population's normal band and is anomalous only against the
   entity's own history — `_own_z` is the intended instrument and is
   evidently not sufficient on its own. See `docs/models_isolation_forest.md`
-  §"Measured" and `CHANGELOG.md` 2026-08-01 for the numbers. This needs
-  feature/architecture work, not more hyperparameter search.
+  §"Measured" and `CHANGELOG.md` 2026-08-01 for the numbers. The external
+  IF-VAE Diagnostic Suite (see "IF-VAE Diagnostic Suite integration" below)
+  independently reproduces this with a differently-coded percentile/AP
+  methodology, on real project data: `local` AP ≈ 0.012, `contextual` AP ≈
+  0.023 (both near the ~0.007 base rate — indistinguishable from random) for
+  **every** score candidate (IF, VAE, both ensembles), while `global` reaches
+  AP ≈ 0.82 on the VAE score alone. This needs feature/architecture work, not
+  more hyperparameter search.
 - **VAE health was not independently validated until recently.** See
   `docs/diagnostico_del_proyecto.md` for the fullest current account — it
   found (2026-08-22/23) that the VAE's loss scaling made its effective
@@ -763,7 +933,13 @@ parallel mode; 50/50 (stacked) and 57/57 (parallel) health checks passed.
   single fixed seed (`PipelineConfig.seed = 42`) runs today;
   `unsupervised_metrics`'s `rank_stability` is a bootstrap-jitter proxy for
   score sensitivity to noise, not a re-fit-under-a-different-seed measurement.
-  See `docs/validacion_no_supervisada.md` §6 for the proposed design.
+  See `docs/validacion_no_supervisada.md` §6 for the proposed design. Partial
+  external option for the Isolation Forest specifically: the IF-VAE
+  Diagnostic Suite's own seed-refit top-K Jaccard/selection-probability
+  diagnostic (`if_stability.json`) does exactly this — but only when
+  `if_score_col` is left unset (a fresh in-suite refit across
+  `random_seeds`), which then diagnoses a *different* forest than the
+  production one. No equivalent exists for the VAE either way.
 - **The Isolation Forest permanently runs a sub-optimal numeric transform**
   for its own objective (`yeo-johnson`, not `robust`) because the VAE cannot
   survive `robust` — see "Leakage-free pipeline" above. Worth re-measuring

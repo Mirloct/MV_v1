@@ -1,0 +1,15 @@
+{
+  "note_id": "failure-hidden-generator-shift",
+  "kind": "failure",
+  "content": "Synthetic reference and scored normals used separate loading matrices, creating unintended broad drift despite passing initial tests.",
+  "phase": "validate",
+  "tags": ["hypothesis", "simulation", "drift"],
+  "keywords": ["generator", "covariate-shift", "ks"],
+  "context": "Fixed with shared weights plus family-level and KS-bound behavior tests.",
+  "links": ["gate-two-quiet-rounds"],
+  "metadata": {"resolved": true},
+  "created_at": "2026-09-02T00:00:00Z",
+  "updated_at": "2026-09-02T00:00:00Z",
+  "version": 1
+}
+

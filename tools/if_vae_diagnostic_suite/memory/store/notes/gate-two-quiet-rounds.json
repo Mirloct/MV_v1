@@ -1,0 +1,15 @@
+{
+  "note_id": "gate-two-quiet-rounds",
+  "kind": "gate",
+  "content": "Two consecutive full validation rounds found no new issue and passed tests, mutants, complexity, direct CLI, and CSV round-trip behavior.",
+  "phase": "validate",
+  "tags": ["gate", "convergence", "evidence"],
+  "keywords": ["quiet-round", "passed", "mutation"],
+  "context": "Round 2 final: 26 tests passed, 4/4 mutants killed, complexity <=10, exact 10/10/10 synthetic family recovery.",
+  "links": ["failure-hidden-generator-shift", "failure-family-all-positive-cohort", "pattern-location-specific-mutation"],
+  "metadata": {"converge_k": 2, "max_rounds": 5, "passed": true},
+  "created_at": "2026-09-02T00:00:00Z",
+  "updated_at": "2026-09-02T00:00:00Z",
+  "version": 1
+}
+

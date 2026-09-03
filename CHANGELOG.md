@@ -1710,3 +1710,137 @@ and `--no-stack-iforest-into-vae` (parallel, two Excels):**
 the corrected, unified design -- explicitly naming both mistakes and how
 each is now prevented in the code, not just narrating the current state
 as if it had always been this way.
+
+---
+
+## 2026-09-03 — IF-VAE Diagnostic Suite vendored, adapted, debugged, and run against real project data; dashboard filter + responsive fix
+
+**Ask:** vendor a third-party "IF-VAE Diagnostic Suite" package into the
+project, apply whichever of its capabilities fit an unsupervised model
+(official runs carry no target), adapt this project's own scripts to feed
+it real data, run it, root-cause and fix whatever breaks, and interpret
+the results -- plus, separately, add a search filter and responsive
+layout to `analyst_dashboard.html`'s priority table. A full backup was
+taken first (`git archive` zip + a local, unpushed tag
+`backup-pre-diagnostic-suite-2026-09-03`) since this is explicitly a
+before-you-evaluate-it change: **not pushed to GitHub this round**, by
+explicit instruction.
+
+**Suite vendored** into `tools/if_vae_diagnostic_suite/` (copied from the
+user-provided package, not a submodule) and installed editable. Read all
+~1,100 lines of its `src/ifvae_diag/` before writing any adapter code
+(`cli.py`, `config.py`, `contracts.py`, `pipeline.py`, `modeling.py`,
+`scoring.py`, `diagnostics.py`, `metrics.py`, `data_quality.py`,
+`stability.py`, `reporting.py`, `simulation.py`) -- confirmed its own
+26-test suite and `simulate` demo both passed clean before touching
+anything, so every later finding is attributable to the real-data
+integration, not a pre-broken package.
+
+**`tools/export_diagnostic_suite_inputs.py`** (new): mirrors `main.py`'s
+Phases 2→3a→4→6→6b→7 to fit a real IF+VAE pair (same functions, same seed,
+stacking on) and export the suite's `reference.csv`/`scored.csv` contract
+-- see `CONTEXT.md` "IF-VAE Diagnostic Suite integration" for the exact
+mapping (id/time/label/segment/family columns, why `scored.csv` is one row
+per (entity, period) rather than deduplicated like the OOT Excel). One bug
+caught and fixed immediately: the VAE's `encoder`/`decoder` `Linear` layers
+are float32 (`src/models/vae.py::_densify`), and my first draft densified
+the export matrix to float64, producing `RuntimeError: mat1 and mat2 must
+have the same dtype, but got Double and Float` on the very first real run.
+Also hit and fixed pandas' `PerformanceWarning: DataFrame is highly
+fragmented` (from ~140 individual `frame[col] = ...` assignments building
+the mu/logvar/recon columns one at a time) by building each frame via a
+single `pd.concat` of column blocks instead.
+
+**Two real, root-caused bugs found and fixed in the vendored suite itself**
+(full detail, code, and verification in `CONTEXT.md` -- summarized here):
+1. `scripts/mutation_probe.py` hardcoded a POSIX `PYTHONPATH` separator
+   (`:`), which is broken on Windows (`os.pathsep` is `;`, and a
+   drive-letter path already contains a `:`) -- every mutation test
+   silently ran against the real, installed package instead of the
+   mutated copy, so `killed=False` for all 4 mutants regardless of test
+   quality. Found because I ran `make chore-lint` on this Windows machine
+   as part of "hasta que funcione correctamente," not because anything in
+   my own adapter script triggered it.
+2. No label-free mode: the data contract hard-required a binary label
+   column that this project's real, unsupervised production runs do not
+   have. Added `label_col: str | None` end to end
+   (`config.py`/`contracts.py`/`pipeline.py`/`reporting.py`), following
+   the suite's own Red→Green discipline (`AGENTS.md`): wrote
+   `tests/test_pipeline_unsupervised.py` first, watched it fail for the
+   right reason (`DataContractError: scored is missing columns: [None]`),
+   then implemented.
+
+Both fixes are covered by new tests (`tests/test_mutation_probe.py`,
+`tests/test_pipeline_unsupervised.py`); the suite's own quality gate
+(`PYTHONPATH=src python scripts/quality_gate.py`) went from
+`mutations=False` (broken) to fully green: `compile=True tests=True
+mutations=True`, 31/31 tests. Verified end to end against this project's
+own real export, twice -- once with the project's synthetic ground truth
+attached (to prove the numbers are right) and once with every label/
+segment/family column stripped and `label_col: null` (to prove the
+label-free path is real, not just unit-tested): both runs produce
+identical disagreement quadrant counts (77 BOTH / 115 IF_ONLY / 132
+VAE_ONLY / 1176 NEITHER), confirming quadrant assignment never touches
+the label column either way.
+
+**Findings from running it against a real, freshly-fitted IF+VAE** (full
+numbers in `CONTEXT.md`): VAE strongly dominates IF on `global` anomalies
+(AP 0.82 vs. 0.08) but both are near-random on `local` and `contextual`
+(AP ≈ 0.01–0.02) -- an independent, differently-coded confirmation of the
+project's own long-standing "`local`-type anomalies are unrecovered"
+finding, now extended to `contextual` too; IF contributed zero unique hits
+to the top-K queue beyond what VAE already found, and a naive mean
+ensemble was worse than VAE alone; no posterior collapse (independent
+confirmation the 2026-08-22/23 VAE loss-scaling fix is holding); the
+drift report's top entries are dominated by calendar/lag-feature artifacts
+of the chronological split itself, not genuine concerning drift; and the
+`collective` anomaly family had zero known positives in this particular
+3-month OOT sample, a reminder that a family-level breakdown needs a large
+enough OOT window to be trusted.
+
+**Per-layer performance chart added to `report.md`** (follow-up ask: "de
+ser necesario, al nuevo reporte agregale los gráficos que sirven para
+monitorear el desempeño de los modelos en cada capa"). The report only had
+`disagreement.png`, a percentile-agreement scatter that shows where IF and
+VAE *agree*, not which one actually *performs*. Added
+`metrics_bar_plot()` (`reporting.py`): a precision@k bar chart, one group
+per alert budget (k=10/25/50), one bar per score candidate
+(`if_percentile`/`vae_percentile`/`ensemble_max`/`ensemble_mean`) -- the
+visual counterpart to `metrics.csv`. Same Red→Green discipline: wrote
+`tests/test_reporting_metrics_plot.py` first (Red --
+`ImportError: cannot import name 'metrics_bar_plot'`), implemented,
+green. Wired into `pipeline.py::_write_outputs`, which now passes a
+`has_metrics_plot` flag through to `write_markdown_report` so the report
+embeds `![...](metrics.png)` when it exists and a plain sentence in its
+place when it does not -- this chart needs known positives, so it is
+correctly and silently skipped (not a broken image link) on the label-free
+path. Re-verified against this project's real export in both modes:
+labeled `report/report.md` embeds `metrics.png`; label-free
+`report_unsupervised/report.md` has neither the file nor a dangling
+reference. Full suite re-run after this change: 31/31 tests,
+`compile=True tests=True mutations=True`.
+
+**`analyst_dashboard.html`: search filter + responsive table**
+(`src/reporting/analyst_dashboard.py`). Added `#tableSearch`, a
+client-side filter (`filterTable()`, debounced via
+`requestAnimationFrame`) matching the query against every visible cell of
+a row -- ID, band, both percentiles, top-5 variables, meses -- not just
+the ID column, with a "no matches" row and a live-updating count badge.
+Made the table responsive for entity IDs longer than this project's own
+synthetic `CUST_000123` format: `.tablewrap` scrolls both axes on its own
+(`overflow:auto`) instead of the page gaining horizontal scroll, and the
+ID cell wraps (`overflow-wrap:anywhere`) instead of forcing the whole
+table wider for one long value. Verified against a real
+`python main.py --quick --no-tune` run: HTML parses with balanced tags,
+every row carries the `data-id` attribute the filter's selector expects,
+50/50 health checks passed.
+
+**Full-pipeline integrity check** (both stacked and parallel modes,
+`python main.py --quick --no-tune`, run after every change in this entry)
+-- see the final validation note at the end of this file for the exact
+health-check counts. No regression found in the core pipeline; all
+changes in this entry are additive (`tools/`, dashboard JS/CSS) or
+confined to the vendored suite.
+
+**Not pushed.** Local commit only, per explicit instruction to evaluate
+first.

@@ -1,0 +1,15 @@
+{
+  "note_id": "pattern-location-specific-mutation",
+  "kind": "pattern",
+  "content": "Each mutation must target one precise source location; duplicate text matches are split into independent mutants.",
+  "phase": "validate",
+  "tags": ["pattern", "mutation-testing", "verification"],
+  "keywords": ["location", "operator", "killed-mutant"],
+  "context": "Adopted after an ambiguous global threshold mutation failed before running tests.",
+  "links": ["gate-two-quiet-rounds"],
+  "metadata": {},
+  "created_at": "2026-09-02T00:00:00Z",
+  "updated_at": "2026-09-02T00:00:00Z",
+  "version": 1
+}
+

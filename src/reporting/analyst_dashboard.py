@@ -229,11 +229,17 @@ def build_analyst_dashboard(
       <div class="col-table">
         <div class="panel-head">
           <div class="panel-title">Individuos priorizados<span class="hint">clic en una fila &rarr; perfil completo</span></div>
-          <span class="badge">mostrando {n_rows:,} de {n_total_oot:,}</span>
+          <span class="badge" id="rowCountBadge">mostrando {n_rows:,} de {n_total_oot:,}</span>
         </div>
         <p class="tablenote"><b>Definición fija:</b> "en revisión" = score &ge; percentil 95 del bloque OOT completo (no un umbral calibrado que pueda caer a cero); el conteo son individuos únicos, no filas mes-a-mes. Todo lo mostrado abajo es una columna que Modelo v0.1 produce directamente (ID, scores, percentiles, banda, top-5 variables, presencia mensual) &mdash; sin categorización de negocio añadida.</p>
+        <div class="searchbar">
+          <input type="search" id="tableSearch" class="search-input"
+                 placeholder="Filtrar por ID, banda o variable..." autocomplete="off"
+                 oninput="filterTable(this.value)">
+          <span class="search-hint" id="searchHint"></span>
+        </div>
         <div class="tablewrap">
-          <table>
+          <table id="priorityTable">
             <thead>
               <tr>
                 <th></th><th>ID</th><th>Banda</th>
@@ -241,7 +247,7 @@ def build_analyst_dashboard(
                 <th>Top-5 variables (salida del modelo)</th><th>Meses ({n_months})</th>
               </tr>
             </thead>
-            <tbody>{rows_html}
+            <tbody id="priorityTableBody">{rows_html}
             </tbody>
           </table>
         </div>
@@ -297,6 +303,8 @@ var PROFILES = {json.dumps(profiles, ensure_ascii=False)};
 var MONTH_LABEL = {json.dumps(month_label, ensure_ascii=False)};
 var OOT_MONTHS = {json.dumps(all_periods, ensure_ascii=False)};
 var N_MONTHS = {n_months};
+var N_ROWS_TOTAL = {n_rows};
+var N_TOTAL_OOT = {n_total_oot};
 
 function pad(n){{return n<10?"0"+n:""+n}}
 var MESES=["ENE","FEB","MAR","ABR","MAY","JUN","JUL","AGO","SEP","OCT","NOV","DIC"];
@@ -309,6 +317,47 @@ function tick(){{
   }}catch(e){{}}
 }}
 tick(); setInterval(tick,1000);
+
+// Client-side filter: matches the query against every visible cell in the
+// row (ID, banda, percentiles, top-5 variables, meses) -- not just the ID
+// column, since an analyst may just as easily search by a variable name or
+// a band. Debounced with requestAnimationFrame so typing stays smooth even
+// with a few thousand rows.
+var _filterPending = null;
+function filterTable(query){{
+  if (_filterPending) cancelAnimationFrame(_filterPending);
+  _filterPending = requestAnimationFrame(function(){{
+    var needle = query.trim().toLowerCase();
+    var rows = document.querySelectorAll("#priorityTableBody tr[data-id]");
+    var shown = 0;
+    rows.forEach(function(row){{
+      var match = !needle || row.textContent.toLowerCase().indexOf(needle) !== -1;
+      row.hidden = !match;
+      if (match) shown++;
+    }});
+    var emptyRow = document.getElementById("noMatchRow");
+    if (needle && shown === 0){{
+      if (!emptyRow){{
+        emptyRow = document.createElement("tr");
+        emptyRow.id = "noMatchRow";
+        emptyRow.innerHTML = "<td colspan='7' class='no-match'>"
+          + "Ningún individuo coincide con el filtro.</td>";
+        document.getElementById("priorityTableBody").appendChild(emptyRow);
+      }}
+    }} else if (emptyRow) {{
+      emptyRow.remove();
+    }}
+    var badge = document.getElementById("rowCountBadge");
+    var hint = document.getElementById("searchHint");
+    if (needle) {{
+      badge.textContent = "mostrando " + shown + " de " + N_ROWS_TOTAL;
+      hint.textContent = shown + " coincidencia" + (shown === 1 ? "" : "s");
+    }} else {{
+      badge.textContent = "mostrando " + N_ROWS_TOTAL.toLocaleString("es") + " de " + N_TOTAL_OOT.toLocaleString("es");
+      hint.textContent = "";
+    }}
+  }});
+}}
 
 function sevFor(count, total){{
   if (total <= 0 || count <= 0) return "mute";
@@ -456,15 +505,33 @@ body{background:var(--paper);color:var(--ink);
   border-radius:6px;font-size:11.5px;line-height:1.55;color:var(--ink-soft);flex-shrink:0}
 .tablenote b{color:var(--ink)}
 
-.tablewrap{flex:1;overflow-y:auto;padding:0 24px 16px}
+.searchbar{margin:0 24px 10px;display:flex;align-items:center;gap:10px;flex-shrink:0}
+.search-input{flex:1;max-width:360px;font-family:"Public Sans",sans-serif;font-size:12.5px;
+  padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);
+  color:var(--ink)}
+.search-input:focus{outline:2px solid var(--if);outline-offset:1px;background:var(--surface)}
+.search-input::placeholder{color:var(--ink-mute)}
+.search-hint{font-family:"IBM Plex Mono",monospace;font-size:10.5px;color:var(--ink-mute)}
+
+/* The table scrolls inside its own box on a narrow viewport or with a wide
+   ID column, instead of the whole page gaining horizontal scroll -- the
+   page body must never scroll sideways (see the project's artifact/report
+   layout rule). Real entity IDs can run much longer than this project's
+   own synthetic "CUST_000123" format, so the ID cell also wraps rather
+   than forcing the table wider indefinitely. */
+.tablewrap{flex:1;overflow:auto;padding:0 24px 16px}
+#priorityTable{min-width:760px}
 thead th{position:sticky;top:0;background:var(--surface);z-index:2;text-align:left;
   font-size:10px;font-weight:700;letter-spacing:.06em;color:var(--ink-mute);text-transform:uppercase;
   padding:8px 10px;border-bottom:1px solid var(--border)}
 tbody tr{cursor:pointer}
 tbody tr:hover{background:var(--surface-2)}
+tbody tr[hidden]{display:none}
 tbody td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12.5px;vertical-align:middle}
 .idx{width:30px;color:var(--ink-mute);font-family:"IBM Plex Mono",monospace;font-size:11px}
-.idc{font-family:"IBM Plex Mono",monospace;font-weight:600;white-space:nowrap}
+.idc{font-family:"IBM Plex Mono",monospace;font-weight:600;overflow-wrap:anywhere;min-width:120px}
+.no-match{text-align:center;color:var(--ink-mute);font-size:12.5px;padding:22px 10px !important;
+  cursor:default}
 
 .band{font-family:"IBM Plex Mono",monospace;font-size:10.5px;font-weight:700;padding:2px 8px;
   border-radius:5px;letter-spacing:.03em}
@@ -547,5 +614,6 @@ tbody td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12.5px
   .kpis{flex-direction:column}
   .kpi{border-left:0;border-top:1px solid var(--border)}
   .kpi:first-child{border-top:0}
+  .search-input{max-width:none}
 }
 """

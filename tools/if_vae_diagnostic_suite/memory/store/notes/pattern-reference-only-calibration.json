@@ -1,0 +1,15 @@
+{
+  "note_id": "pattern-reference-only-calibration",
+  "kind": "pattern",
+  "content": "Fit imputation, detector, residual scales, covariance, and ECDF percentiles only on the earlier reference population.",
+  "phase": "green",
+  "tags": ["pattern", "leakage", "calibration"],
+  "keywords": ["reference", "ecdf", "temporal"],
+  "context": "Prevents held-out/test rows from defining their own anomaly rank.",
+  "links": ["research-detector-disagreement"],
+  "metadata": {},
+  "created_at": "2026-09-02T00:00:00Z",
+  "updated_at": "2026-09-02T00:00:00Z",
+  "version": 1
+}
+

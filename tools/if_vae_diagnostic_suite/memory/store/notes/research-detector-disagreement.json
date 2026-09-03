@@ -1,0 +1,15 @@
+{
+  "note_id": "research-detector-disagreement",
+  "kind": "research",
+  "content": "IF and VAE disagreements represent different anomaly assumptions; preserve model-unique coverage and diagnose reconstruction, latent, contamination, and calibration paths separately.",
+  "phase": "research",
+  "tags": ["anomaly-detection", "if", "vae", "storm"],
+  "keywords": ["disagreement", "reconstruction", "latent", "coverage"],
+  "context": "Grounded in IF primary work, ADBench, robust tabular VAE research, and autoencoder unreliability evidence.",
+  "links": ["pattern-reference-only-calibration"],
+  "metadata": {},
+  "created_at": "2026-09-02T00:00:00Z",
+  "updated_at": "2026-09-02T00:00:00Z",
+  "version": 1
+}
+

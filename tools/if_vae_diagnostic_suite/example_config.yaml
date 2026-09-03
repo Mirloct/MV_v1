@@ -1,0 +1,27 @@
+features:
+  - amount_log1p
+  - amount_vs_self_30d_robust_z
+  - amount_vs_peer_30d_robust_z
+  - counterparties_new_7d
+  - event_velocity_1h_vs_30d
+id_col: alert_id
+label_col: confirmed_case
+time_col: scoring_timestamp
+segment_col: customer_segment
+family_col: anomaly_family
+reconstruction_prefix: recon__
+latent_mu_prefix: mu__
+latent_logvar_prefix: logvar__
+if_score_col: null
+if_higher_is_anomalous: true
+vae_primary_score: recon_topk
+top_k_residuals: 3
+percentile_threshold: 0.995
+alert_budgets: [25, 50, 100]
+random_seeds: [7, 19, 43, 71, 101]
+if_n_estimators: 500
+if_max_samples: 1024
+if_max_features: 1.0
+n_jobs: -1
+active_variance_threshold: 0.001
+

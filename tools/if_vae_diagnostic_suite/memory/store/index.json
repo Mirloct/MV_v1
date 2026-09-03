@@ -1,0 +1,13 @@
+{
+  "notes": [
+    "research-detector-disagreement",
+    "failure-hidden-generator-shift",
+    "failure-if-single-feature-fixture",
+    "failure-family-all-positive-cohort",
+    "pattern-reference-only-calibration",
+    "pattern-location-specific-mutation",
+    "gate-two-quiet-rounds"
+  ],
+  "version": 1
+}
+

@@ -894,6 +894,175 @@ measurement; treat magnitudes as directional):
   entire family by chance. A longer or repeated OOT window would be needed
   before reading "family X has 0 recall" as evidence rather than absence.
 
+**In-process integration + report chapter (2026-09-04, superseded below).**
+Runs the suite itself, in-process, as an optional phase (`--run-diagnostic-
+suite`, then default off), building `reference`/`scored` directly from this
+run's own already-fitted detectors and indexing the result into
+`anomaly_report.{html,md}` as a 15-section, non-interpretive chapter. The
+architecture (contract → gathering → renderers, three modules) and the
+label-free/traceable-field/no-silent-fallback design all still stand; what
+changed on 2026-09-05 is the section count, two previously-permanent
+`UNAVAILABLE` diagnostics, and the addition of a second, explicitly
+interpretive chapter — see immediately below.
+
+**Restructured into a leaner ficha + a separate interpretation chapter
+(2026-09-05).** Two requests arrived back to back and both stand: keep the
+factual ficha free of interpretation (2026-09-04's own explicit spec), *and*
+add a per-analysis interpretation toolkit, indicator validation, a dynamic
+decision-flow diagram, and an analyst recommendation (2026-09-05's request).
+The resolution is two contracts, not one weakened contract:
+
+- `--run-diagnostic-suite` is now **ON by default** ("this is now part of
+  the official run" — explicit request). **Trade-off, stated rather than
+  absorbed:** every official run now requires the vendored package
+  installed (`pip install -e tools/if_vae_diagnostic_suite`) and pays its
+  runtime cost — `--no-run-diagnostic-suite` opts back out (e.g. on a
+  machine without the package).
+- **Six sections removed from the factual ficha**, by explicit editorial
+  request, not because they could not run: disponibilidad de diagnósticos,
+  unidad de análisis (folded into a note on `§1 Alcance` and the agreement
+  table instead of its own section), reconstrucción/autopsias de alertas,
+  calidad/desplazamiento de datos (raw table), bloques condicionados a
+  verdad base, riesgos/limitaciones/procedencia. The surviving nine are
+  renumbered 1–9: alcance, configuración efectiva, concordancia y
+  desacuerdo, candidatos VAE, sensibilidad, latente, estabilidad,
+  temporal/segmentación, experimentos. `CONTRACT_VERSION` bumped to
+  `"2.0.0"` for the shape change. Drift and autopsy numbers were not thrown
+  away — they still feed the interpretation chapter as distilled signals
+  (see below), just not as raw per-row tables in the ficha.
+- **Two previously-permanent `UNAVAILABLE` diagnostics now actually run:**
+  - *Estabilidad IF* was always `UNAVAILABLE` because the "production" IF
+    score is precomputed (`if_score_col` set), so the suite's own
+    `top_k_stability` never had a fresh multi-seed fit to measure. Fixed by
+    refitting `IsolationForestDetector` (this project's own class, same
+    hyperparameters read off the fitted production detector's own public
+    attributes — `n_estimators`, `contamination`, etc., not off a possibly-
+    partial `best_params` dict) `diagnostic_stability_refits` times
+    (default 3) with different seeds and running the SAME
+    `ifvae_diag.stability.top_k_stability` the suite already uses for IF —
+    not a new metric, the identical one, applied to a detector the suite
+    itself does not refit in this integration.
+  - *Estabilidad VAE* did not exist at all (the suite has no VAE-refit
+    path). Implemented the same way: refit `VAEDetector` (this project's
+    class) `diagnostic_stability_refits` times, same architecture read off
+    the fitted instance's own attributes (`latent_dim`, `hidden_dim`, …),
+    `top_k_stability` over the refits' scores on the OOT population.
+    **Trade-off, stated rather than absorbed:** VAE refits are full
+    training runs, not just scoring — this is the single most expensive
+    part of Phase 9c (roughly `diagnostic_stability_refits` extra VAE
+    fits). `--diagnostic-stability-refits 0` disables it (`UNAVAILABLE`
+    with a stated reason) if that cost is not acceptable. Seeds are derived
+    from `base_seed` (`config.seed + 1000·i`), not hardcoded, so two
+    official runs never collide and the choice doesn't need defending as a
+    "random" magic number.
+  - **Methodological note, grounded before implementing (not asserted from
+    memory):** searched for prior evidence on cross-seed stability of
+    autoencoder-family scores before picking a pass/fail threshold, and
+    found none that would justify one — "Evaluating the Stability of Deep
+    Learning Latent Feature Spaces" (arXiv:2402.11404, 2024) reports
+    Jaccard dissimilarity commonly *exceeding* 0.6 (mode ≈0.86) between
+    independently-trained autoencoder embeddings, i.e. VAE-family models
+    are, in the published record, considerably less stable across seeds
+    than tree ensembles by default. **Deliberately did NOT invent a
+    universal "stable ≥ X" cutoff** for this reason — an expert asked to
+    defend an arbitrary Jaccard threshold for a VAE would reject it as
+    unsupported by the evidence. Only the genuinely degenerate case
+    (mean Jaccard < 0.05, essentially zero overlap regardless of
+    architecture) is flagged; everything else is reported numerically with
+    the citation, comparatively (IF vs. VAE), never as a verdict.
+- **Segmentation now actually executes.** The panel already carries a real
+  `segment` column (`retail`/`corporate`/…, confirmed via
+  `load_or_generate_panel`) that the export path had simply never wired
+  through. `main.py` now passes `df["segment"]` into the diagnostic bridge;
+  §8's per-segment table populates for real instead of sitting at
+  `NOT_APPLICABLE`.
+- **Sensitivity grid and entity view are now ON by default** —
+  `diagnostic_sensitivity_grid` defaults to `(0.90, 0.95, 0.99)` (this
+  project's own P90/P95/P99 operating points, not an arbitrary choice) and
+  `diagnostic_entity_view` defaults to `True` — both previously sat at
+  `NOT_REQUESTED`/off purely because they were opt-in, not because they
+  couldn't run.
+- **`§9 Experimentos diagnósticos` deliberately stays `NOT_REQUESTED`.**
+  Implementing it for real means a contamination/capacity/β-schedule/
+  preprocessing/ablation/ensemble/temporal-backtest tracking harness per
+  the suite's own `evidence/EXPERIMENT_MATRIX.md` — out of scope for a
+  report-only change; the section says so in its own caption rather than
+  hiding the gap.
+
+**New: a second, explicitly-labelled interpretation chapter.** Reconciles
+the standing "no interpretation in the ficha" rule with the new request for
+a toolkit, a decision flow, and a recommendation — by building them as a
+SEPARATE contract from the same numbers, not by softening the first one.
+
+- `src/evaluation/ifvae_interpretation.py` — `build_interpretation_contract(
+  ...)` returns `{toolkit, indicator_validation, decision_flow,
+  methodology_notes}`. Every claim carries a `basis` (what it was computed
+  from) and a `severity` (`info`/`attention`/`caution`, never a pass/fail
+  verdict on the run). `METHODOLOGY_NOTES` documents every threshold used —
+  including the ones deliberately NOT turned into a threshold (see
+  stability above) — so a reader can check no cutoff is asserted without a
+  citation or an existing project precedent behind it.
+- **Validación de indicadores**: sample-size adequacy for Spearman/Jaccard
+  (flags n < 30), refit-count adequacy for stability, sensitivity-grid
+  range validity, and — the concrete statistical upgrade this pass made —
+  **Benjamini-Hochberg FDR correction** (Benjamini & Hochberg, 1995) across
+  every feature's KS p-value for the drift signal, replacing the earlier,
+  explicitly-flagged gap ("no se declaró una regla de severidad") with a
+  principled one: testing dozens of features simultaneously at an
+  uncorrected α=0.05 produces several false "drifted" features by
+  construction.
+- **Flujo de decisión**: 5 nodes evaluated against THIS run's real numbers
+  (¿hay observaciones en BOTH? ¿espacio latente activo (≥⅓, Burda et al.
+  2016 — the SAME threshold this project's own
+  `src.models.vae.collapse_verdict` already uses, reused not reinvented)?
+  ¿drift FDR-significativo en variables de negocio (calendario/panel
+  excluidos por el motivo estructural ya documentado)? ¿sensibilidad al
+  umbral ≥3× entre el mínimo y el máximo de la malla?), each producing a
+  fragment; the **recommendation is assembled from whichever fragments this
+  run's branches actually produced**, sorted attention-first — never a
+  fixed string per scenario.
+- `src/reporting/interpretation_section.py` — HTML/Markdown renderers,
+  mirroring `diagnostic_section.py`'s split exactly, with one deliberate
+  difference asserted by its own test: this renderer IS allowed
+  interpretive language (that is its entire purpose), but like the factual
+  renderer it still computes nothing itself — every fragment, check, and
+  node arrives pre-built.
+
+**Unit of analysis is stated everywhere** (moved from its own section into
+a note on `§1`/the agreement table): counts are entity–period observations,
+never "individuos"/"clientes". The chapter's `BOTH` count differs from the
+in-house "Concordancia entre detectores" chart (`report_content.py`), which
+deduplicates to one row per entity and ranks against the OOT population
+itself, while this chapter keeps one row per (entity, month) and ranks
+against the training distribution — the interpretation chapter's own
+methodology notes make this explicit where it matters.
+
+**Tests.** `tests/test_diagnostic_section.py` (40 tests, this project's
+first `tests/` directory) drives the real contract path via
+`diagnose_frames`/`build_interpretation_contract` — HTML/Markdown parity for
+BOTH contracts, traceability, no silent fallbacks, response to
+threshold/candidate/aggregation changes, architecture modes, label states,
+quadrant arithmetic, absent/empty artifacts, degenerate cases (zero alerts,
+ties, missing `logvar`, duplicate ids, infinities, missing values, temporal
+overlap, segmentation), decision-flow branch selection under constructed
+scenarios (zero-BOTH, collapsed-latent, business-vs-calendar drift), and —
+the part that used to be untestable — **real seeded stability refits**,
+fitting actual (tiny) `IsolationForestDetector`/`VAEDetector` instances and
+asserting a valid Jaccard in `[0, 1]`. Renderer-purity tests assert the
+factual renderer still has no verdict language/run-specific constants and
+that neither renderer computes over the run's numbers.
+
+**Verified end to end**, `python main.py --quick --no-tune` (diagnostic
+suite on by default now), both `--stack-iforest-into-vae` and
+`--no-stack-iforest-into-vae`: 51/51 and 58/58 health checks, real stability
+Jaccard values computed (IF ≈0.80, VAE =1.00 on this `--quick`-scale run —
+a real number, not asserted as "good" or "bad" anywhere in the ficha), real
+segment table populated, sensitivity grid swept by default, decision flow
+and recommendation rendered with this run's own numbers in both formats,
+zero unclosed HTML tags. `tools/render_diagnostic_example.py` still renders
+both chapters from the same synthetic fixture for review without a pipeline
+run.
+
 ## Known open problems
 
 - **`local`-type anomalies are unrecovered — and, independently confirmed

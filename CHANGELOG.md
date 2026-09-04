@@ -1844,3 +1844,419 @@ confined to the vendored suite.
 
 **Not pushed.** Local commit only, per explicit instruction to evaluate
 first.
+
+---
+
+## 2026-09-04 — IF-VAE Diagnostic Suite wired into the pipeline itself; new "Diagnóstico cruzado IF-VAE" report chapter
+
+**Ask:** run the diagnostic suite and index its results into
+`anomaly_report` as a new chapter, written pyramid-style (most actionable
+conclusion first), pulling every number directly from the code with no
+hardcoded values, stubs, or placeholders -- iterated twice, checking both
+the methodology and the reading flow.
+
+Until now the suite only ran as a manual, standalone exercise
+(`tools/export_diagnostic_suite_inputs.py` + its own CLI, see 2026-09-03
+above). This entry wires it into `main.py` itself as an optional phase.
+
+**New: `src/evaluation/ifvae_diagnostic.py`**
+(`run_ifvae_diagnostic_suite`). Builds the suite's `reference`
+(`train_mask`)/`scored` (`oot_mask`) frame contract directly from this
+run's own already-fitted `models["iforest"]`/`models["vae"]` tuples --
+no refit, no CSV round-trip, no dependency on the standalone export
+script. VAE reconstruction/mu/logvar come from a batched
+`detector._check_fitted()` forward pass (same private-model access
+pattern `VAEDetector.score_samples`/`latent_diagnostics` already use
+internally); the IF score reuses `models["iforest"][1]`
+(`if_detector.score_samples(X_if)`, already computed in Phase 6) as-is.
+Always label-free (`label_col=None`): official runs on this project carry
+no target, so this is the only mode the pipeline itself exercises; a
+labeled run stays the standalone script's job for validating the suite.
+
+**`main.py`**: new `--run-diagnostic-suite` flag (`BooleanOptionalAction`,
+default off -- the vendored package is a dev/analyst dependency, not a
+core one). When on, "Phase 9c" (after the per-model OOT export loop,
+before interpretability) calls the new bridge function inside a
+try/except that logs and continues on any failure -- same
+never-block-the-deliverable contract as the analyst dashboard's Phase 9b.
+Output goes to `artifacts/reports/ifvae_diagnostics/` (already covered by
+the existing blanket `artifacts/` gitignore rule, no new entry needed).
+The result feeds
+`context["diagnostic_suite"]` for Phase 11 and gets a line in the final
+summary and the `model_documentation.md` artifact catalog.
+
+**`src/reporting/report.py`**: new chapter, "Diagnóstico cruzado IF-VAE"
+(`_diagnostic_suite_section_md`/`_diagnostic_suite_section_html`,
+`_diagnostic_suite_quadrant_verdict`), placed right after the interactive
+"Explicabilidad" charts and before the per-model detail cards, in both
+the Markdown and HTML reports. Written pyramid-first:
+1. A **verdict sentence computed fresh from this run's own quadrant
+   counts** (never a fixed narrative) -- which detector (IF or VAE)
+   contributed more *exclusive* hits on this OOT window.
+2. Quadrant-count KPI tiles/table (BOTH/VAE_ONLY/IF_ONLY/NEITHER, counts
+   and percentages).
+3. The suite's own `disagreement.png`, embedded inline as base64
+   (`_img_data_uri`, HTML) or linked (Markdown).
+4. An independent VAE latent-health recheck (active units, collapsed
+   fraction, mean KL) -- computed by the external suite over the
+   reference/train block, a second opinion on the pipeline's own
+   `latent_health` check.
+5. Top population drift (reference vs. scored), with the same
+   calendar/lag-artifact caveat already documented for the standalone run.
+6. Any risk warnings the suite raised.
+7. A methodology/scope footer (label-free, row counts, percentile
+   threshold) and a link out to the suite's own full `report.md`.
+
+The chapter renders as `''` -- no placeholder, no stub -- when the flag is
+off, the package isn't installed, or the phase failed; same contract the
+rest of this report already uses for optional sections (`_hero_html`,
+the analyst dashboard, etc.).
+
+**Iteration 1 → 2, methodology check:** while validating the chapter I
+found that its "ambos detectores" (BOTH) count is *not* the same
+measurement as the top-5% overlap already annotated on the existing
+in-house "Concordancia entre detectores" chart shown just above it
+(`report_content.py::build_plotly_figures`) -- that chart deduplicates the
+OOT window to one row per entity (max score) and ranks each score against
+that same OOT population; this chapter keeps one row per (entity, month)
+and ranks each score against the **training** distribution
+(`ifvae_diag.scoring.anomaly_percentile`, genuinely out-of-sample). The two
+numbers landing in the same ballpark (2.0% vs. 2.3% on the `--quick`
+stacked run) is a reassuring cross-check, not a coincidence to hide -- but
+a reader who notices two "similar" numbers differ deserves the reason
+spelled out rather than left to guess, so iteration 2 added an explicit
+methodology note to both the HTML and Markdown chapter (worded differently
+per format, since the comparison chart itself only exists in the
+interactive HTML report, not in Markdown).
+
+**Verified end to end**, `python main.py --quick --no-tune`, both
+`--stack-iforest-into-vae` (default) and `--no-stack-iforest-into-vae`:
+- Stacked: 51/51 health checks, quadrants `NEITHER=1327 VAE_ONLY=73
+  IF_ONLY=65 BOTH=35` (1,500 OOT rows vs. 2,000 reference rows).
+- Parallel: 58/58 health checks, quadrants `NEITHER=1091 VAE_ONLY=309
+  BOTH=59 IF_ONLY=41`.
+- Flag off: chapter cleanly absent from both HTML and Markdown (only the
+  nav anchor remains, same as every other optional section), 50/50 health
+  checks, no regression.
+- Cross-check confirming the stacking plumbing is genuinely reflected, not
+  hardcoded: the parallel run's drift table has no `iforest_score` row
+  (the stacked run's does) -- only stacking mode injects that column into
+  the VAE's own feature space, and the chapter's drift table correctly
+  follows whichever `vae_feature_names` this run actually used.
+- **Cross-checked every number in the rendered chapter against the raw
+  `summary.json`/`drift.csv`/`warnings.json` the suite itself wrote** --
+  exact match, including the manually-recomputed `mean_kl` average and the
+  percentage roundings. Parsed the full `anomaly_report.html` with
+  `html.parser` end to end: zero unclosed/mismatched tags. Verified the
+  embedded `disagreement.png` base64 payload decodes to a valid PNG
+  (1360x1190) and that both the image and the linked suite `report.md`
+  resolve to real files on disk.
+- **Superseded the same day** by the structural rewrite below: the verdict
+  sentence, the priority-labelled tiles and the "confirma o contradice"
+  latent wording documented above no longer exist. See the 2026-09-04
+  entry "Capítulo reestructurado como ficha de diagnóstico no supervisado".
+- **Found and fixed one real (if currently unreached) correctness gap**
+  during this validation: the latent-diagnostics callout guarded on
+  `latent.get("latent_dimensions")` truthy, but the suite returns a
+  *smaller* dict -- `{"latent_dimensions": N, "kl_available": False}`, no
+  `active_units`/`collapsed_fraction`/`mean_kl_by_unit` -- when the frames
+  carry `mu__*` columns but no `logvar__*`. The old guard would have
+  defaulted those missing keys to `0`/`0.0` and rendered "0 de N
+  dimensiones activas (fracción colapsada 0.0%, KL media nan)" -- reading
+  as "total posterior collapse" when the true state is "unknown, no
+  logvar available". This project's own bridge
+  (`run_ifvae_diagnostic_suite`) always supplies both `mu` and `logvar`,
+  so the bug could not fire through today's integration -- caught by
+  directly unit-testing the two render functions with a crafted
+  `kl_available: False` payload, not by any real run. Fixed by checking
+  `"active_units" in latent` instead of the `latent_dimensions` truthy
+  check, in both the Markdown and HTML renderers; re-tested with the
+  crafted payload (callout now correctly omitted, no "nan" leaks into
+  either format) and re-verified end to end that the real, always-has-both
+  path still renders identically (51/51 health checks, same numbers).
+
+---
+
+## 2026-09-04 — Capítulo reestructurado como ficha de diagnóstico no supervisado
+
+**Ask:** reorganizar y completar *únicamente la estructura documental* del
+apartado "Diagnóstico cruzado IF-VAE", para que funcione como una ficha
+estructurada de diagnóstico no supervisado y no emita interpretaciones.
+Restricciones explícitas: no interpretar resultados, no determinar qué modelo
+es mejor, no afirmar que un detector aporta más señal, no asignar prioridad
+operativa a ningún cuadrante, no convertir concordancia/latente/drift/
+estabilidad en evidencia de desempeño, no inventar nada, no usar lenguaje
+causal ("confirma", "demuestra", "valida el desempeño"), y no hardcodear
+cifras, umbrales, nombres de features ni conclusiones. Los renderers HTML y
+Markdown deben consumir el mismo objeto estructurado y no contener lógica.
+
+**Qué se eliminó.** El capítulo escrito esa misma mañana (entrada anterior)
+violaba varias de estas restricciones y se retiró por completo: la frase de
+veredicto ("el VAE aporta más señal exclusiva que el Isolation Forest"), el
+subtítulo de prioridad operativa en la tarjeta de cuadrante BOTH ("máxima
+prioridad de revisión"), el texto "Confirma — o contradice —" del bloque
+latente, y `_diagnostic_suite_quadrant_verdict()` como función. Una prueba
+verifica que ese helper ya no exista en el módulo, no sólo que no se use.
+
+**Arquitectura nueva (tres capas).**
+1. `src/evaluation/ifvae_contract.py` — contrato versionado y serializable
+   (`CONTRACT_VERSION = "1.0.0"`), única capa que decide disponibilidad,
+   severidad, procedencia y redacción. Cada valor es un
+   `field(value, source=…, status=…, reason=…)`: `field()` lanza si falta la
+   fuente y lanza si un estado distinto de `EXECUTED` no trae motivo, de modo
+   que un valor de respaldo silencioso no se puede escribir por descuido.
+   Cinco estados estructurados: `EXECUTED`, `NOT_APPLICABLE`, `UNAVAILABLE`,
+   `FAILED`, `NOT_REQUESTED`.
+2. `src/evaluation/ifvae_diagnostic.py` — reúne lo que el contrato necesita
+   leyendo los artefactos que la suite ya escribió: aritmética de conjuntos
+   sobre los cuadrantes, Spearman sobre las columnas de percentil,
+   comparación de candidatos VAE *descubiertos desde las columnas presentes*
+   (no desde una lista fija), barrido de la malla configurada, lectura
+   latente, autopsias de alertas por cuadrante reutilizando
+   `residual_contributions`/`build_autopsy` de la propia suite con un
+   selector declarado (orden por percentil) en vez de etiquetas, drift con
+   columna de familia para filtrar, estabilidad, cortes por periodo y
+   segmento, y verificación de existencia y tamaño de los 13 artefactos.
+   Se extrajo `diagnose_frames()` para que todo ese camino sea ejecutable sin
+   un VAE entrenado en el proceso — es la función que usan las pruebas.
+3. `src/reporting/diagnostic_section.py` — los dos renderers y nada más.
+   Recorren el mismo contrato y maquetan cuatro tipos de bloque (`fields`,
+   `table`, `note`, `scatter`). El scatter es un SVG en línea, sin librerías,
+   con líneas de umbral etiquetadas, forma de marcador distinta por cuadrante
+   y conteos impresos, para que se lea en escala de grises y por lector de
+   pantalla. `src/reporting/report.py` sólo delega.
+
+**Las 15 secciones** quedaron: alcance, configuración efectiva, matriz de
+disponibilidad (21 diagnósticos), unidad de análisis, concordancia y
+desacuerdo, comparación de candidatos VAE, sensibilidad, latente,
+reconstrucción y autopsias de alertas, calidad y desplazamiento, estabilidad,
+evolución temporal y segmentación, bloques condicionados a verdad base,
+matriz de experimentos, y riesgos/limitaciones/procedencia.
+
+**Perillas nuevas, todas apagadas o vacías por defecto** para que nada se
+barra ni se muestre sin pedirlo: `--diagnostic-sensitivity-grid P [P …]`
+(malla de umbrales de §7; sin ella la sección reporta `NOT_REQUESTED` en vez
+de inventar percentiles), `--diagnostic-autopsy-rows N` (presupuesto de
+despliegue de §9, no de alertas) y `--diagnostic-entity-view` (agrega la
+vista por entidad a §4 sólo si además hay regla de agregación declarada).
+
+**Pruebas** — `tests/test_diagnostic_section.py`, 28 pruebas, primer
+directorio `tests/` del proyecto. Cubren los criterios pedidos: paridad
+HTML/Markdown (celda por celda, no fila por fila — las dos maquetaciones
+separan celdas distinto), trazabilidad de cada campo a su fuente, ausencia de
+valores de respaldo, actualización al cambiar umbral / candidato VAE / regla
+de agregación, arquitectura apilada / paralela / desconocida, separación
+observación vs. entidad, estados con y sin etiquetas, `UNAVAILABLE` cuando no
+hubo reajustes de estabilidad, invariantes aritméticos de cuadrantes y
+porcentajes, artefactos ausentes o de cero bytes, y los casos degenerados
+(cero alertas, empates, `logvar` ausente, IDs duplicados, infinitos,
+faltantes, solapamiento temporal). Dos pruebas más escanean el código de los
+renderers —con los docstrings removidos vía AST— para verificar que no
+contengan lenguaje de veredicto ni constantes de corrida (`0.95`, `P95`,
+`recon_topk`, nombres de modelo), y que no hagan aritmética sobre las cifras
+de la corrida.
+
+**Dos defectos encontrados y corregidos durante las pruebas:** la prueba de
+paridad comparaba filas unidas con `" | "`, que no sobrevive al despojado de
+etiquetas HTML (se corrigió el enumerador del contrato para emitir celda por
+celda); y la prueba de "cero alertas" asumía que un umbral de 0.999999 dejaba
+todo por debajo, cuando `anomaly_percentile` puede devolver exactamente 1.0
+— se reescribió construyendo una población evaluada íntegramente por debajo
+de la referencia, que es el escenario real de cero alertas.
+
+**Comandos de validación ejecutados.**
+- `python -m pytest tests/ -q` → **28 passed**.
+- `python -m pytest tools/if_vae_diagnostic_suite/tests -q` → **31 passed**
+  (las pruebas metodológicas de la suite original quedan intactas).
+- `PYTHONPATH=src python scripts/quality_gate.py` (suite) →
+  `compile=True tests=True mutations=True complexity_limit=10`, 4/4 mutantes
+  eliminados.
+- `python tools/render_diagnostic_example.py` → ejemplo sintético en
+  `artifacts/reports/ifvae_diagnostics_example/` (HTML + Markdown), con
+  banner que lo identifica como datos sintéticos; HTML sin etiquetas
+  desbalanceadas.
+- Dos ejecuciones completas consecutivas del pipeline, sin fallos:
+  1. `python main.py --quick --no-tune --run-diagnostic-suite
+     --diagnostic-sensitivity-grid 0.90 0.95 0.99` → 51/51 health checks,
+     modo apilado, §7 con la malla barrida.
+  2. `python main.py --quick --no-tune --no-stack-iforest-into-vae
+     --run-diagnostic-suite --diagnostic-entity-view` → 58/58 health checks,
+     §1 reporta "Paralelo", §4 muestra la vista por entidad, y §7 vuelve a
+     `NOT_REQUESTED` al no declararse malla — el capítulo sigue la
+     configuración, no valores fijos.
+
+**Limitaciones pendientes** (declaradas en el propio capítulo, no ocultas):
+estabilidad IF sale `UNAVAILABLE` porque el puntaje se pasa precalculado y la
+suite no reajusta con varias semillas; estabilidad VAE no existe en la suite;
+el análisis por segmento queda `NOT_APPLICABLE` mientras no se declare
+columna de segmentación; la matriz de experimentos queda `NOT_REQUESTED`
+porque el pipeline no lleva registro por variante; y todos los bloques
+supervisados quedan `NOT_APPLICABLE` por ausencia de verdad base.
+
+---
+
+## 2026-09-05 — Ficha reestructurada (9 secciones), estabilidad IF/VAE implementada de verdad, segmentación real, y nuevo capítulo de interpretación + flujo de decisión + recomendaciones
+
+**Ask** (llega inmediatamente después de la entrada anterior, que había
+prohibido explícitamente toda interpretación en la ficha): validar
+indicadores, construir un toolkit de interpretación por gráfico/análisis, un
+flujo estilo diagrama de decisión para la corrida específica, una
+recomendación al analista, identificar e implementar correctamente lo que
+"no pudo correr", depurar segmentos que hablan de corridas no realizadas
+(el modelo es no supervisado), eliminar explícitamente las secciones 3
+(disponibilidad), 4 (unidad de análisis), 9 (autopsias), 10 (calidad/
+desplazamiento), 13 (bloques condicionados a verdad base) y 15 (riesgos/
+procedencia), y finalmente fusionar con el proyecto original como la
+corrida oficial -- con la aclaración explícita de que el cambio es solo del
+reporte, no del resto del código. Mandato explícito de rigor: investigar
+qué haría un experto del área antes de fijar cualquier umbral, y declarar
+cada trade-off en vez de absorberlo silenciosamente.
+
+**Tensión resuelta, no promediada.** La entrada anterior pedía "sin
+interpretación, sin veredicto, sin prioridad operativa" en la ficha; esta
+pide un toolkit de interpretación y una recomendación. Ambas se mantienen
+en pie: la ficha (`ifvae_contract.py`) sigue sin interpretar nada, y un
+capítulo NUEVO y separado, "Interpretación y recomendaciones"
+(`ifvae_interpretation.py` + `interpretation_section.py`), lee los mismos
+números y sí interpreta, con cada afirmación etiquetada con su base y su
+severidad, y un banner explícito de que es heurística, no verdad base.
+
+**Investigación previa a implementar** (WebSearch, antes de fijar ningún
+umbral nuevo): estabilidad multisemilla de modelos tipo autoencoder --
+"Evaluating the Stability of Deep Learning Latent Feature Spaces"
+(arXiv:2402.11404, 2024) reporta disimilitud de Jaccard >0.6 (moda ≈0.86)
+entre espacios latentes de autoencoders entrenados independientemente, i.e.
+los VAE son, en la evidencia publicada, bastante menos estables entre
+semillas que los ensambles de árboles por defecto. Consecuencia directa:
+**no se fijó un umbral universal de "estable"** para el Jaccard del VAE --
+un experto que revisara ese corte lo rechazaría por no estar respaldado por
+evidencia. Solo se marca el caso degenerado (Jaccard < 0.05, solapamiento
+casi nulo), no un punto de corte intermedio inventado.
+
+**Seis secciones eliminadas de la ficha** (`src/evaluation/ifvae_contract.py`,
+`CONTRACT_VERSION` 1.0.0 → 2.0.0), por pedido editorial explícito, no
+porque no pudieran ejecutarse: disponibilidad de diagnósticos, unidad de
+análisis (la nota de unidad de observación se movió a §1 y a la tabla de
+concordancia), reconstrucción/autopsias de alertas, calidad y
+desplazamiento de datos (tabla cruda), bloques condicionados a verdad base,
+riesgos/limitaciones/procedencia. Las 9 restantes se renumeraron 1-9. Drift
+y autopsias no se descartaron: siguen alimentando el capítulo de
+interpretación como señales resumidas (drift con corrección FDR), solo ya
+no aparecen como tablas crudas fila-por-fila en la ficha.
+
+**Dos diagnósticos permanentemente `UNAVAILABLE` ahora se ejecutan de
+verdad** (`src/evaluation/ifvae_diagnostic.py`):
+- *Estabilidad IF* estaba `UNAVAILABLE` porque el puntaje de producción es
+  precalculado (`if_score_col`), así que la suite nunca reajustaba nada
+  para medir estabilidad. Arreglado reajustando
+  `IsolationForestDetector` (clase propia del proyecto, mismos
+  hiperparámetros leídos de los atributos públicos del detector ya
+  ajustado, no de un `best_params` posiblemente parcial) con semillas
+  distintas y aplicando el mismo `ifvae_diag.stability.top_k_stability`
+  que la suite ya usa para IF -- no una métrica nueva, la misma, aplicada a
+  un detector que la integración no reajusta por su cuenta.
+- *Estabilidad VAE* no existía en absoluto (la suite no tiene reajuste
+  multisemilla para VAE). Implementado igual: reajustar `VAEDetector`
+  (clase propia) con la misma arquitectura leída del detector ya ajustado,
+  mismo `top_k_stability` sobre los puntajes de los reajustes.
+  **Trade-off explícito**: los reajustes del VAE son entrenamientos
+  completos, no solo puntuación -- es la parte más cara de la Fase 9c.
+  `diagnostic_stability_refits` (nuevo, default 3) controla cuántos;
+  `--diagnostic-stability-refits 0` lo desactiva (`UNAVAILABLE` con motivo
+  declarado). Las semillas se derivan de `base_seed` (`config.seed +
+  1000·i`), no están hardcodeadas.
+
+**Segmentación ahora se ejecuta de verdad.** El panel ya trae una columna
+`segment` real (retail/corporate/...) que la integración simplemente nunca
+conectaba. `main.py` ahora pasa `df["segment"]` al puente diagnóstico; §8
+puebla su tabla por segmento en vez de quedar en `NOT_APPLICABLE`.
+
+**Sensibilidad y vista por entidad, encendidas por defecto.**
+`diagnostic_sensitivity_grid` pasa de `()` a `(0.90, 0.95, 0.99)` (los
+mismos puntos operativos P90/P95/P99 que ya usa el resto del proyecto, no
+una elección arbitraria); `diagnostic_entity_view` pasa de `False` a
+`True`. Ambas estaban en `NOT_REQUESTED`/apagadas solo por ser opt-in, no
+por no poder ejecutarse. `§9 Experimentos diagnósticos` se deja
+explícitamente `NOT_REQUESTED`: implementarlo de verdad exigiría un
+harness de seguimiento por variante (contaminación/capacidad/β/
+preprocesamiento/ablación/ensembles/backtests) equivalente a reconstruir
+gran parte de `evidence/EXPERIMENT_MATRIX.md` de la suite -- fuera de
+alcance para un cambio "solo de reporte"; la sección lo declara en su
+propio texto en vez de ocultar el vacío.
+
+**`--run-diagnostic-suite` pasa a ON por defecto** ("que esta sea la nueva
+corrida oficial"). **Trade-off explícito**: toda corrida oficial ahora
+requiere el paquete vendorizado instalado (`pip install -e
+tools/if_vae_diagnostic_suite`) y paga su costo de tiempo --
+`--no-run-diagnostic-suite` para desactivarlo si no es aceptable en una
+máquina dada.
+
+**Nuevo capítulo "Interpretación y recomendaciones"**
+(`src/evaluation/ifvae_interpretation.py` +
+`src/reporting/interpretation_section.py`): un `build_interpretation_contract`
+separado que produce `{toolkit, indicator_validation, decision_flow,
+methodology_notes}` a partir de los mismos números ya calculados --
+ninguna medición nueva, solo lectura y regla determinista. Cada afirmación
+lleva `basis` (de dónde sale) y `severity` (info/attention/caution, nunca
+un veredicto pasa/no-pasa sobre la corrida). El flujo de decisión evalúa 5
+nodos con los números reales de la corrida (¿BOTH > 0? ¿espacio latente
+activo ≥⅓, mismo umbral de Burda et al. 2016 que ya usa
+`collapse_verdict`? ¿drift FDR-significativo en variables de negocio,
+excluyendo calendario/panel por el motivo estructural ya documentado?
+¿sensibilidad al umbral ≥3×?) y la recomendación se arma con los
+fragmentos que los nodos de ESTA corrida realmente produjeron, ordenados
+por severidad -- nunca una cadena fija por escenario.
+
+**Validación de indicadores**, la petición explícita de este turno: tamaño
+de muestra para Spearman/Jaccard (n<30 se marca), cantidad de reajustes
+para estabilidad, rango válido de la malla de sensibilidad, y -- la mejora
+estadística concreta de este pase -- **corrección Benjamini-Hochberg (FDR)**
+sobre los p-valores de KS del drift, reemplazando el hueco que la entrada
+anterior había dejado explícitamente señalado ("no se declaró una regla de
+severidad") por una regla principiada: probar docenas de features a la vez
+sin corregir produce varios falsos positivos por construcción.
+
+**Pruebas** (`tests/test_diagnostic_section.py`, 40 pruebas): se
+reescribieron las que dependían de las 6 secciones eliminadas, se agregó
+paridad HTML/Markdown también para el contrato de interpretación, pruebas
+de selección de rama del flujo de decisión con escenarios construidos
+(BOTH=0, latente colapsado, drift de negocio vs. calendario), y --lo que
+antes no era comprobable-- **pruebas de estabilidad con reajustes reales**,
+ajustando instancias diminutas de `IsolationForestDetector`/`VAEDetector`
+de verdad y verificando un Jaccard válido en `[0,1]`. Se corrigieron dos
+bugs propios durante la escritura de pruebas: dos aserciones quedaron fuera
+de su bloque `with tempfile.TemporaryDirectory()`, leyendo un archivo que
+ya no existía (movidas adentro).
+
+**Comandos de validación ejecutados:**
+- `python -m pytest tests/ -q` → **40 passed**.
+- `python -m pytest tools/if_vae_diagnostic_suite/tests -q` → **31 passed**
+  (sin cambios en la suite vendorizada).
+- Dos ejecuciones completas consecutivas, con el diagnóstico ya encendido
+  por defecto:
+  1. `python main.py --quick --no-tune` (apilado) → 51/51 health checks;
+     Jaccard real IF≈0.80, VAE=1.00 (número real de esta corrida a escala
+     `--quick`, no una afirmación de "bueno" en ningún lugar de la ficha);
+     tabla de segmento poblada con datos reales; malla de sensibilidad
+     barrida por defecto; flujo de decisión y recomendación con los
+     números de esta corrida en ambos formatos.
+  2. `python main.py --quick --no-tune --no-stack-iforest-into-vae`
+     (paralelo) → 58/58 health checks.
+- HTML parseado end-to-end (`html.parser`): cero etiquetas sin cerrar en
+  ninguno de los dos capítulos.
+
+**Alcance respetado**: solo se tocaron `main.py` (metadatos de la Fase 9c y
+CLI del capítulo diagnóstico), `src/evaluation/ifvae_contract.py`,
+`src/evaluation/ifvae_diagnostic.py`, `src/evaluation/ifvae_interpretation.py`
+(nuevo), `src/reporting/report.py` (hooks del capítulo),
+`src/reporting/diagnostic_section.py`,
+`src/reporting/interpretation_section.py` (nuevo), y
+`tests/test_diagnostic_section.py` -- ningún modelo, preprocesamiento, ni
+lógica de negocio existente fuera del reporte se modificó.
+
+**Limitaciones pendientes, declaradas y no absorbidas:** `§9 Experimentos
+diagnósticos` sigue sin ejecutarse (falta un registro de corridas por
+variante); estabilidad VAE añade costo real de entrenamiento cada corrida
+oficial (mitigable con `--diagnostic-stability-refits 0`); el paquete
+vendorizado es ahora una dependencia de facto de la corrida oficial, no
+solo de un modo opcional.

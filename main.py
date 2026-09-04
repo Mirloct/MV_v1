@@ -146,6 +146,39 @@ class PipelineConfig:
     # matrix the VAE trains on. When on, the VAE subsumes the forest's signal
     # and becomes the single deliverable (see `deliverable_models`).
     stack_iforest_into_vae: bool = True
+    # Cross-validate this run's IF+VAE against the vendored, optional
+    # IF-VAE Diagnostic Suite (`tools/if_vae_diagnostic_suite`, `pip install
+    # -e` required -- not a core dependency) and add the "Diagnóstico
+    # cruzado IF-VAE" + "Interpretación y recomendaciones" chapters to the
+    # report. ON by default as of 2026-09-05 (explicit request: this is now
+    # part of the official run) -- see CONTEXT.md "IF-VAE Diagnostic Suite
+    # integration". TRADE-OFF: this requires the vendored package installed
+    # and adds real runtime -- most of it from `diagnostic_stability_refits`
+    # below, which refits both detectors several times. Pass
+    # --no-run-diagnostic-suite to skip it (e.g. on a machine without the
+    # package installed).
+    run_diagnostic_suite: bool = True
+    # Threshold grid the diagnostic chapter's sensitivity section sweeps.
+    # Defaults to this project's own P90/P95/P99 operating points (the same
+    # bands `PERCENTILE_BANDS`/the OOT Excel already use), not an arbitrary
+    # choice -- so the section runs by default instead of sitting at
+    # NOT_REQUESTED. Values are percentile thresholds in (0, 1).
+    diagnostic_sensitivity_grid: tuple = (0.90, 0.95, 0.99)
+    # Add the entity-aggregated view to the chapter's scope section. ON by
+    # default: the aggregation rule (max score per entity across the OOT
+    # window) is the same one `true_oot_entity_scores` already applies
+    # elsewhere in this pipeline, so showing it here is not a new rule.
+    diagnostic_entity_view: bool = True
+    # Independent seed refits used to measure IF and VAE alert-set stability
+    # (top-K Jaccard across refits, same metric the suite itself uses for
+    # IF -- see `src/evaluation/ifvae_diagnostic.py`). TRADE-OFF: VAE refits
+    # are full training runs, not just scoring, so each unit here costs
+    # roughly one extra VAE fit; 3 is the minimum needed to compute a
+    # meaningful pairwise Jaccard (top_k_stability needs >= 2, 3 gives more
+    # than one pairwise comparison). Set to 0 to disable (reports
+    # UNAVAILABLE with a stated reason) on a machine where this cost is not
+    # acceptable.
+    diagnostic_stability_refits: int = 3
     data_path: str = DATA_PATH
     # P95 checkpoint gate (Phase 6c, between the Isolation Forest fit and the
     # VAE layer): percentile of the in-time score distribution above which a
@@ -332,6 +365,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
     oot_excels: dict = {}
     deliverable_tables: dict = {}
     analyst_dashboard_path: Optional[str] = None
+    diagnostic_suite_result: Optional[dict] = None
     model_specs: dict = {}
     chart_data: dict = {"models": {}}
     # Numeric payloads behind the charts that used to be embedded PNGs. The
@@ -1274,6 +1308,116 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 "are unaffected.", exc,
             )
 
+    # -- Phase 9c: IF-VAE diagnostic suite (on by default) ------------------- #
+    # Cross-validates this run's own already-fitted IF+VAE against the
+    # vendored, optional diagnostic package -- reusing the live detectors and
+    # matrices above for scoring (no refit, no CSV round-trip there). The
+    # stability sub-check DOES refit both detectors a few times with
+    # different seeds -- see `diagnostic_stability_refits`'s docstring above
+    # for that cost. Label-free: this project's official runs carry no
+    # target, so this is the only mode wired into the pipeline (see
+    # CONTEXT.md "IF-VAE Diagnostic Suite integration"). Pass
+    # `--no-run-diagnostic-suite` to skip entirely (e.g. package not
+    # installed on this machine).
+    if config.run_diagnostic_suite:
+        with log_phase("Phase 9c: IF-VAE diagnostic suite"):
+            try:
+                from src.evaluation import run_ifvae_diagnostic_suite
+
+                # Run metadata the chapter's contract reports as-is. Every
+                # value is read from this run's own state -- the architecture
+                # mode from the config that produced it, the derived-feature
+                # list by differencing the VAE's feature space against the
+                # pre-stacking one -- so nothing about the detectors is
+                # asserted that the run did not actually do.
+                _stacked = bool(config.stack_iforest_into_vae)
+                _derived = [f for f in models["vae"][4] if f not in set(feature_names)]
+                _run_meta = {
+                    "run_id": ctx.run_id,
+                    "generated_at": generated_at,
+                    "architecture_mode": "Apilado" if _stacked else "Paralelo",
+                    "detector_dependency": (
+                        "El VAE recibe el puntaje del Isolation Forest como feature "
+                        "de entrada; los detectores no son independientes."
+                        if _stacked else
+                        "Los detectores se ajustan por separado sobre la misma "
+                        "matriz base; ninguno recibe el puntaje del otro."
+                    ),
+                    "derived_features": _derived,
+                    "entity_aggregation_rule": (
+                        "Máximo puntaje de la entidad dentro de la ventana OOT"
+                        if config.diagnostic_entity_view else None
+                    ),
+                    "detectors": {
+                        "iforest": {
+                            "label": "Isolation Forest",
+                            "model_id": os.path.basename(IFOREST_MODEL),
+                            "score_origin": "Precalculado por el pipeline "
+                                            "(IsolationForestDetector.score_samples)",
+                            "score_column": "if_score",
+                            "score_direction": "Mayor = más anómalo",
+                        },
+                        "vae": {
+                            "label": "VAE",
+                            "model_id": os.path.basename(VAE_MODEL),
+                            "score_origin": "Reconstrucción y latentes calculados en "
+                                            "proceso desde el detector ajustado",
+                            "score_column": "recon__<feature>, mu__<i>, logvar__<i>",
+                            "score_direction": "Mayor residual = más anómalo",
+                        },
+                    },
+                }
+                _segment = df["segment"].to_numpy() if "segment" in df.columns else None
+                diagnostic_suite_result = run_ifvae_diagnostic_suite(
+                    keys, schema,
+                    models["iforest"][0], models["iforest"][1], models["iforest"][3],
+                    in_mask, valid_local,
+                    models["vae"][0], models["vae"][3], models["vae"][4],
+                    train_mask, oot_mask,
+                    out_dir=os.path.join(REPORTS_DIR, "ifvae_diagnostics"),
+                    run_meta=_run_meta,
+                    sensitivity_grid=config.diagnostic_sensitivity_grid,
+                    entity_view=config.diagnostic_entity_view,
+                    stability_refits=config.diagnostic_stability_refits,
+                    base_seed=config.seed,
+                    segment=_segment,
+                )
+                _n_files = sum(
+                    1 for name_ in (
+                        "report.md", "disagreement.png", "summary.json",
+                        "drift.csv", "scored_diagnostics.csv", "warnings.json",
+                    )
+                    if os.path.isfile(os.path.join(diagnostic_suite_result["report_dir"], name_))
+                )
+                observability.check(
+                    name="artifact.diagnostic_suite_written", category="artifact",
+                    definition="The IF-VAE Diagnostic Suite's report and core "
+                               "artifact files exist in its output directory.",
+                    expected="report.md, disagreement.png and 4 other core files exist",
+                    severity="warning", passed=_n_files == 6,
+                    observed={"report_dir": diagnostic_suite_result["report_dir"],
+                              "files_found": _n_files,
+                              "rows_scored": diagnostic_suite_result["rows_scored"]},
+                    failure_action="Best-effort artifact; the OOT Excel deliverable(s) "
+                                   "and report above are unaffected. Check the log for "
+                                   "the diagnostic-suite error.",
+                    evidence=diagnostic_suite_result["report_dir"],
+                )
+                logger.info(
+                    "IF-VAE diagnostic suite: %d OOT rows scored against %d reference "
+                    "rows, quadrants=%s -> %s",
+                    diagnostic_suite_result["rows_scored"],
+                    diagnostic_suite_result["rows_reference"],
+                    diagnostic_suite_result["quadrants"],
+                    diagnostic_suite_result["report_dir"],
+                )
+            except Exception as exc:  # noqa: BLE001 - never block the report above
+                logger.warning(
+                    "IF-VAE diagnostic suite failed (%s); the report chapter for it "
+                    "will be omitted. Is the package installed "
+                    "(`pip install -e tools/if_vae_diagnostic_suite`)?", exc,
+                )
+
     # -- Phase 10: interpretability, AFTER every Excel deliverable ---------- #
     # Deliberately outside the per-model loop above. Interpretability is the
     # slowest stage in the pipeline (SHAP over the forest, UMAP's one-time
@@ -1422,6 +1566,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             "chart_data": {**chart_data, "anomaly_rate": anomaly_rate,
                             "static": chart_static},
             "oot_excel": oot_excels,
+            "diagnostic_suite": diagnostic_suite_result,
             "preprocessing": {
                 "numeric_transform": config.numeric_transform,
                 "categorical_encoding": config.categorical_encoding,
@@ -1478,6 +1623,9 @@ def run_pipeline(config: PipelineConfig) -> dict:
     artifacts = {
         "oot_excels": oot_excels,
         "analyst_dashboard": analyst_dashboard_path,
+        "ifvae_diagnostic_report": (
+            diagnostic_suite_result["report_md_path"] if diagnostic_suite_result else None
+        ),
         "p95_checkpoint": p95_path,
         "attribution_workbook": attribution_path,
         "reports": report_paths,
@@ -1492,6 +1640,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         f"  IF P95 checkpoint: {p95_path}",
         f"  OOT Excel(s)   : {', '.join(oot_excels.values()) or '(none)'}",
         f"  Analyst dashboard: {analyst_dashboard_path or '(none)'}",
+        f"  IF-VAE diagnostic suite: {artifacts['ifvae_diagnostic_report'] or '(not run)'}",
         f"  Feature attribution (xlsx): {attribution_path}",
         f"  Report (html)  : {report_paths.get('html')}",
         f"  Report (md)    : {report_paths.get('md')}",
@@ -1631,6 +1780,33 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "feature; the VAE then ships the only Excel queue. "
                              "--no-stack-iforest-into-vae runs them in parallel with "
                              "one queue each (default: stacked).")
+    parser.add_argument("--run-diagnostic-suite", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Cross-validate this run's IF+VAE against the vendored, "
+                             "optional IF-VAE Diagnostic Suite (tools/if_vae_diagnostic_suite; "
+                             "requires `pip install -e tools/if_vae_diagnostic_suite`, not a "
+                             "core dependency) and add the 'Diagnóstico cruzado IF-VAE' and "
+                             "'Interpretación y recomendaciones' report chapters (default ON "
+                             "as of 2026-09-05). Runs label-free -- see CONTEXT.md "
+                             "\"IF-VAE Diagnostic Suite integration\". "
+                             "--no-run-diagnostic-suite skips it, e.g. if the package is not "
+                             "installed on this machine.")
+    parser.add_argument("--diagnostic-sensitivity-grid", type=float, nargs="*",
+                        default=None, metavar="P",
+                        help="Percentile thresholds (each in (0,1)) the diagnostic "
+                             "chapter's sensitivity section sweeps (default 0.90 0.95 0.99, "
+                             "this project's own P90/P95/P99 operating points). Pass with no "
+                             "values to disable that section (NOT_REQUESTED).")
+    parser.add_argument("--diagnostic-entity-view", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Add the entity-aggregated view to the diagnostic chapter's "
+                             "scope section (default ON; the aggregation rule is the same "
+                             "max-per-entity rule already used elsewhere in this pipeline).")
+    parser.add_argument("--diagnostic-stability-refits", type=int, default=None,
+                        help="Independent seed refits used to measure IF/VAE alert-set "
+                             "stability (default 3). VAE refits are full training runs -- "
+                             "this is the most expensive part of the diagnostic chapter. "
+                             "Pass 0 to disable (reports UNAVAILABLE with a stated reason).")
     parser.add_argument("--contamination", type=float, default=None,
                         help="Isolation Forest operating-point contamination, used by both "
                              "the tuned and untuned paths (default 0.02; must be in (0, 0.5]). "
@@ -1713,7 +1889,26 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         threshold_percentile=args.threshold_percentile,
         threshold_target_far=args.threshold_target_far,
         stack_iforest_into_vae=args.stack_iforest_into_vae,
+        run_diagnostic_suite=args.run_diagnostic_suite,
+        diagnostic_entity_view=args.diagnostic_entity_view,
     )
+    # Validated here rather than inside the diagnostic bridge: a malformed
+    # grid should stop the run at argument-parsing time, not halfway through
+    # a fitted pipeline. `is not None` (not truthiness): `--diagnostic-
+    # sensitivity-grid` with no values parses to `[]`, which must override
+    # the dataclass default to "disabled", not be indistinguishable from the
+    # flag never being passed.
+    if args.diagnostic_sensitivity_grid is not None:
+        grid = tuple(float(p) for p in args.diagnostic_sensitivity_grid)
+        if any(not 0.0 < p < 1.0 for p in grid):
+            raise SystemExit(
+                "--diagnostic-sensitivity-grid takes percentile thresholds in (0, 1)."
+            )
+        config.diagnostic_sensitivity_grid = grid
+    if args.diagnostic_stability_refits is not None:
+        if args.diagnostic_stability_refits < 0:
+            raise SystemExit("--diagnostic-stability-refits cannot be negative.")
+        config.diagnostic_stability_refits = args.diagnostic_stability_refits
     # Both apply after construction so they override the dataclass's own
     # `default_factory` dict rather than requiring the CLI to rebuild it.
     if args.contamination is not None:

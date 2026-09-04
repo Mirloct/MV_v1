@@ -289,6 +289,36 @@ def _md_kv_table(rows: list[tuple[str, str]], headers=("Clave", "Valor")) -> str
     return "\n".join(out) + "\n"
 
 
+def _diagnostic_suite_section_md(context: dict) -> str:
+    """Markdown for the "Diagnóstico cruzado IF-VAE" chapter.
+
+    Thin delegation: the chapter is a structured contract built in
+    ``src/evaluation/ifvae_contract.py`` and laid out by
+    ``src/reporting/diagnostic_section.py``. This report module holds no
+    availability rules, no arithmetic over the run's numbers, and no
+    narrative about them -- see those modules for why.
+    """
+    from src.reporting.diagnostic_section import render_diagnostic_markdown
+
+    payload = context.get("diagnostic_suite")
+    contract = payload.get("contract") if isinstance(payload, dict) else None
+    return render_diagnostic_markdown(contract)
+
+
+def _interpretation_section_md(context: dict) -> str:
+    """Markdown for the "Interpretación y recomendaciones" chapter.
+
+    Thin delegation, exactly like ``_diagnostic_suite_section_md`` -- see
+    ``src/evaluation/ifvae_interpretation.py`` for why this is a SEPARATE
+    contract from the factual ficha rather than folded into it.
+    """
+    from src.reporting.interpretation_section import render_interpretation_markdown
+
+    payload = context.get("diagnostic_suite")
+    interpretation = payload.get("interpretation") if isinstance(payload, dict) else None
+    return render_interpretation_markdown(interpretation)
+
+
 def _md_table(headers: Sequence[str], rows: list[tuple[str, ...]]) -> str:
     """Generic n-column markdown table."""
     if not rows:
@@ -371,6 +401,10 @@ def _build_markdown(context: dict, out_dir: str) -> str:
             parts.append("**Todas las métricas**\n")
             parts.append(_md_kv_table(_kv_rows(_flat_metrics(metrics)),
                                       headers=("Métrica", "Valor")))
+
+    # -- IF-VAE diagnostic suite (optional, external cross-validation) ------- #
+    parts.append(_diagnostic_suite_section_md(context))
+    parts.append(_interpretation_section_md(context))
 
     # -- figures gallery ----------------------------------------------------- #
     figures = context.get("figures") or []
@@ -951,6 +985,32 @@ def _oot_callout_html(oot_excel, out_dir: str) -> str:
     )
 
 
+def _diagnostic_suite_section_html(context: dict) -> str:
+    """HTML for the "Diagnóstico cruzado IF-VAE" chapter.
+
+    Thin delegation, mirroring ``_diagnostic_suite_section_md``: both formats
+    render the same structured contract, so neither can show a value the
+    other does not (asserted in ``tests/test_diagnostic_section.py``).
+    """
+    from src.reporting.diagnostic_section import render_diagnostic_html
+
+    payload = context.get("diagnostic_suite")
+    contract = payload.get("contract") if isinstance(payload, dict) else None
+    return render_diagnostic_html(contract)
+
+
+def _interpretation_section_html(context: dict) -> str:
+    """HTML for the "Interpretación y recomendaciones" chapter.
+
+    Thin delegation, mirroring ``_diagnostic_suite_section_html``.
+    """
+    from src.reporting.interpretation_section import render_interpretation_html
+
+    payload = context.get("diagnostic_suite")
+    interpretation = payload.get("interpretation") if isinstance(payload, dict) else None
+    return render_interpretation_html(interpretation)
+
+
 def _model_headline_tiles_html(metrics: Optional[dict]) -> str:
     groups = _metric_prefix_split(metrics)
     headline_keys = _HEADLINE_SUPERVISED if groups["oot"] else _HEADLINE_UNSUPERVISED
@@ -1403,6 +1463,13 @@ def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
     parts.append("<meta name='viewport' content='width=device-width, initial-scale=1'>")
     parts.append(f"<title>{html.escape(title)}</title>")
     parts.append(f"<style>{_HTML_CSS}</style>")
+    # Chapter-local styles for the structured diagnostic record. Loaded
+    # unconditionally so the stylesheet does not depend on whether the
+    # optional chapter rendered on this particular run.
+    from src.reporting.diagnostic_section import DIAGNOSTIC_CSS
+    parts.append(f"<style>{DIAGNOSTIC_CSS}</style>")
+    from src.reporting.interpretation_section import INTERPRETATION_CSS
+    parts.append(f"<style>{INTERPRETATION_CSS}</style>")
     parts.append("</head><body>")
 
     # -- sticky header / jump nav -------------------------------------------- #
@@ -1418,6 +1485,8 @@ def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
         "<a href='#oot'>Entregable</a>"
         "<a href='#results'>Resultados</a>"
         "<a href='#explain'>Explicabilidad</a>"
+        "<a href='#diagnostic-suite'>Diagnóstico cruzado</a>"
+        "<a href='#diagnostic-interpretation'>Interpretación</a>"
         "<a href='#models'>Modelos</a>"
         "<a href='#indicators'>Indicadores</a>"
         "<a href='#reliability'>Confiabilidad</a>"
@@ -1449,6 +1518,10 @@ def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
     charts = _plotly_section_html(context.get("chart_data"), log)
     parts.append(charts.get("results", ""))
     parts.append(charts.get("explain", ""))
+
+    # -- IF-VAE diagnostic suite (optional, external cross-validation) -------- #
+    parts.append(_diagnostic_suite_section_html(context))
+    parts.append(_interpretation_section_html(context))
 
     # -- models ---------------------------------------------------------------- #
     if models:
@@ -1509,6 +1582,8 @@ def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
     )
     parts.append("</div>")  # .wrap
     parts.append(f"<script>{_THEME_TOGGLE_JS}</script>")
+    from src.reporting.diagnostic_section import DIAGNOSTIC_JS
+    parts.append(f"<script>{DIAGNOSTIC_JS}</script>")
     parts.append("</body></html>")
     return "\n".join(parts)
 
@@ -1542,6 +1617,9 @@ def _artifact_catalog_rows(
         p = report_paths.get(fmt)
         if p:
             rows.append((label, p))
+    diag = context.get("diagnostic_suite")
+    if isinstance(diag, dict) and diag.get("report_md_path"):
+        rows.append(("Reporte técnico del IF-VAE Diagnostic Suite", diag["report_md_path"]))
     rows.append(("Documentación técnica (este archivo)", doc_path))
     return rows
 

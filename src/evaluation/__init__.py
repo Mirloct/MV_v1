@@ -5,6 +5,7 @@ headline business deliverable -- the out-of-time (OOT) top-decile anomaly Excel
 export (ID - SCORE - VARIABLES).
 """
 
+from src.evaluation.ifvae_diagnostic import run_ifvae_diagnostic_suite
 from src.evaluation.labels import load_ground_truth_labels, load_ground_truth_types
 from src.evaluation.metrics import (
     metrics_by_anomaly_type,
@@ -57,4 +58,5 @@ __all__ = [
     "months_present_by_entity",
     "plot_embedding",
     "plot_roc_pr",
+    "run_ifvae_diagnostic_suite",
 ]

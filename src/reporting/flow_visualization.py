@@ -657,6 +657,16 @@ function fmtDur(s) {
   if (s === null || s === undefined) return "--";
   return s < 1 ? (s * 1000).toFixed(0) + "ms" : s.toFixed(2) + "s";
 }
+/* Cumulative run time, in minutes -- "Xh Ym" past 60 minutes. Deliberately
+   coarser than fmtDur: seconds matter for one phase's own duration, not for
+   how long the whole run has been going. */
+function fmtElapsedMinutes(totalSeconds) {
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  if (totalMinutes < 60) return totalMinutes + "m";
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  return h + "h " + m + "m";
+}
 function statusDot(status) { return '<span class="dot dot-' + status + '"></span>'; }
 
 let stopped = false;
@@ -704,7 +714,7 @@ function render(data) {
   document.getElementById("progress-pct").textContent = pct + "%";
   const totalSecs = nodes.reduce((a, n) => a + (n.duration_s || 0), 0);
   document.getElementById("elapsed").textContent =
-    done + "/" + nodes.length + " phases done · " + totalSecs.toFixed(1) + "s of work";
+    done + "/" + nodes.length + " phases done · " + fmtElapsedMinutes(totalSecs) + " of work";
 
   const running = nodes.find(n => n.status === "running");
   const nowEl = document.getElementById("now-running");

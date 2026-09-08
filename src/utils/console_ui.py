@@ -101,6 +101,7 @@ _PHASE_PLAN: tuple[tuple[str, str, float], ...] = (
     ("Phase 6",  "Isolation Forest",                  3.0),
     ("Phase 6b", "Stacking IF -> VAE",                0.5),
     ("Phase 6c", "Checkpoint P95 del IF",             0.3),
+    ("Phase 6d", "Exportación OOT del IF (validación)", 0.3),
     ("Phase 7",  "VAE",                               4.0),
     ("Phase 8",  "Evaluación",                        0.5),
     ("Phase 8b", "Calibración del umbral",            0.3),
@@ -324,6 +325,20 @@ class ConsoleUI:
         h, m = divmod(m, 60)
         return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
+    @staticmethod
+    def _fmt_elapsed_minutes(seconds: float) -> str:
+        """Total run elapsed time, in whole minutes -- ``Xh Ym`` past 60
+        minutes. Deliberately coarser than :meth:`_fmt_elapsed`: seconds
+        matter for judging whether the CURRENT phase is stuck, not for how
+        long the whole run has been going, so this is used only for the
+        header's total-elapsed readout, never per-phase.
+        """
+        total_minutes = int(seconds) // 60
+        if total_minutes < 60:
+            return f"{total_minutes}m"
+        h, m = divmod(total_minutes, 60)
+        return f"{h}h {m}m"
+
     def _label_for(self, name: str) -> str:
         """Human label for a phase name, keeping any ``[model]`` suffix."""
         code = name.split(":", 1)[0].strip()
@@ -378,7 +393,7 @@ class ConsoleUI:
         left = Text("Pipeline de detección de anomalías", style="bold")
         if self.run_id:
             left.append(f"   run {self.run_id[:12]}", style="dim")
-        right = Text(self._fmt_elapsed(elapsed), style="bold cyan")
+        right = Text(self._fmt_elapsed_minutes(elapsed), style="bold cyan")
         if self._paused:
             right.append("  || PAUSA", style="bold yellow")
         head.add_row(left, right)

@@ -779,6 +779,88 @@ def run_pipeline(config: PipelineConfig) -> dict:
             len(p95_table), len(df), p95_threshold, p95_path,
         )
 
+    # -- Phase 6d: IF OOT export (validation, stacked mode only) ------------ #
+    # Answers a concrete risk of stacking: once the forest's score becomes
+    # just one input feature to the VAE, the VAE's own ranking could in
+    # principle "lose" OOT individuals the forest alone would have flagged.
+    # Exported here -- right after the forest is fit, before its score is
+    # folded into the VAE's matrix below -- so it reflects the forest alone,
+    # not the stacked model. Only meaningful when stacking would otherwise
+    # hide IF's own queue entirely (`"iforest" not in
+    # config.deliverable_models`); in parallel mode IF already ships this
+    # exact export via Phase 9's per-model loop, so doing it again here would
+    # just recompute and overwrite an identical file.
+    if config.stack_iforest_into_vae:
+        with log_phase("Phase 6d: IF OOT export (validation)"):
+            try:
+                from src.evaluation import (
+                    build_scored_frame,
+                    calibrate_threshold,
+                    export_oot_top_anomalies,
+                )
+
+                # Calibrated on validation only, exactly like Phase 8b does
+                # per model later -- this is the forest's own threshold, not
+                # borrowed from the VAE.
+                if_cal = calibrate_threshold(
+                    if_scores[val_mask],
+                    method=config.threshold_method,
+                    percentile=config.threshold_percentile,
+                    target_far=config.threshold_target_far,
+                )
+                if_scored_df = build_scored_frame(df, keys, if_scores, schema)
+                try:
+                    if oot_mask.any():
+                        from src.interpretability import explain_rows_iforest
+
+                        top_vars = explain_rows_iforest(
+                            if_detector, X_if[oot_mask], feature_names=names_if,
+                        )
+                        if_scored_df.loc[oot_mask, "top_5_variables"] = top_vars
+                except Exception as exc:  # noqa: BLE001 - never block this export
+                    logger.warning(
+                        "[iforest] per-row explanation for the OOT validation "
+                        "export failed (%s); continuing without it.", exc,
+                    )
+                if_oot_path, if_oot_table = export_oot_top_anomalies(
+                    if_scored_df, schema,
+                    min_percentile=(None if config.top_n is not None
+                                    else config.oot_min_percentile),
+                    top_n=config.top_n, top_fraction=config.top_fraction,
+                    model_name="iforest", n_oot_periods=config.n_oot_periods,
+                    threshold=if_cal["threshold"],
+                )
+                oot_excels["iforest"] = if_oot_path
+                logger.info(
+                    "IF OOT validation export (pre-stacking, threshold=%.6f) -> %s "
+                    "(%d rows). Compare against the VAE's stacked queue to check "
+                    "whether stacking dropped individuals the forest alone flags.",
+                    if_cal["threshold"], if_oot_path, len(if_oot_table),
+                )
+                _if_oot_ok = (os.path.isfile(if_oot_path)
+                             and os.path.getsize(if_oot_path) > 0)
+                observability.check(
+                    name="artifact.oot_excel_written[iforest_validation]",
+                    category="artifact",
+                    definition="The Isolation Forest's own pre-stacking OOT "
+                               "risk-ranked Excel exists and is non-empty, so it "
+                               "can be compared against the VAE's stacked queue.",
+                    expected="file exists and size_bytes > 0", severity="warning",
+                    passed=_if_oot_ok,
+                    observed={"path": if_oot_path,
+                              "size_bytes": os.path.getsize(if_oot_path) if _if_oot_ok else 0,
+                              "rows": int(len(if_oot_table))},
+                    failure_action="Best-effort validation artifact; the P95 "
+                                   "checkpoint above and the VAE's own OOT "
+                                   "deliverable below are unaffected.",
+                    evidence=if_oot_path,
+                )
+            except Exception as exc:  # noqa: BLE001 - never block stacking/VAE below
+                logger.warning(
+                    "IF OOT validation export failed (%s); the P95 checkpoint "
+                    "above and the VAE deliverable below are unaffected.", exc,
+                )
+
     # -- Phase 6b: IF -> VAE stacking --------------------------------------- #
     # The forest's score becomes an extra column of the matrix the VAE trains
     # on, so the VAE models the normal manifold *including* how isolated the

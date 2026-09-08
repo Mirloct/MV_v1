@@ -2260,3 +2260,118 @@ variante); estabilidad VAE añade costo real de entrenamiento cada corrida
 oficial (mitigable con `--diagnostic-stability-refits 0`); el paquete
 vendorizado es ahora una dependencia de facto de la corrida oficial, no
 solo de un modo opcional.
+
+---
+
+## 2026-09-07 — Export OOT del IF antes del stacking (validación), tiempo transcurrido en minutos/horas, y confirmación visual con captura de pantalla real
+
+**Ask.** Validar que el stacking IF→VAE no esté "perdiendo" del top de OOT
+individuos que sí interesan: exportar el Isolation Forest evaluado en la
+OOT a Excel, igual que ya se hace con el checkpoint P95, sin dejar de
+exportar el P95. Agregar ese paso al flujo de ejecución visual. Mostrar el
+tiempo transcurrido en minutos (no segundos), y en horas y minutos pasados
+los 60 minutos. Al terminar, al menos 3 iteraciones de prueba, subir a
+GitHub, depurar contexto y actualizar documentación. Un pedido adicional a
+mitad de turno pidió además una doble validación explícita de que el
+capítulo de diagnóstico/interpretación de la sesión anterior sí aparece en
+el reporte real, con capturas de pantalla como evidencia -- cubierto en
+detalle más abajo.
+
+**Nueva "Phase 6d: IF OOT export (validation)"** (`main.py`, justo después
+de "Phase 6c: IF P95 checkpoint export" y antes de "Phase 6b: IF -> VAE
+stacking" -- es decir, con el forest ya ajustado pero su puntaje todavía
+sin entrar a la matriz del VAE). Calibra su propio umbral sobre validación
+(igual que la Fase 8b hace después por modelo, pero adelantado y usando
+solo el puntaje del forest), calcula el top-5 de variables por fila para
+las observaciones OOT (`explain_rows_iforest`, igual patrón que la Fase 9),
+y exporta con la misma función que ya usa el entregable oficial
+(`export_oot_top_anomalies`) -- mismo layout ID-PERIODO-PUNTAJE-BANDA-
+VARIABLES, mismas bandas P90/P95/P99 -- a
+`artifacts/reports/oot_p90_iforest.xlsx`. **Solo corre cuando el stacking
+está activado** (`if config.stack_iforest_into_vae:`): en modo paralelo el
+forest ya recibe este mismo export por la vía normal (Fase 9, por modelo),
+así que la Fase 6d ahí se saltaría y recalcularía un archivo idéntico --
+en vez de eso, no corre en absoluto, sin duplicar trabajo. El checkpoint
+P95 (Fase 6c) sigue exportándose exactamente igual, sin cambios.
+
+**Resultado real, `--quick` sintético**: de las 50 filas del top-P90 del
+Isolation Forest, solo 29 coinciden con el top-P90 de la VAE apilada -- 21
+individuos que el forest solo habría marcado no aparecen en la cola
+apilada. Esto es justo la comparación operativa que pedía el usuario, y es
+consistente con -- pero más granular que -- el hallazgo ya documentado del
+2026-08-16 (`CONTEXT.md` "IF → VAE stacking"): que el stacking a nivel de
+feature no transfiere el ranking del forest de forma agregada. La
+diferencia es que ese hallazgo fue una medición histórica de una corrida;
+esta exportación deja la comparación disponible en cada corrida oficial.
+
+**Aparece en el flujo visual sin código adicional.** Tanto la vista en vivo
+como el diagrama estático (`src/reporting/flow_visualization.py`) derivan
+sus nodos directamente de `run_events.jsonl`, tratando cualquier nombre de
+fase que calce con `^Phase \d+[a-z]?` como un nodo nuevo -- envolver el
+bloque en `with log_phase("Phase 6d: ..."):` bastó por sí solo. Confirmado
+visualmente: captura de pantalla del diagrama muestra "Phase 6d: IF OOT
+export (validation)" en su posición correcta, entre "Phase 6c" y "Phase
+6b". La única pieza que sí necesitó una entrada manual fue el checklist del
+dashboard de terminal (`_PHASE_PLAN` en `src/utils/console_ui.py`), que es
+una lista fija usada solo para dibujar las filas pendientes por adelantado
+y ponderar el porcentaje de avance.
+
+**Tiempo transcurrido: minutos, y horas+minutos pasados los 60 minutos --
+solo para los contadores de tiempo TOTAL, nunca por fase.** Dos lugares
+mostraban el tiempo total transcurrido en `H:MM:SS` o en segundos crudos:
+el encabezado del dashboard de consola (`ConsoleUI._fmt_elapsed`) y la
+línea acumulada "`N/M fases · ...s of work`" de la vista en vivo del
+navegador (`flow_visualization.py`, plantilla `_LIVE_HTML`). Se agregó un
+formateador nuevo en cada archivo (`_fmt_elapsed_minutes` en Python,
+`fmtElapsedMinutes` en JS) que da `"45m"` por debajo de 60 minutos y
+`"1h 5m"` en adelante, y se usó **únicamente** en esos dos contadores de
+total. Los contadores POR FASE (el spinner de la fase en curso, la línea de
+checkpoints de interpretabilidad, la duración de cada nodo en ambos
+diagramas) se dejaron exactamente como estaban, en segundos/milisegundos:
+la mayoría de las fases terminan en unos pocos segundos, y redondear a
+minutos ahí mostraría "0m" durante toda una fase corta sin decir si sigue
+progresando o está colgada. Verificado con valores de borde
+(`0s→"0m"`, `59s→"0m"`, `60s→"1m"`, `3599s→"59m"`, `3600s→"1h 0m"`,
+`3661s→"1h 1m"`).
+
+**Tres iteraciones de prueba ejecutadas:**
+1. Modo apilado (`--quick --no-tune`): "Phase 6d" corre, exporta
+   `oot_p90_iforest.xlsx` (50 filas), ambos Excel OOT aparecen en el resumen
+   final, 0 chequeos de salud fallidos, comparación real de 21/50
+   individuos divergentes confirmada leyendo ambos `.xlsx` con pandas.
+2. Modo paralelo (`--quick --no-tune --no-stack-iforest-into-vae`): "Phase
+   6d" NO aparece en el log (correctamente omitida), el forest sigue
+   recibiendo su export por la Fase 9 de siempre, sin duplicar archivo ni
+   trabajo, 0 chequeos de salud fallidos.
+3. Formato de tiempo + integración visual: prueba unitaria de
+   `_fmt_elapsed_minutes` con valores de borde: correcto. Captura de
+   pantalla real (Playwright/Chromium headless) del diagrama de flujo
+   confirmando "Phase 6d" en su posición correcta, sin errores de
+   JavaScript ni de página.
+
+**Validación adicional pedida a mitad de turno: ¿el capítulo de
+diagnóstico/interpretación (entrada 2026-09-05) realmente aparece en el
+reporte?** El usuario reportó no verlo. Se hicieron 5 pasadas de
+validación real (no solo revisión de código): (1) borrar el
+`anomaly_report.html` existente y correr el pipeline desde cero: (2)
+revisar el log completo por advertencias de "Phase 9c" -- ninguna; (3)
+verificación de texto de cada `id`/encabezado esperado de ambos capítulos
+en el HTML resultante; (4) carga real en Chromium headless vía Playwright,
+clic en ambos enlaces de navegación, verificación de que ambas secciones
+son visibles en el DOM sin errores de consola; (5) diez capturas de
+pantalla reales del contenido renderizado (ficha, toolkit de
+interpretación, flujo de decisión con sus 4 nodos, recomendación). Todo
+confirmó que el código sí funciona -- la causa real era que el usuario
+tenía abierto un `anomaly_report.html` generado antes del commit `2c13c0f`
+(el reporte no se versiona en git; vive en `artifacts/`, que está en
+`.gitignore`, y se regenera localmente en cada corrida). Se subió esa
+evidencia (reporte fresco + las 10 capturas) a una rama de GitHub aparte
+(`reporte-validacion-2026-09-07`) para que el usuario pudiera verificarlo
+sin volver a correr el pipeline, y se documentó en su propio `README.md`
+qué revisar si a alguien localmente no le aparece el capítulo (paquete
+`ifvae_diag` no instalado, o copia vieja del archivo).
+
+**Alcance**: `main.py` (Fase 6d), `src/utils/console_ui.py` (formateador +
+entrada en `_PHASE_PLAN`), `src/reporting/flow_visualization.py`
+(formateador JS + call site). Ningún modelo ni lógica de preprocesamiento
+se tocó.

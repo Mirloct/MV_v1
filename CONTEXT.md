@@ -302,6 +302,30 @@ evidence favours **score-level rank combination** over feature-level
 stacking. Flip `--no-stack-iforest-into-vae` to restore the parallel
 arrangement (both models export their own Excel).
 
+**Per-run validation export (2026-09-07).** The 2026-08-16 measurement above
+answers "does stacking transfer the forest's ranking" once, in the
+aggregate, on one historical run. It does not tell an analyst whether
+*this specific run's* stacked VAE queue dropped an individual the forest
+alone would have flagged. "Phase 6d: IF OOT export (validation)"
+(`main.py`, right after the forest is fit, before its score is folded into
+the VAE's matrix) answers that directly: when stacking is on, it exports
+the forest's OWN OOT queue (`export_oot_top_anomalies`, same ID-PERIOD-
+SCORE-BAND-VARIABLES layout, same P90/P95/P99 grading, own threshold
+calibrated on validation) to `artifacts/reports/oot_p90_iforest.xlsx`
+*alongside* the VAE's stacked `oot_p90_vae.xlsx` — the P95 checkpoint export
+right before it is unaffected and still runs. An analyst compares the two
+files' entity sets directly; on the `--quick` synthetic fixture this found
+21 of 50 individuals in the forest's own top-P90 queue that do **not**
+appear in the stacked VAE's top-P90 queue — a real, per-run divergence, not
+necessarily a defect (the two detectors are not supposed to agree
+perfectly; that is exactly the question "IF-VAE Diagnostic Suite
+integration" below cross-validates from a different angle). Guarded by
+`if config.stack_iforest_into_vae:` — in parallel mode the forest already
+gets this exact export via Phase 9's per-model loop, so Phase 6d would only
+recompute and overwrite an identical file; it is skipped there, not run
+twice. Best-effort (`severity="warning"`): a failure here never blocks the
+P95 checkpoint, stacking, or the VAE deliverable.
+
 ## Model routing, defaults and known-current behavior
 
 - **Strategy default is unsupervised.** `PipelineConfig.supervised` (default
@@ -657,6 +681,30 @@ arrangement (both models export their own Excel).
   (see "Live view: interpretability's checkpoints..." above), and a
   team-health line (RAM/CPU, always with the number visible, never color
   alone).
+- **New phases need no registration to appear in either flow view** — both
+  read `run_events.jsonl` directly and treat any `^Phase \d+[a-z]?` name as a
+  node, so wrapping a block in `with log_phase("Phase 6d: ..."):` is
+  sufficient by itself (confirmed for "Phase 6d: IF OOT export (validation)"
+  below). The console dashboard's checklist is the one place that DOES need
+  a manual entry — `_PHASE_PLAN` (`src/utils/console_ui.py`) is a fixed,
+  ordered list used only for the upfront pending-checklist display and the
+  progress-percentage weighting; an unregistered phase still runs and still
+  logs, it just appears dynamically instead of as a pre-drawn pending row.
+- **Elapsed-time display: minutes, not seconds; `Xh Ym` past 60 minutes**
+  (2026-09-07) — for the RUN-TOTAL counters only, never per-phase. The
+  console dashboard's header (`ConsoleUI._fmt_elapsed_minutes`) and the live
+  browser view's cumulative "`N/M phases done · ... of work`" line
+  (`flowElapsedMinutes` in `flow_visualization.py`'s `_LIVE_HTML` template)
+  both switched from `H:MM:SS`/raw-seconds to this coarser format. Every
+  PER-PHASE duration (the running-phase spinner, the interpretability
+  sub-step timer, each node's own `fmtDur` in both the live and the static
+  post-run diagram) deliberately kept the original fine-grained
+  seconds/milliseconds formatting — most phases finish in single-digit
+  seconds, and a "0m" readout for the currently-running phase would hide
+  whether it is progressing or hung. Two formatters exist
+  (`_fmt_elapsed`/`_fmt_elapsed_minutes`, `fmtDur`/`fmtElapsedMinutes`)
+  specifically so the coarser one is never accidentally reused where
+  sub-minute resolution matters.
 
 ## Downstream analyst dashboard
 
@@ -1054,8 +1102,12 @@ that neither renderer computes over the run's numbers.
 
 **Verified end to end**, `python main.py --quick --no-tune` (diagnostic
 suite on by default now), both `--stack-iforest-into-vae` and
-`--no-stack-iforest-into-vae`: 51/51 and 58/58 health checks, real stability
-Jaccard values computed (IF ≈0.80, VAE =1.00 on this `--quick`-scale run —
+`--no-stack-iforest-into-vae`: zero failed health checks in either mode
+(the total count itself is not a fixed invariant — it varies a little
+run to run with how many distinct checks a given `--quick` synthetic
+sample happens to exercise; 0 failures is the thing that must always
+hold), real stability Jaccard values computed (IF ≈0.80, VAE =1.00 on this
+`--quick`-scale run —
 a real number, not asserted as "good" or "bad" anywhere in the ficha), real
 segment table populated, sensitivity grid swept by default, decision flow
 and recommendation rendered with this run's own numbers in both formats,

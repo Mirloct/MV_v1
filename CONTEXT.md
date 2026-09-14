@@ -664,6 +664,14 @@ P95 checkpoint, stacking, or the VAE deliverable.
 - Charts and the glossary are conditioned on `config.supervised`: a run that
   did not compute a supervised metric does not show it, and does not list it
   in the indicator glossary either.
+- The report may close with **“Qué no se ejecutó o falló”**. `run_pipeline`
+  attaches an `IncidentCollector` at ERROR level before the first phase,
+  passes its records into `build_report`, and detaches it after report
+  generation so repeated in-process runs cannot leak incidents into one
+  another. Routine warnings are intentionally excluded from HTML/Markdown,
+  and `main.py` applies `warnings.filterwarnings("ignore")` to Python/library
+  warnings. The table is a quick-glance mirror of genuine failures;
+  `execution.log` remains the authoritative runtime log.
 - `src/reporting/flow_visualization.py` renders an n8n-style diagram of one
   run's phases from `run_events.jsonl` alone (`build_flow_visualization`,
   post-run) — a "node" is any phase name matching `^Phase \d+`, everything
@@ -708,103 +716,50 @@ P95 checkpoint, stacking, or the VAE deliverable.
 
 ## Downstream analyst dashboard
 
-**Built and wired in as its own step right after the per-model loop**
-(`src/reporting/analyst_dashboard.py::build_analyst_dashboard`, "Phase 9b:
-analyst dashboard" in `main.py`, corrected 2026-08-31) — **exactly one**
-file, `artifacts/reports/analyst_dashboard.html`, regardless of
-`--stack-iforest-into-vae`. Its layout is a direct, byte-for-byte port of
-the "Cola de Revisión" mockup reviewed and approved across three rounds
-(2026-08-30, see `CHANGELOG.md`) — same shell/header/two-KPI-tile/table/
-modal/footer structure, same Archivo + Public Sans + IBM Plex Mono type
-system, same `--if`/`--vae` accent colors — only the data source changed,
-from mock to real. **A same-day correction**, also recorded in
-`CHANGELOG.md`: a first pass built one dashboard *per deliverable model* in
-a plainer, re-derived visual style and dropped the side-by-side IF+VAE
-score view. Both were wrong and are fixed here.
+`src/reporting/analyst_dashboard.py::build_analyst_dashboard` runs in Phase
+9b and writes exactly one `artifacts/reports/analyst_dashboard.html` in
+stacked or parallel mode. It is best-effort: an HTML failure never blocks
+the two Excel OOT deliverables.
 
-**One dashboard, both detectors' scores, per individual.** `main.py`'s
-Phase 8 already computes `true_oot_entity_scores` for *both* Isolation
-Forest and VAE every run (the same in-memory join
-`report_content.py`'s agreement chart uses), regardless of which model(s)
-ship an Excel. The dashboard reuses that: row selection, order, `band`, and
-`top_5_variables` all come from the *primary* deliverable's own export
-table (`config.deliverable_models[-1]`, always `"vae"` today), and the
-*other* detector's score/percentile is attached from its own
-`true_oot_entity_scores` dict — an in-memory join on `entity_id`, never a
-second file. Verified directly: in parallel mode (`--no-stack-iforest-into-
-vae`, two separate Excel exports), the dashboard's `if_score` for every
-overlapping entity matches `oot_p90_iforest.xlsx`'s own score column
-exactly (0 mismatches across 35 entities checked), while row
-selection/order/band still come from `oot_p90_vae.xlsx`.
+**Selection is now the union of both P95 rankings, not whichever model was
+the primary export.** Phase 8 already computes one maximum OOT score per
+entity for both detectors. Phase 9b converts each distribution to percentile
+ranks and partitions the P95 union into three disjoint tabs:
 
-**Still fed exclusively by this project's own OOT block, nothing
-external** — the two rules the mockup reviews established still hold,
-just now correctly scoped to "no data outside the OOT block" rather than
-"no data outside a single exported file":
-- **No categorization layer over the model's own output.** `top_5_
-  variables` is shown verbatim (the raw, comma-joined string
-  `explain_rows_iforest`/`explain_rows_vae` return) — never grouped into
-  named business buckets. An early mockup did group them ("Cartera de
-  productos y saldos", "Endeudamiento", ...); that taxonomy does not exist
-  anywhere in the real project output and was cut entirely.
-- **No per-(entity, period) panel field without its period.** The
-  dashboard shows identity, both detectors' score/percentile, band,
-  `top_5_variables`, and OOT-month presence — nothing pulled from the
-  panel's raw feature columns (age, income, account balance, transaction
-  counts, ...), since those are genuinely time-varying and an entity can
-  be flagged in more than one OOT month; a flat, undated value would be
-  ambiguous about which month it describes.
+- **Solo IF:** IF ≥ P95 and IF+VAE < P95.
+- **Solo IF+VAE:** IF+VAE ≥ P95 and IF < P95.
+- **Intersección:** both scores ≥ P95.
 
-**What it renders, concretely:**
-- Identity/band/`top_5_variables`/row order — read straight off the
-  primary deliverable's own exported table.
-- Both percentiles — `rankdata` over each detector's own
-  `true_oot_entity_scores` (not persisted; rebuilt per run, cheap).
-- Month-recurrence ("flagged in 2 of the last N OOT months") —
-  `src/evaluation/oot_report.py::months_present_by_entity(scored_df, schema,
-  oot_periods, cutoff, score_col)`, a **second, additive** query over the
-  *undeduplicated* OOT block (every row, every period) that does **not**
-  change what `export_oot_top_anomalies` exports or how it deduplicates.
-  `cutoff` is the P95 of the *primary* detector's own
-  `true_oot_entity_scores`, so "present this month" means the same
-  threshold the "en revisión" KPI uses.
-- "En revisión" KPI = count of primary-table rows with `band` in
-  `("p95","p99")` (the same fixed-P95 fix described next, not the
-  calibrated `threshold`); "recurrentes" = rows with `months_count >= 2`.
+Each row shows both percentiles. Top-variable explanations and monthly
+recurrence are kept per detector: `months_present_by_entity` runs once for
+IF and once for IF+VAE against each detector's own P95 cut-off. Search only
+filters the active tab; the KPIs update with that same partition.
 
-Best-effort: wrapped in its own try/except in `main.py` ("Phase 9b"), never
-blocks the OOT Excel deliverable(s) it reads from.
+**Per-observation full OOT download.** `main.py` passes the raw, undeduplicated
+OOT rows into the dashboard. Only rows belonging to entities in the P95 union
+are embedded. Opening a profile shows detector-specific variables/months and
+offers “Descargar todas las variables (.csv)”: the browser creates a UTF-8
+CSV containing every OOT row for that entity and every original database
+column, including its period. This is deliberately separate from the top-5
+explanation; no time-varying value is flattened or shown without its date.
 
-**Verified** (2026-08-31, both `--quick --no-tune` and
-`--no-stack-iforest-into-vae` runs): HTML parses with balanced tags in both
-modes; exactly one `analyst_dashboard.html` produced in both (no per-model
-files); every profile carries a real, non-NaN score for *both* detectors;
-row selection matches the primary export's `entity_id` set exactly; the
-"en revisión" KPI equals an independent count of P95/P99 rows from the
-just-written primary Excel (25 in every run tried); the cross-model
-`if_score` join was verified byte-exact against the separate IF export in
-parallel mode; 50/50 (stacked) and 57/57 (parallel) health checks passed.
-
-**Client-side search + responsive table (2026-09-03).** The priority table
-has a text filter (`#tableSearch`, matches the query against every visible
-cell of a row — ID, band, both percentiles, top-5 variables, meses — not
-just the ID column) and its wrapper scrolls both axes on its own
-(`.tablewrap{overflow:auto}`) rather than widening the page, since a real
-`entity_id` can run far longer than this project's own synthetic
-`CUST_000123` format; the ID cell wraps (`overflow-wrap:anywhere`) instead
-of forcing the table wider for one long value.
+The dashboard remains self-contained and client-side: no API, server, or
+external business taxonomy is introduced. Entity IDs and variable labels are
+escaped before HTML insertion, and detail chips are populated with
+`textContent`.
 
 ## IF-VAE Diagnostic Suite integration
 
-**What it is.** A third-party, standalone Python package (`tools/
+**What it is.** A vendored standalone package (`tools/
 if_vae_diagnostic_suite/`, v1.0.0, own `pyproject.toml`/CLI/tests/AGENTS.md)
-that diagnoses *why* an Isolation Forest and a VAE disagree, given exported
-reconstructions/latents/scores — not a component of this pipeline's own
-import graph, `main.py` never imports it. Installed editable
-(`pip install -e tools/if_vae_diagnostic_suite`) into the same environment.
-Vendored in-repo (not a git submodule) so the two integration fixes below
-travel with this project rather than living only on one machine's Downloads
-folder.
+that diagnoses *why* Isolation Forest and IF+VAE disagree. Phase 9c validates
+that `ifvae_diag` is importable and, when needed, runs an editable install
+from this repository's own vendored path. It never resolves the package name
+from an index. After `pip install -e`, it adds the vendored `src/` directory
+to `sys.path` so the newly installed package is available in the **same
+process** (invalidating import caches alone does not reprocess `.pth` files).
+`--no-auto-install-suite` disables the side effect and reports the missing
+suite explicitly; no manual pip step is required in the default path.
 
 **How to run it against this project:**
 ```
@@ -960,12 +915,10 @@ add a per-analysis interpretation toolkit, indicator validation, a dynamic
 decision-flow diagram, and an analyst recommendation (2026-09-05's request).
 The resolution is two contracts, not one weakened contract:
 
-- `--run-diagnostic-suite` is now **ON by default** ("this is now part of
-  the official run" — explicit request). **Trade-off, stated rather than
-  absorbed:** every official run now requires the vendored package
-  installed (`pip install -e tools/if_vae_diagnostic_suite`) and pays its
-  runtime cost — `--no-run-diagnostic-suite` opts back out (e.g. on a
-  machine without the package).
+- `--run-diagnostic-suite` is **ON by default**. `ensure_suite_installed`
+  removes the former manual-install prerequisite; `--no-auto-install-suite`
+  validates without installing and `--no-run-diagnostic-suite` skips the
+  whole phase. Stability refits still carry the runtime cost described below.
 - **Six sections removed from the factual ficha**, by explicit editorial
   request, not because they could not run: disponibilidad de diagnósticos,
   unidad de análisis (folded into a note on `§1 Alcance` and the agreement
@@ -1018,24 +971,27 @@ The resolution is two contracts, not one weakened contract:
     (mean Jaccard < 0.05, essentially zero overlap regardless of
     architecture) is flagged; everything else is reported numerically with
     the citation, comparatively (IF vs. VAE), never as a verdict.
-- **Segmentation now actually executes.** The panel already carries a real
-  `segment` column (`retail`/`corporate`/…, confirmed via
-  `load_or_generate_panel`) that the export path had simply never wired
-  through. `main.py` now passes `df["segment"]` into the diagnostic bridge;
-  §8's per-segment table populates for real instead of sitting at
-  `NOT_APPLICABLE`.
+- **Segmentation executes with a configurable source column.** The default is
+  `--diagnostic-segment-column segment`; point it at any raw categorical
+  column (for example `--diagnostic-segment-column region`). An empty string
+  disables the breakdown. A configured name that is absent logs a warning and
+  makes §8 `NOT_APPLICABLE`, never a silent no-op.
 - **Sensitivity grid and entity view are now ON by default** —
   `diagnostic_sensitivity_grid` defaults to `(0.90, 0.95, 0.99)` (this
   project's own P90/P95/P99 operating points, not an arbitrary choice) and
   `diagnostic_entity_view` defaults to `True` — both previously sat at
   `NOT_REQUESTED`/off purely because they were opt-in, not because they
   couldn't run.
-- **`§9 Experimentos diagnósticos` deliberately stays `NOT_REQUESTED`.**
-  Implementing it for real means a contamination/capacity/β-schedule/
-  preprocessing/ablation/ensemble/temporal-backtest tracking harness per
-  the suite's own `evidence/EXPERIMENT_MATRIX.md` — out of scope for a
-  report-only change; the section says so in its own caption rather than
-  hiding the gap.
+- **`§9 Experimentos diagnósticos` executes what the current run can support.**
+  Ensembles máximo/promedio and reconstruction variants reuse scores already
+  computed, so they always execute. IF contamination sweeps real refits over
+  `0.01 0.02 0.05` by default and can be replaced with
+  `--diagnostic-experiment-contamination-grid`. Capacity and beta each require
+  a full VAE refit per point, so they are opt-in through
+  `--diagnostic-experiment-capacity-grid` and
+  `--diagnostic-experiment-beta-grid`. The five families that require model/
+  preprocessing code changes or multiple retained temporal windows remain
+  `NOT_REQUESTED`, each with its own reason rather than a generic placeholder.
 
 **New: a second, explicitly-labelled interpretation chapter.** Reconciles
 the standing "no interpretation in the ficha" rule with the new request for
@@ -1085,8 +1041,8 @@ itself, while this chapter keeps one row per (entity, month) and ranks
 against the training distribution — the interpretation chapter's own
 methodology notes make this explicit where it matters.
 
-**Tests.** `tests/test_diagnostic_section.py` (40 tests, this project's
-first `tests/` directory) drives the real contract path via
+**Tests.** `tests/test_diagnostic_section.py` plus the focused dashboard
+contract tests drive the real contract path via
 `diagnose_frames`/`build_interpretation_contract` — HTML/Markdown parity for
 BOTH contracts, traceability, no silent fallbacks, response to
 threshold/candidate/aggregation changes, architecture modes, label states,

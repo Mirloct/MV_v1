@@ -148,8 +148,7 @@ at the top-`contamination` scores and, on a random subsample of at most
 Degenerate single-cluster subsamples (all-normal or all-anomaly) yield `NaN`
 cluster metrics rather than raising.
 
-**Sources (GeeksforGeeks, paraphrased in `geeksforgeeks_notes.md`
-section 5):**
+**Fuentes introductorias (indexadas también en `geeksforgeeks_notes.md`):**
 
 - ROC / ROC-AUC — https://www.geeksforgeeks.org/machine-learning/auc-roc-curve/
 - F1 / F-beta — https://www.geeksforgeeks.org/machine-learning/f1-score-in-machine-learning/

@@ -10,11 +10,8 @@ This document covers two modules:
 It explains the concepts, the public API of both modules, where figures and
 reports land on disk, and gives a runnable end-to-end snippet.
 
-> Interpretability concepts (feature attribution, autoencoder reconstruction
-> error) are adapted from GeeksforGeeks; see
-> `geeksforgeeks_notes.md` (section 2 for Isolation Forest path
-> length, section 3 for autoencoder/VAE reconstruction). Source URLs are cited
-> in [Section 1](#1-concepts). All explanations are paraphrased in our own words.
+> Las fuentes introductorias están indexadas en `geeksforgeeks_notes.md`; esta
+> guía documenta la implementación y sus límites concretos en el proyecto.
 
 ---
 
@@ -50,7 +47,7 @@ worst and therefore which features drive its anomaly score. The latent-space
 plot is the companion view: encode rows to latent means and project to 2D to see
 whether anomalies separate from the normal bulk.
 
-Sources (paraphrased in `geeksforgeeks_notes.md`):
+Fuentes introductorias (indexadas también en `geeksforgeeks_notes.md`):
 
 - Isolation Forest / path length —
   https://www.geeksforgeeks.org/machine-learning/what-is-isolation-forest/ and

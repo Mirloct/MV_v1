@@ -50,6 +50,51 @@ def _notify_phase(name: str, event: str, duration_s=None) -> None:
             _PHASE_OBSERVERS.remove(callback)
 
 
+class IncidentCollector(logging.Handler):
+    """Collects ERROR/CRITICAL records for the report's "Qué no se ejecutó o
+    falló" quick-glance section (updated on user request, 2026-09-13): a
+    filtered mirror of what a reader would otherwise only find by opening
+    ``execution.log`` and searching. The log file itself is untouched and
+    remains the complete, authoritative record -- this only ever ADDS a
+    second, best-effort view of a subset of it; it never replaces or
+    truncates the file handler.
+
+    Usage (see ``main.py``): attach for the duration of one run, read
+    ``.records`` when building the report context, detach afterwards so a
+    second in-process run does not accumulate the first run's incidents.
+
+    **Filters inside ``emit()``, not via ``Handler.level``.** This logger is
+    shared process-wide, and every module calls ``setup_logging()`` to reach
+    it; that function's own idempotent re-entry path
+    (``for handler in logger.handlers: handler.setLevel(level)``) resets
+    EVERY attached handler's level to its own default (``INFO``) on every
+    such call -- which happens constantly throughout a real pipeline run.
+    Relying on ``self.level`` here silently downgraded this collector to
+    INFO the moment any other module called ``setup_logging()`` after this
+    one attached, filling the report with routine progress lines instead of
+    genuine incidents. Checking ``record.levelno`` directly inside
+    ``emit()`` cannot be reset by that mechanism.
+    """
+
+    def __init__(self, min_level: int = logging.ERROR):
+        super().__init__(level=logging.NOTSET)
+        self.min_level = min_level
+        self.records: list[dict] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno < self.min_level:
+            return
+        try:
+            self.records.append({
+                "level": record.levelname,
+                "message": record.getMessage(),
+                "logger": record.name,
+                "time": time.strftime("%H:%M:%S", time.localtime(record.created)),
+            })
+        except Exception:  # noqa: BLE001 - a log line must never raise
+            pass
+
+
 def setup_logging(
     log_dir: str = paths.LOGS_DIR,
     log_file: str = paths.LOG_FILE,

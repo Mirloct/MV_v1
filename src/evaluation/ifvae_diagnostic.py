@@ -33,9 +33,10 @@ rather than let the suite fit a throwaway one). VAE refits in particular are
 full training runs, not just scoring, so this is the single most expensive
 part of Phase 9c -- see ``main.py``'s ``--diagnostic-stability-refits`` flag.
 
-The suite package (``ifvae_diag``) is an optional, vendored dependency
-(``pip install -e tools/if_vae_diagnostic_suite``), not part of this
-project's core requirements, so the import is lazy. Any failure here is the
+The suite package (``ifvae_diag``) is an optional, vendored dependency, not
+part of the core requirements. ``ensure_suite_installed`` validates the lazy
+import and installs the repository's own copy automatically when needed; it
+never resolves a package name from an index. Any remaining failure is the
 caller's to catch (see ``main.py`` "Phase 9c").
 """
 
@@ -51,6 +52,7 @@ import scipy.sparse as sp
 from src.data.loader import PanelSchema
 from src.evaluation.ifvae_contract import (
     STATUS_EXECUTED,
+    STATUS_FAILED,
     STATUS_NOT_APPLICABLE,
     STATUS_NOT_REQUESTED,
     STATUS_UNAVAILABLE,
@@ -59,14 +61,106 @@ from src.evaluation.ifvae_contract import (
     REASON_NO_SEGMENT,
     REASON_NO_SENSITIVITY_GRID,
     REASON_NO_STABILITY_REFITS,
-    REASON_NO_EXPERIMENT_TRACKING,
     _artifact_entry,
     feature_family,
     build_diagnostic_contract,
 )
 from src.evaluation.ifvae_interpretation import build_interpretation_contract
+from src.utils.logging_config import setup_logging
 
-__all__ = ["run_ifvae_diagnostic_suite", "diagnose_frames"]
+__all__ = ["run_ifvae_diagnostic_suite", "diagnose_frames", "ensure_suite_installed"]
+
+#: Path to the vendored suite, relative to the repository root. The package is
+#: shipped inside this repo, so a missing install is a setup gap, not a
+#: missing third-party dependency to go fetch from an index.
+SUITE_SOURCE_DIR = os.path.join("tools", "if_vae_diagnostic_suite")
+
+
+def ensure_suite_installed(auto_install: bool = True) -> dict:
+    """Make ``ifvae_diag`` importable, installing the vendored copy if needed.
+
+    The suite lives inside this repository (``tools/if_vae_diagnostic_suite``),
+    so "not installed" means "this checkout was never `pip install -e`'d",
+    not "a third-party package is missing". Rather than making every operator
+    remember that one command, this checks and -- when ``auto_install`` --
+    runs the editable install itself, from the vendored path only.
+
+    Deliberately narrow, because auto-installing is a side effect: it only
+    ever installs THIS repo's own vendored directory, never a name resolved
+    from an index, and it is a no-op when the import already works.
+
+    Returns:
+        ``{"available": bool, "action": str, "detail": str}`` -- ``action`` is
+        one of ``already_installed`` / ``installed_now`` / ``install_failed``
+        / ``missing_source`` / ``not_attempted``, so the caller can report
+        exactly what happened instead of only whether it worked.
+    """
+    import importlib
+    import subprocess
+    import sys
+
+    log = setup_logging()
+
+    def _importable() -> bool:
+        try:
+            importlib.import_module("ifvae_diag")
+            return True
+        except ImportError:
+            return False
+
+    if _importable():
+        return {"available": True, "action": "already_installed",
+                "detail": "El paquete ifvae_diag ya es importable."}
+
+    source = os.path.abspath(SUITE_SOURCE_DIR)
+    if not os.path.isdir(source):
+        return {"available": False, "action": "missing_source",
+                "detail": f"No existe el directorio vendorizado {SUITE_SOURCE_DIR}."}
+    if not auto_install:
+        return {"available": False, "action": "not_attempted",
+                "detail": "La instalación automática está desactivada "
+                          "(--no-auto-install-suite)."}
+
+    log.info(
+        "ifvae_diag no está instalado; instalando la copia vendorizada desde %s "
+        "(pip install -e). Esto ocurre una sola vez por entorno.", source,
+    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-e", source],
+            capture_output=True, text=True, timeout=600,
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed install must not raise here
+        return {"available": False, "action": "install_failed",
+                "detail": f"No se pudo ejecutar pip: {exc}"}
+    if completed.returncode != 0:
+        tail = (completed.stderr or completed.stdout or "").strip().splitlines()
+        return {"available": False, "action": "install_failed",
+                "detail": "pip devolvió código "
+                          f"{completed.returncode}: {' | '.join(tail[-3:])}"}
+    # `pip install -e` (PEP 660) writes an editable finder/`.pth` entry into
+    # site-packages, but that only gets *read* when the `site` module runs at
+    # interpreter start-up -- a plain `importlib.invalidate_caches()` refreshes
+    # finder caches, it does not re-scan site-packages for new `.pth`/finder
+    # files, so the freshly-installed package is still invisible in THIS
+    # process. Rather than exec-ing a new interpreter, add the vendored
+    # source directory straight onto `sys.path`: we already know exactly
+    # where it is (we just installed from it), so this is not a guess.
+    importlib.invalidate_caches()
+    vendored_src = os.path.join(source, "src")
+    if not _importable() and os.path.isdir(vendored_src) and vendored_src not in sys.path:
+        sys.path.insert(0, vendored_src)
+        importlib.invalidate_caches()
+    if not _importable():
+        return {"available": False, "action": "install_failed",
+                "detail": "pip terminó sin error pero ifvae_diag sigue sin "
+                          "poder importarse en este proceso (ni siquiera tras "
+                          f"agregar {vendored_src} a sys.path). Puede requerir "
+                          "reiniciar el intérprete."}
+    log.info("ifvae_diag instalado correctamente desde la copia vendorizada.")
+    return {"available": True, "action": "installed_now",
+            "detail": f"Instalado con pip install -e {SUITE_SOURCE_DIR}."}
+
 
 #: Every file the suite writes, checked for existence and non-emptiness so the
 #: chapter never links to a missing or zero-byte artifact.
@@ -462,6 +556,214 @@ def _build_stability(
     return {"iforest": iforest, "vae": vae}
 
 
+#: Families genuinely out of bounds for a report-only change (they need
+#: core model/preprocessing code, or a multi-window pipeline structure this
+#: bridge does not have) -- each reason names exactly why, not a blanket
+#: "not implemented".
+_OUT_OF_SCOPE_EXPERIMENTS = (
+    ("Pérdidas por tipo de feature",
+     "Requiere reescribir la función de pérdida del VAE por tipo de "
+     "variable (Gaussiana/Bernoulli/categórica) -- código de modelo, fuera "
+     "de alcance de un cambio solo de reporte."),
+    ("Preprocesamiento",
+     "Requiere re-ejecutar `fit_transform_panel` con transformaciones "
+     "distintas -- código de preprocesamiento, fuera de alcance de un "
+     "cambio solo de reporte."),
+    ("Ablación de familias de features",
+     "Requiere reconstruir la matriz de features excluyendo familias "
+     "completas -- código de preprocesamiento, fuera de alcance de un "
+     "cambio solo de reporte."),
+    ("Backtests temporales",
+     "Requiere reajustar en múltiples cortes temporales (origen rodante) -- "
+     "una estructura de corridas distinta a la de un solo pipeline. La "
+     "sección 8 ya desglosa por mes la ventana OOT de ESTA corrida, pero "
+     "eso no reajusta nada en cortes anteriores."),
+    ("Estabilidad entre ventanas",
+     "Requiere comparar rankings entre múltiples ventanas OOT históricas, "
+     "que esta corrida no conserva -- ver limitación de \"Backtests "
+     "temporales\" arriba."),
+)
+
+
+def _swept_refit_experiment(
+    detector_cls: Any, base_detector: Any, param_names: Sequence[str],
+    sweep_param: str, sweep_grid: Sequence, fit_x: np.ndarray, score_x: np.ndarray,
+    reference_high: np.ndarray, percentile_threshold: float, base_seed: int,
+    fit_kwargs: Optional[dict] = None,
+) -> list[dict]:
+    """For each value in ``sweep_grid``, refit ``detector_cls`` with the
+    production detector's own hyperparameters except ``sweep_param``
+    (varied), on the SAME fit/score data and a FIXED seed (``base_seed`` --
+    the point here is the hyperparameter's effect, not seed variance, which
+    ``_seeded_refit_stability`` already measures separately). Each variant's
+    own alert set (recomputed via the suite's own ``anomaly_percentile``, its
+    own reference distribution) is compared against ``reference_high`` (the
+    PRODUCTION detector's alert set at the same threshold) via Jaccard -- a
+    real, executed comparison, never a placeholder.
+    """
+    from ifvae_diag.scoring import anomaly_percentile
+
+    base_params = {name: getattr(base_detector, name) for name in param_names}
+    rows = []
+    for value in sweep_grid:
+        try:
+            detector = detector_cls(random_state=base_seed,
+                                    **{**base_params, sweep_param: value})
+            detector.fit(fit_x, **(fit_kwargs or {}))
+            fit_scores = np.asarray(detector.score_samples(fit_x), dtype=float)
+            variant_scores = np.asarray(detector.score_samples(score_x), dtype=float)
+            variant_pct = anomaly_percentile(fit_scores, variant_scores)
+            variant_high = variant_pct >= percentile_threshold
+            counts = _quadrant_counts(reference_high, variant_high)
+            relations = _set_relations(counts)
+            rows.append({
+                "value": value, "status": STATUS_EXECUTED,
+                "alerts": int(variant_high.sum()), "total": int(len(variant_high)),
+                "jaccard_vs_production": relations["jaccard"],
+            })
+        except Exception as exc:  # noqa: BLE001 - one bad grid point must not kill the sweep
+            rows.append({"value": value, "status": STATUS_FAILED, "reason": str(exc)})
+    return rows
+
+
+def _build_experiments(
+    *, scored_diag: pd.DataFrame, threshold: float,
+    if_detector: Optional[Any] = None, x_if_fit: Optional[np.ndarray] = None,
+    x_if_score: Optional[np.ndarray] = None,
+    vae_detector: Optional[Any] = None, x_vae_fit: Optional[np.ndarray] = None,
+    x_vae_score: Optional[np.ndarray] = None, valid_mask: Optional[np.ndarray] = None,
+    contamination_grid: Sequence[float] = (),
+    capacity_grid: Sequence[int] = (), beta_grid: Sequence[float] = (),
+    base_seed: int = 42,
+) -> list[dict]:
+    """§9 tracking rows -- genuinely executed where the underlying comparison
+    is cheap or already computed elsewhere; explicitly out of bounds (with a
+    specific, per-family reason, see ``_OUT_OF_SCOPE_EXPERIMENTS``) where it
+    would require touching model or preprocessing code, which is outside the
+    scope of a report-only change.
+    """
+    experiments: list[dict] = []
+    if_high = (scored_diag["if_percentile"] >= threshold).to_numpy()
+    vae_high = (scored_diag["vae_percentile"] >= threshold).to_numpy()
+
+    # -- Ensembles: max()/mean() of the two detectors' percentiles, already
+    #    computed by the suite itself (`ifvae_diag.pipeline`) -- zero new
+    #    cost, just surfaced here instead of silently dropped. -------------
+    for name, label in (("ensemble_max", "máximo"), ("ensemble_mean", "promedio")):
+        if name not in scored_diag.columns:
+            experiments.append({
+                "experiment": f"Ensembles ({label} IF/VAE)",
+                "status": STATUS_UNAVAILABLE,
+                "reason": f"La suite no escribió la columna {name}.",
+            })
+            continue
+        combo_high = (scored_diag[name] >= threshold).to_numpy()
+        counts = _quadrant_counts(if_high, combo_high)
+        relations = _set_relations(counts)
+        experiments.append({
+            "experiment": f"Ensembles ({label} IF/VAE)",
+            "status": STATUS_EXECUTED,
+            "configuration": f"umbral={threshold:.3f}",
+            "artifact": "scored_diagnostics.csv",
+            "detail": f"{int(combo_high.sum())} alertas; Jaccard vs. IF solo = "
+                     f"{relations['jaccard']:.3f}" if relations["jaccard"] is not None
+                     else f"{int(combo_high.sum())} alertas",
+        })
+
+    # -- Variantes de reconstrucción: recon_mean/topk/max, distancia latente
+    #    y KL ya se comparan en la sección 4 -- ejecutado ahí, no se repite.
+    experiments.append({
+        "experiment": "Variantes de reconstrucción (VAE)",
+        "status": STATUS_EXECUTED,
+        "configuration": "recon_mean, recon_topk, recon_max, latent_mahalanobis, KL",
+        "artifact": "scored_diagnostics.csv",
+        "detail": "Ver sección 4 (Comparación de puntajes VAE) -- misma "
+                 "corrida, no se repite el cómputo aquí.",
+    })
+
+    # -- Variantes de contaminación (IF): reajuste real y barato (el forest
+    #    no necesita reentrenamiento profundo), comparado contra la alerta
+    #    de producción. --------------------------------------------------
+    if contamination_grid and if_detector is not None and x_if_fit is not None:
+        from src.models import IsolationForestDetector
+
+        sweep = _swept_refit_experiment(
+            IsolationForestDetector, if_detector, _IF_REFIT_PARAMS,
+            "contamination", contamination_grid, x_if_fit, x_if_score,
+            if_high, threshold, base_seed,
+        )
+        for value, row in zip(contamination_grid, sweep):
+            if row["status"] == STATUS_EXECUTED:
+                detail = (f"{row['alerts']} alertas de {row['total']}; Jaccard vs. "
+                         f"producción = {row['jaccard_vs_production']:.3f}"
+                         if row["jaccard_vs_production"] is not None
+                         else f"{row['alerts']} alertas de {row['total']}")
+            else:
+                detail = None
+            experiments.append({
+                "experiment": f"Variantes de contaminación (IF, contamination={value})",
+                "status": row["status"],
+                "configuration": f"contamination={value}",
+                "artifact": None,
+                "detail": detail,
+                "reason": row.get("reason"),
+            })
+    else:
+        experiments.append({
+            "experiment": "Variantes de contaminación (IF)",
+            "status": STATUS_NOT_REQUESTED,
+            "reason": "No se configuró una malla de contaminación "
+                     "(--diagnostic-experiment-contamination-grid).",
+        })
+
+    # -- Capacidad y dimensión latente / Beta y programación KL (VAE):
+    #    ejecutables con la misma clase VAEDetector, pero cada punto de la
+    #    malla es un entrenamiento completo -- apagado por defecto, opt-in.
+    for label, param, grid, refit_param_names in (
+        ("Capacidad y dimensión latente (VAE)", "latent_dim", capacity_grid, _VAE_REFIT_PARAMS),
+        ("Beta y programación KL (VAE)", "beta", beta_grid, _VAE_REFIT_PARAMS),
+    ):
+        if grid and vae_detector is not None and x_vae_fit is not None:
+            from src.models import VAEDetector
+
+            sweep = _swept_refit_experiment(
+                VAEDetector, vae_detector, refit_param_names, param, grid,
+                x_vae_fit, x_vae_score, vae_high, threshold, base_seed,
+                fit_kwargs={"valid_mask": valid_mask} if valid_mask is not None else None,
+            )
+            for value, row in zip(grid, sweep):
+                if row["status"] == STATUS_EXECUTED:
+                    detail = (f"{row['alerts']} alertas de {row['total']}; Jaccard vs. "
+                             f"producción = {row['jaccard_vs_production']:.3f}"
+                             if row["jaccard_vs_production"] is not None
+                             else f"{row['alerts']} alertas de {row['total']}")
+                else:
+                    detail = None
+                experiments.append({
+                    "experiment": f"{label}: {param}={value}",
+                    "status": row["status"],
+                    "configuration": f"{param}={value}",
+                    "artifact": None,
+                    "detail": detail,
+                    "reason": row.get("reason"),
+                })
+        else:
+            experiments.append({
+                "experiment": label,
+                "status": STATUS_NOT_REQUESTED,
+                "reason": "No se configuró una malla (opt-in: cada punto "
+                         "reentrena el VAE por completo). Ver "
+                         "--diagnostic-experiment-capacity-grid / "
+                         "--diagnostic-experiment-beta-grid.",
+            })
+
+    for name, reason in _OUT_OF_SCOPE_EXPERIMENTS:
+        experiments.append({"experiment": name, "status": STATUS_NOT_REQUESTED,
+                            "reason": reason})
+
+    return experiments
+
+
 def _group_quadrants(scored_diag: pd.DataFrame, group_column: str) -> list:
     rows = []
     for group, block in scored_diag.groupby(group_column, sort=True):
@@ -478,27 +780,6 @@ def _group_quadrants(scored_diag: pd.DataFrame, group_column: str) -> list:
         ])
     return rows
 
-
-def _experiment_matrix() -> list[dict]:
-    """§9 tracking rows -- see the section's own caption for why this stays
-    NOT_REQUESTED rather than implemented: a full experiment-tracking harness
-    (contamination/capacity/beta/preprocessing/ablation/ensemble/temporal
-    sweeps, per the suite's own EXPERIMENT_MATRIX.md) is out of scope for
-    this report-only change; this list keeps the backlog explicit instead of
-    silently dropping it.
-    """
-    families = (
-        "Variantes de contaminación", "Variantes de reconstrucción",
-        "Pérdidas por tipo de feature", "Capacidad y dimensión latente",
-        "Beta y programación KL", "Preprocesamiento",
-        "Ablación de familias de features", "Ensembles",
-        "Backtests temporales", "Estabilidad entre ventanas",
-    )
-    return [
-        {"experiment": name, "status": STATUS_NOT_REQUESTED,
-         "reason": REASON_NO_EXPERIMENT_TRACKING}
-        for name in families
-    ]
 
 
 def _drift_signal(drift_frame: Optional[pd.DataFrame], derived_features: Sequence[str],
@@ -566,6 +847,10 @@ def run_ifvae_diagnostic_suite(
     stability_refits: int = 3,
     base_seed: int = 42,
     segment: Optional[np.ndarray] = None,
+    auto_install_suite: bool = True,
+    experiment_contamination_grid: Sequence[float] = (0.01, 0.02, 0.05),
+    experiment_capacity_grid: Sequence[int] = (),
+    experiment_beta_grid: Sequence[float] = (),
 ) -> dict:
     """Run the suite label-free against this run's own OOT window and return
     ``{"contract": ..., "interpretation": ..., ...run-level fields}``.
@@ -577,8 +862,15 @@ def run_ifvae_diagnostic_suite(
     (best-effort, caught internally); the caller (``main.py`` "Phase 9c") is
     responsible for catching everything else and logging.
     """
-    from ifvae_diag import run_diagnostic
-    from ifvae_diag.config import DiagnosticConfig
+    # Checked here too (not just inside `diagnose_frames` below), so a
+    # missing/unfixable install fails fast -- before the VAE forward pass
+    # and stability refits below do real, potentially slow work for nothing.
+    install = ensure_suite_installed(auto_install=auto_install_suite)
+    if not install["available"]:
+        raise RuntimeError(
+            "El paquete vendorizado ifvae_diag no está disponible: "
+            f"{install['detail']}"
+        )
 
     run_meta = dict(run_meta or {})
     entity_col = schema.entity_col or "entity_id"
@@ -616,6 +908,10 @@ def run_ifvae_diagnostic_suite(
                 "base_seed": base_seed,
             }
         ),
+        auto_install_suite=auto_install_suite,
+        experiment_contamination_grid=experiment_contamination_grid,
+        experiment_capacity_grid=experiment_capacity_grid,
+        experiment_beta_grid=experiment_beta_grid,
     )
 
 
@@ -634,6 +930,10 @@ def diagnose_frames(
     segment_col: Optional[str] = None,
     vae_primary_score: str = "recon_topk",
     stability: Optional[dict] = None,
+    auto_install_suite: bool = True,
+    experiment_contamination_grid: Sequence[float] = (0.01, 0.02, 0.05),
+    experiment_capacity_grid: Sequence[int] = (),
+    experiment_beta_grid: Sequence[float] = (),
 ) -> dict:
     """Run the suite over ready-made frames and assemble both contracts.
 
@@ -645,6 +945,13 @@ def diagnose_frames(
     else without paying for real refits; omitting it reports stability as
     NOT_REQUESTED with a stated reason, not as a silently-passing default.
     """
+    install = ensure_suite_installed(auto_install=auto_install_suite)
+    if not install["available"]:
+        raise RuntimeError(
+            "El paquete vendorizado ifvae_diag no está disponible: "
+            f"{install['detail']}"
+        )
+
     from ifvae_diag import run_diagnostic
     from ifvae_diag.config import DiagnosticConfig
 
@@ -736,6 +1043,21 @@ def diagnose_frames(
 
     drift_signal = _drift_signal(result.drift, derived_features)
 
+    experiments = _build_experiments(
+        scored_diag=scored_diag, threshold=threshold,
+        if_detector=(stability or {}).get("if_detector"),
+        x_if_fit=(stability or {}).get("x_if_fit"),
+        x_if_score=(stability or {}).get("x_if_score"),
+        vae_detector=(stability or {}).get("vae_detector"),
+        x_vae_fit=(stability or {}).get("x_vae_fit"),
+        x_vae_score=(stability or {}).get("x_vae_score"),
+        valid_mask=(stability or {}).get("valid_mask"),
+        contamination_grid=experiment_contamination_grid,
+        capacity_grid=experiment_capacity_grid,
+        beta_grid=experiment_beta_grid,
+        base_seed=(stability or {}).get("base_seed", 42),
+    )
+
     contract = build_diagnostic_contract(
         populations=populations,
         config=config_dict,
@@ -749,7 +1071,7 @@ def diagnose_frames(
         stability=stability_result,
         temporal=temporal,
         segmentation=segmentation,
-        experiments=_experiment_matrix(),
+        experiments=experiments,
     )
 
     interpretation = build_interpretation_contract(

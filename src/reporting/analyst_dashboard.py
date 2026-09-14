@@ -13,17 +13,18 @@ order), and each detector's own de-duplicated OOT scores
 (`true_oot_entity_scores`, `main.py` Phase 8) plus the per-month recurrence
 view derived from the same OOT block
 (:func:`src.evaluation.oot_report.months_present_by_entity`). No business
-categorization is invented over `top_5_variables`, and no per-(entity,
-period) panel field is shown without its period (none is shown at all).
+categorization is invented over `top_5_variables`.
 
-One dashboard, not one per model: both Isolation Forest and VAE percentiles
-are shown for every individual, sourced from each detector's own
-`true_oot_entity_scores` -- an in-memory join, not a second exported file,
-so this holds regardless of `--stack-iforest-into-vae`.
+One dashboard, not one per model: both detector percentiles are shown for
+every individual in the union of both P95 queues. Three tabs make agreement
+explicit: only IF, only IF+VAE, and their intersection. The detail view also
+embeds the selected individual's complete raw OOT rows for an offline CSV
+download; every value remains tied to its original period.
 """
 
 from __future__ import annotations
 
+import html
 import json
 import os
 from typing import Optional, Sequence
@@ -31,7 +32,6 @@ from typing import Optional, Sequence
 import pandas as pd
 
 from src.data.loader import PanelSchema
-from src.evaluation.oot_report import BAND_COL
 from src.utils import paths
 from src.utils.logging_config import setup_logging
 
@@ -83,18 +83,19 @@ def build_analyst_dashboard(
     n_total_oot: int,
     score_col: str = "anomaly_score",
     out_path: Optional[str] = None,
+    model_tables: Optional[dict[str, pd.DataFrame]] = None,
+    months_present_by_model: Optional[dict[str, dict]] = None,
+    oot_records: Optional[pd.DataFrame] = None,
 ) -> str:
     """Render the single, unified analyst review-queue dashboard.
 
     Args:
         table: The table `export_oot_top_anomalies` returned for
-            ``base_model_name`` -- already sorted by score descending; row
-            order, selection (who is in the queue at all), and the `band`/
-            `top_5_variables` columns all come from this one model's export.
+            ``base_model_name``. Retained as the backwards-compatible source
+            of top-variable explanations when ``model_tables`` is omitted.
         schema: Panel schema (for `entity_col`).
-        base_model_name: Which model's export drives selection/order/band/
-            `top_5_variables` -- `"iforest"` or `"vae"` (in practice always
-            the last entry of `PipelineConfig.deliverable_models`, i.e. VAE).
+        base_model_name: Primary exported model, used for provenance and as
+            the backwards-compatible table/month fallback.
         oot_periods: Every period in the OOT window, so the recurrence
             indicator always shows the same N columns for every row.
         if_percentile_by_entity / vae_percentile_by_entity: `{entity_id:
@@ -105,13 +106,20 @@ def build_analyst_dashboard(
             rows) renders as "&mdash;" rather than raising.
         if_score_by_entity / vae_score_by_entity: the raw scores behind the
             percentiles above, for the modal's score readout.
-        months_present: `{entity_id: [period_str, ...]}` from
-            `months_present_by_entity`, keyed to `base_model_name`'s own P95
-            cut-off -- which OOT months this entity's score cleared it in.
+        months_present: Legacy recurrence map for ``base_model_name``. New
+            callers should also pass ``months_present_by_model``.
         n_total_oot: Total unique individuals in the OOT window (from
             `base_model_name`'s own de-duplicated population) -- the
             denominator for the "en revisión" KPI's percentage.
         score_col: Name of the score column in ``table``.
+        model_tables: Optional OOT export table for each detector. Supplying
+            both ``iforest`` and ``vae`` lets the three detector-agreement
+            tabs retain each model's own top-variable explanation.
+        months_present_by_model: Per-detector recurrence maps. When omitted,
+            the legacy ``months_present`` map is assigned to the base model.
+        oot_records: Raw OOT rows, with every source column. Only records for
+            entities in the P95 review union are embedded; the profile modal
+            downloads them as a CSV without reducing the source columns.
         out_path: Destination ``.html``. Defaults to
             ``artifacts/reports/analyst_dashboard.html``.
 
@@ -122,63 +130,113 @@ def build_analyst_dashboard(
     entity_col = schema.entity_col or "entity_id"
     resolved_out = out_path or paths.ANALYST_DASHBOARD_DEFAULT
 
+    if_percentile_by_entity = {str(k): v for k, v in if_percentile_by_entity.items()}
+    vae_percentile_by_entity = {str(k): v for k, v in vae_percentile_by_entity.items()}
+    if_score_by_entity = {str(k): v for k, v in if_score_by_entity.items()}
+    vae_score_by_entity = {str(k): v for k, v in vae_score_by_entity.items()}
+
     all_periods = [str(p)[:10] for p in oot_periods]
     n_months = max(1, len(all_periods))
-    has_vars = "top_5_variables" in table.columns
+    model_tables = dict(model_tables or {base_model_name: table})
+    model_tables.setdefault(base_model_name, table)
+    recurrence = dict(months_present_by_model or {base_model_name: months_present})
+    recurrence.setdefault("iforest", months_present if base_model_name == "iforest" else {})
+    recurrence.setdefault("vae", months_present if base_model_name == "vae" else {})
 
-    records = table.to_dict("records")
-    n_reviewed = 0
-    n_recurrent = 0
-    n_recurrent_full = 0
+    def _rows_by_entity(frame: Optional[pd.DataFrame]) -> dict[str, dict]:
+        if frame is None or frame.empty or entity_col not in frame.columns:
+            return {}
+        return {str(row[entity_col]): row for row in frame.to_dict("records")}
+
+    table_rows = {name: _rows_by_entity(frame) for name, frame in model_tables.items()}
+    # The review universe is deliberately detector-independent: every entity
+    # at/above P95 in either score distribution appears exactly once.
+    entity_ids = sorted(
+        set(str(eid) for eid, pct in if_percentile_by_entity.items() if float(pct) >= 95.0)
+        | set(str(eid) for eid, pct in vae_percentile_by_entity.items() if float(pct) >= 95.0),
+        key=lambda eid: (
+            -max(float(if_percentile_by_entity.get(eid, -1)),
+                 float(vae_percentile_by_entity.get(eid, -1))),
+            eid,
+        ),
+    )
+
+    raw_by_entity: dict[str, list[dict]] = {}
+    oot_columns: list[str] = []
+    if oot_records is not None and entity_col in oot_records.columns:
+        oot_columns = [str(c) for c in oot_records.columns]
+        wanted = set(entity_ids)
+        raw = oot_records.loc[oot_records[entity_col].astype(str).isin(wanted)].copy()
+        # pandas' JSON encoder handles Timestamp/numpy scalars and emits null
+        # for NaN, producing a safe, exact-enough browser payload.
+        safe_rows = json.loads(raw.to_json(orient="records", date_format="iso", force_ascii=False))
+        for original_id, safe_row in zip(raw[entity_col].astype(str), safe_rows):
+            raw_by_entity.setdefault(original_id, []).append(safe_row)
+
+    counts = {"if_only": 0, "vae_only": 0, "intersection": 0}
+    recurrent_counts = {"if_only": 0, "vae_only": 0, "intersection": 0}
     row_html_list: list[str] = []
     profiles: dict = {}
 
-    for i, r in enumerate(records, start=1):
-        eid = str(r[entity_col])
-        band = str(r.get(BAND_COL, ""))
-        if band in ("p95", "p99"):
-            n_reviewed += 1
+    for i, eid in enumerate(entity_ids, start=1):
         if_pctl = float(if_percentile_by_entity.get(eid, float("nan")))
         vae_pctl = float(vae_percentile_by_entity.get(eid, float("nan")))
         if_score = float(if_score_by_entity.get(eid, float("nan")))
         vae_score = float(vae_score_by_entity.get(eid, float("nan")))
-        present = sorted(months_present.get(eid, []))
+        if_hit, vae_hit = if_pctl >= 95.0, vae_pctl >= 95.0
+        tab = "intersection" if if_hit and vae_hit else ("if_only" if if_hit else "vae_only")
+        counts[tab] += 1
+        if_months = sorted(recurrence["iforest"].get(eid, []))
+        vae_months = sorted(recurrence["vae"].get(eid, []))
+        present = sorted(set(if_months) | set(vae_months))
         months_count = len(present)
         if months_count >= 2:
-            n_recurrent += 1
-        if months_count >= n_months:
-            n_recurrent_full += 1
+            recurrent_counts[tab] += 1
         sev = _severity_for(months_count, n_months)
-        top5 = str(r.get("top_5_variables") or "").strip() if has_vars else ""
-        band_label = "P99" if band == "p99" else ("P95" if band == "p95" else band.upper() or "&mdash;")
+        if_row = table_rows.get("iforest", {}).get(eid, {})
+        vae_row = table_rows.get("vae", {}).get(eid, {})
+        if_top5 = str(if_row.get("top_5_variables") or "").strip()
+        vae_top5 = str(vae_row.get("top_5_variables") or "").strip()
+        shown_top5 = if_top5 if tab == "if_only" else vae_top5
+        if tab == "intersection" and if_top5 and vae_top5:
+            shown_top5 = f"IF: {if_top5} · IF+VAE: {vae_top5}"
+        elif tab == "intersection":
+            shown_top5 = if_top5 or vae_top5
+        band = "p99" if max(if_pctl, vae_pctl) >= 99.0 else "p95"
+        band_label = "AMBOS" if tab == "intersection" else ("IF" if tab == "if_only" else "IF+VAE")
+        profile_key = f"p{i}"
+        safe_eid = html.escape(eid, quote=True)
+        safe_top5 = html.escape(shown_top5, quote=True)
 
         row_html_list.append(f"""
-        <tr data-id="{eid}" onclick="openProfile('{eid}')" tabindex="0"
-            onkeypress="if(event.key==='Enter')openProfile('{eid}')">
+        <tr data-id="{safe_eid}" data-tab="{tab}" data-profile="{profile_key}"
+            onclick="openProfile('{profile_key}')" tabindex="0"
+            onkeypress="if(event.key==='Enter')openProfile('{profile_key}')">
           <td class="idx">{i}</td>
-          <td class="idc">{eid}</td>
+          <td class="idc">{safe_eid}</td>
           <td><span class="band band-{band or 'p90'}">{band_label}</span></td>
           <td class="scorecell">{_pct_bar(if_pctl, 'if')}</td>
           <td class="scorecell">{_pct_bar(vae_pctl, 'vae')}</td>
-          <td class="vars5" title="{top5}">{top5 or '&mdash;'}</td>
+          <td class="vars5" title="{safe_top5}">{safe_top5 or '&mdash;'}</td>
           <td class="monthscell">
             <span class="mcount mcount-{sev}">{months_count}/{n_months}</span>
             <span class="mdots">{_month_dots_html(present, all_periods, sev)}</span>
           </td>
         </tr>""")
 
-        profiles[eid] = {
+        profiles[profile_key] = {
             "id": eid, "band": band,
+            "tab": tab,
             "if_score": if_score, "vae_score": vae_score,
             "if_pctl": if_pctl, "vae_pctl": vae_pctl,
             "months": present, "months_count": months_count,
-            "top5": top5,
+            "if_months": if_months, "vae_months": vae_months,
+            "if_top5": if_top5, "vae_top5": vae_top5,
+            "oot_records": raw_by_entity.get(eid, []),
         }
 
     rows_html = "\n".join(row_html_list)
-    n_rows = len(records)
-    p95_pct = (100.0 * n_reviewed / n_total_oot) if n_total_oot else 0.0
-    recurrent_rate = (100.0 * n_recurrent / n_rows) if n_rows else 0.0
+    n_rows = len(entity_ids)
     oot_label = ", ".join(all_periods) if all_periods else "(sin periodos)"
 
     month_label = {p: p for p in all_periods}  # ISO date is already the label
@@ -214,14 +272,14 @@ def build_analyst_dashboard(
 
     <section class="kpis">
       <div class="kpi">
-        <div class="kpi-label">En revisión (&ge; P95 del score)</div>
-        <div class="kpi-value">{n_reviewed:,}<span class="kpi-unit">individuos</span></div>
-        <div class="kpi-sub">{p95_pct:.1f}% de {n_total_oot:,} individuos únicos en el OOT ({n_months} mes{'es' if n_months != 1 else ''})</div>
+        <div class="kpi-label" id="queueKpiLabel">En revisión</div>
+        <div class="kpi-value"><span id="queueKpiValue">0</span><span class="kpi-unit">individuos</span></div>
+        <div class="kpi-sub" id="queueKpiSub">&mdash;</div>
       </div>
       <div class="kpi">
         <div class="kpi-label">Recurrentes &ge; 2 de {n_months} meses</div>
-        <div class="kpi-value">{n_recurrent:,}<span class="kpi-unit">de la cola</span></div>
-        <div class="kpi-sub">{recurrent_rate:.1f}% reaparece; {n_recurrent_full:,} marcados los {n_months} meses</div>
+        <div class="kpi-value"><span id="recurrentKpiValue">0</span><span class="kpi-unit">de la pestaña</span></div>
+        <div class="kpi-sub" id="recurrentKpiSub">&mdash;</div>
       </div>
     </section>
 
@@ -231,7 +289,12 @@ def build_analyst_dashboard(
           <div class="panel-title">Individuos priorizados<span class="hint">clic en una fila &rarr; perfil completo</span></div>
           <span class="badge" id="rowCountBadge">mostrando {n_rows:,} de {n_total_oot:,}</span>
         </div>
-        <p class="tablenote"><b>Definición fija:</b> "en revisión" = score &ge; percentil 95 del bloque OOT completo (no un umbral calibrado que pueda caer a cero); el conteo son individuos únicos, no filas mes-a-mes. Todo lo mostrado abajo es una columna que Modelo v0.1 produce directamente (ID, scores, percentiles, banda, top-5 variables, presencia mensual) &mdash; sin categorización de negocio añadida.</p>
+        <p class="tablenote"><b>Definición fija:</b> "en revisión" = score &ge; percentil 95 del bloque OOT completo. Las pestañas separan quién fue priorizado solo por Isolation Forest, solo por el detector IF+VAE, o por ambos. El perfil permite descargar todas las filas y variables OOT del individuo, sin resumirlas a top-5.</p>
+        <div class="tabs" role="tablist" aria-label="Coincidencia entre detectores">
+          <button class="tabbtn" role="tab" data-tab-target="if_only" onclick="setActiveTab('if_only')">Solo IF <span>{counts['if_only']:,}</span></button>
+          <button class="tabbtn" role="tab" data-tab-target="vae_only" onclick="setActiveTab('vae_only')">Solo IF+VAE <span>{counts['vae_only']:,}</span></button>
+          <button class="tabbtn active" role="tab" data-tab-target="intersection" onclick="setActiveTab('intersection')">Intersección <span>{counts['intersection']:,}</span></button>
+        </div>
         <div class="searchbar">
           <input type="search" id="tableSearch" class="search-input"
                  placeholder="Filtrar por ID, banda o variable..." autocomplete="off"
@@ -292,9 +355,15 @@ def build_analyst_dashboard(
       </div>
     </div>
     <div class="mfieldlabel">Presencia en el OOT ({n_months} mes{'es' if n_months != 1 else ''})</div>
-    <div class="mmonths" id="mMonths"></div>
-    <div class="mfieldlabel">Top-5 variables que más empujan el score</div>
-    <div class="mchips" id="mChips"></div>
+    <div class="detector-detail"><span><i class="lswatch if"></i>Isolation Forest</span><div class="mmonths" id="mIfMonths"></div></div>
+    <div class="detector-detail"><span><i class="lswatch vae"></i>IF+VAE</span><div class="mmonths" id="mVaeMonths"></div></div>
+    <div class="mfieldlabel">Top-5 variables por detector</div>
+    <div class="detector-detail"><span><i class="lswatch if"></i>Isolation Forest</span><div class="mchips" id="mIfChips"></div></div>
+    <div class="detector-detail"><span><i class="lswatch vae"></i>IF+VAE</span><div class="mchips" id="mVaeChips"></div></div>
+    <div class="download-panel">
+      <div><b>Registro OOT completo</b><small id="mDownloadMeta">&mdash;</small></div>
+      <button class="download-btn" id="downloadBtn" onclick="downloadObservation()">Descargar todas las variables (.csv)</button>
+    </div>
   </div>
 </div>
 
@@ -305,6 +374,12 @@ var OOT_MONTHS = {json.dumps(all_periods, ensure_ascii=False)};
 var N_MONTHS = {n_months};
 var N_ROWS_TOTAL = {n_rows};
 var N_TOTAL_OOT = {n_total_oot};
+var COUNTS = {json.dumps(counts)};
+var RECURRENT_COUNTS = {json.dumps(recurrent_counts)};
+var OOT_COLUMNS = {json.dumps(oot_columns, ensure_ascii=False)};
+var ACTIVE_TAB = "intersection";
+var ACTIVE_PROFILE = null;
+var TAB_LABELS = {{if_only:"Solo IF", vae_only:"Solo IF+VAE", intersection:"Intersección"}};
 
 function pad(n){{return n<10?"0"+n:""+n}}
 var MESES=["ENE","FEB","MAR","ABR","MAY","JUN","JUL","AGO","SEP","OCT","NOV","DIC"];
@@ -331,7 +406,8 @@ function filterTable(query){{
     var rows = document.querySelectorAll("#priorityTableBody tr[data-id]");
     var shown = 0;
     rows.forEach(function(row){{
-      var match = !needle || row.textContent.toLowerCase().indexOf(needle) !== -1;
+      var inTab = row.dataset.tab === ACTIVE_TAB;
+      var match = inTab && (!needle || row.textContent.toLowerCase().indexOf(needle) !== -1);
       row.hidden = !match;
       if (match) shown++;
     }});
@@ -353,10 +429,29 @@ function filterTable(query){{
       badge.textContent = "mostrando " + shown + " de " + N_ROWS_TOTAL;
       hint.textContent = shown + " coincidencia" + (shown === 1 ? "" : "s");
     }} else {{
-      badge.textContent = "mostrando " + N_ROWS_TOTAL.toLocaleString("es") + " de " + N_TOTAL_OOT.toLocaleString("es");
+      badge.textContent = "mostrando " + shown.toLocaleString("es") + " de " + N_TOTAL_OOT.toLocaleString("es");
       hint.textContent = "";
     }}
   }});
+}}
+
+function setActiveTab(tab){{
+  ACTIVE_TAB = tab;
+  document.querySelectorAll(".tabbtn").forEach(function(btn){{
+    var selected = btn.dataset.tabTarget === tab;
+    btn.classList.toggle("active", selected);
+    btn.setAttribute("aria-selected", selected ? "true" : "false");
+  }});
+  var count = COUNTS[tab] || 0;
+  var recurrent = RECURRENT_COUNTS[tab] || 0;
+  var pct = N_TOTAL_OOT ? (100*count/N_TOTAL_OOT) : 0;
+  var recurrentPct = count ? (100*recurrent/count) : 0;
+  document.getElementById("queueKpiLabel").textContent = TAB_LABELS[tab] + " (≥ P95)";
+  document.getElementById("queueKpiValue").textContent = count.toLocaleString("es");
+  document.getElementById("queueKpiSub").textContent = pct.toFixed(1)+"% de "+N_TOTAL_OOT.toLocaleString("es")+" individuos únicos OOT";
+  document.getElementById("recurrentKpiValue").textContent = recurrent.toLocaleString("es");
+  document.getElementById("recurrentKpiSub").textContent = recurrentPct.toFixed(1)+"% reaparece en 2 o más meses";
+  filterTable(document.getElementById("tableSearch").value);
 }}
 
 function sevFor(count, total){{
@@ -369,7 +464,8 @@ function sevFor(count, total){{
 
 function openProfile(id){{
   var r = PROFILES[id]; if(!r) return;
-  document.getElementById("mId").textContent = id;
+  ACTIVE_PROFILE = r;
+  document.getElementById("mId").textContent = r.id;
   var bandEl = document.getElementById("mBand");
   bandEl.textContent = (r.band || "-").toUpperCase();
   bandEl.className = "mband mband-"+(r.band || "p90");
@@ -380,23 +476,49 @@ function openProfile(id){{
   document.getElementById("mVaeBar").style.width = (isNaN(r.vae_pctl) ? 0 : r.vae_pctl)+"%";
   document.getElementById("mVaePctl").textContent = isNaN(r.vae_pctl) ? "" : ("percentil "+r.vae_pctl.toFixed(1));
 
-  var sev = sevFor(r.months_count, N_MONTHS);
-  var mm = document.getElementById("mMonths"); mm.innerHTML = "";
-  OOT_MONTHS.forEach(function(m){{
-    var on = r.months.indexOf(m) !== -1;
-    var sevClass = on ? ("mchip-on mchip-"+sev) : "mchip-off";
-    mm.innerHTML += '<span class="mchip '+sevClass+'">'+(MONTH_LABEL[m]||m)+'</span>';
-  }});
-
-  var mc = document.getElementById("mChips"); mc.innerHTML = "";
-  (r.top5 ? r.top5.split(",").map(function(s){{return s.trim();}}).filter(Boolean) : []).forEach(function(v){{
-    mc.innerHTML += '<span class="vchip">'+v+'</span>';
-  }});
+  renderMonths("mIfMonths", r.if_months);
+  renderMonths("mVaeMonths", r.vae_months);
+  renderChips("mIfChips", r.if_top5);
+  renderChips("mVaeChips", r.vae_top5);
+  var recordCount = (r.oot_records || []).length;
+  document.getElementById("mDownloadMeta").textContent = recordCount+" fila"+(recordCount===1?"":"s")+" · "+OOT_COLUMNS.length+" columnas originales";
+  document.getElementById("downloadBtn").disabled = recordCount === 0 || OOT_COLUMNS.length === 0;
 
   document.getElementById("overlay").classList.add("open");
 }}
+function renderMonths(targetId, present){{
+  var mm=document.getElementById(targetId); mm.innerHTML="";
+  var sev=sevFor((present||[]).length,N_MONTHS);
+  OOT_MONTHS.forEach(function(m){{
+    var on=(present||[]).indexOf(m)!==-1;
+    var chip=document.createElement("span");
+    chip.className="mchip "+(on ? ("mchip-on mchip-"+sev) : "mchip-off");
+    chip.textContent=MONTH_LABEL[m]||m; mm.appendChild(chip);
+  }});
+}}
+function renderChips(targetId, text){{
+  var mc=document.getElementById(targetId); mc.innerHTML="";
+  var values=(text||"").split(",").map(function(s){{return s.trim();}}).filter(Boolean);
+  if(!values.length){{var empty=document.createElement("span");empty.className="empty-detail";empty.textContent="No disponible";mc.appendChild(empty);return;}}
+  values.forEach(function(v){{var chip=document.createElement("span");chip.className="vchip";chip.textContent=v;mc.appendChild(chip);}});
+}}
+function csvCell(value){{
+  if(value===null || value===undefined) return '""';
+  var text=(typeof value === "object") ? JSON.stringify(value) : String(value);
+  return '"'+text.replace(/"/g,'""')+'"';
+}}
+function downloadObservation(){{
+  var r=ACTIVE_PROFILE; if(!r || !(r.oot_records||[]).length) return;
+  var lines=[OOT_COLUMNS.map(csvCell).join(",")];
+  r.oot_records.forEach(function(row){{lines.push(OOT_COLUMNS.map(function(c){{return csvCell(row[c]);}}).join(","));}});
+  var blob=new Blob(["\\ufeff"+lines.join("\\r\\n")],{{type:"text/csv;charset=utf-8"}});
+  var url=URL.createObjectURL(blob); var a=document.createElement("a");
+  a.href=url; a.download="oot_"+String(r.id).replace(/[^a-zA-Z0-9._-]+/g,"_")+".csv";
+  document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){{URL.revokeObjectURL(url);}},1000);
+}}
 function closeProfile(){{ document.getElementById("overlay").classList.remove("open"); }}
 document.addEventListener("keydown", function(e){{ if(e.key==="Escape") closeProfile(); }});
+setActiveTab(ACTIVE_TAB);
 </script>
 </body>
 </html>
@@ -409,9 +531,10 @@ document.addEventListener("keydown", function(e){{ if(e.key==="Escape") closePro
         fh.write(html_out)
 
     log.info(
-        "Analyst dashboard [base=%s] -> %s (%d in review of %d unique OOT individuals, "
-        "%d recurrent >=2 of %d months)",
-        base_model_name, resolved_out, n_reviewed, n_total_oot, n_recurrent, n_months,
+        "Analyst dashboard [base=%s] -> %s (%d in P95 union of %d unique OOT "
+        "individuals; tabs=%s; recurrent>=2=%s; %d OOT columns downloadable)",
+        base_model_name, resolved_out, n_rows, n_total_oot, counts,
+        recurrent_counts, len(oot_columns),
     )
     return os.path.abspath(resolved_out)
 
@@ -505,6 +628,15 @@ body{background:var(--paper);color:var(--ink);
   border-radius:6px;font-size:11.5px;line-height:1.55;color:var(--ink-soft);flex-shrink:0}
 .tablenote b{color:var(--ink)}
 
+.tabs{margin:0 24px 10px;display:flex;gap:7px;flex-wrap:wrap;flex-shrink:0}
+.tabbtn{border:1px solid var(--border);border-radius:8px;padding:7px 11px;color:var(--ink-soft);
+  background:var(--surface);font-size:11.5px;font-weight:700;display:flex;align-items:center;gap:7px}
+.tabbtn span{font-family:"IBM Plex Mono",monospace;font-size:10px;padding:1px 6px;border-radius:10px;
+  background:var(--surface-2);color:var(--ink-mute)}
+.tabbtn:hover{background:var(--surface-2)}
+.tabbtn.active{border-color:var(--if);background:var(--if-soft);color:var(--ink)}
+.tabbtn.active span{background:var(--if);color:#fff}
+
 .searchbar{margin:0 24px 10px;display:flex;align-items:center;gap:10px;flex-shrink:0}
 .search-input{flex:1;max-width:360px;font-family:"Public Sans",sans-serif;font-size:12.5px;
   padding:8px 12px;border-radius:8px;border:1px solid var(--border);background:var(--surface-2);
@@ -588,7 +720,7 @@ tbody td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12.5px
 .meyebrow{font-size:10px;font-weight:700;color:var(--ink-mute);text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}
 .mid{font-family:"IBM Plex Mono",monospace;font-size:20px;font-weight:700}
 .mband{font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:700;padding:5px 12px;
-  border-radius:20px;text-transform:uppercase}
+  border-radius:20px;text-transform:uppercase;margin-right:36px}
 .mband-p90{background:var(--surface-2);color:var(--ink-soft)}
 .mband-p95{background:var(--warn-soft);color:var(--warn)}
 .mband-p99{background:var(--crit-soft);color:var(--crit)}
@@ -608,6 +740,15 @@ tbody td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12.5px
 .mchips{display:flex;flex-wrap:wrap;gap:7px}
 .vchip{font-family:"IBM Plex Mono",monospace;font-size:11px;background:var(--surface-2);
   border:1px solid var(--border);padding:4px 9px;border-radius:6px;color:var(--ink-soft)}
+.detector-detail{display:grid;grid-template-columns:130px 1fr;gap:10px;align-items:start;
+  padding:7px 0;border-bottom:1px solid var(--border)}
+.detector-detail>span{display:flex;align-items:center;gap:6px;font-size:10.5px;font-weight:700;color:var(--ink-soft)}
+.empty-detail{font-size:11px;color:var(--ink-mute)}
+.download-panel{margin-top:18px;padding:13px 14px;border:1px solid var(--border);border-radius:10px;
+  background:var(--surface-2);display:flex;align-items:center;justify-content:space-between;gap:16px}
+.download-panel b{font-size:11.5px;display:block}.download-panel small{display:block;color:var(--ink-mute);margin-top:3px}
+.download-btn{background:var(--ink);color:var(--surface);padding:8px 12px;border-radius:8px;font-size:11px;font-weight:700}
+.download-btn:hover{opacity:.86}.download-btn:disabled{opacity:.4;cursor:not-allowed}
 
 @media (max-width:980px){
   .shell{height:auto;max-height:none}
@@ -615,5 +756,6 @@ tbody td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12.5px
   .kpi{border-left:0;border-top:1px solid var(--border)}
   .kpi:first-child{border-top:0}
   .search-input{max-width:none}
+  .download-panel{align-items:stretch;flex-direction:column}.download-btn{width:100%}
 }
 """

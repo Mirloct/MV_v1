@@ -437,11 +437,41 @@ def _build_markdown(context: dict, out_dir: str) -> str:
     parts.append("con la KL gaussiana disponible en forma cerrada:\n")
     parts.append(f"$$\n{_KL_LATEX}\n$$\n")
 
+    parts.append(_incidents_section_md(context))
+
     notes = context.get("notes")
     if notes:
         parts.append("## Notas\n")
         parts.append(f"{notes}\n")
 
+    return "\n".join(parts)
+
+
+def _incidents_section_md(context: dict) -> str:
+    """"Qué no se ejecutó o falló" -- a quick-glance mirror of genuine
+    ERROR/CRITICAL records, added so a reader does not have
+    to open `execution.log` just to know whether anything needs attention.
+    The log file itself remains the complete, authoritative record; this
+    section only ever shows a filtered subset of it, never a replacement.
+    Returns ``''`` when there is nothing to show -- an empty run has no
+    incidents, not a placeholder saying so at length.
+    """
+    incidents = [i for i in (context.get("incidents") or [])
+                 if str(i.get("level", "")).upper() in {"ERROR", "CRITICAL"}]
+    if not incidents:
+        return ""
+    parts = [
+        "## Qué no se ejecutó o falló\n",
+        "_Vista rápida de los fallos registrados durante esta corrida. Las "
+        "advertencias se omiten para mantener limpio el reporte; el "
+        "detalle completo, con contexto adicional, permanece en "
+        "`artifacts/logs/execution.log`._\n",
+    ]
+    parts.append(_md_table(
+        ["Hora", "Nivel", "Mensaje"],
+        [(i.get("time", ""), i.get("level", ""), i.get("message", ""))
+         for i in incidents],
+    ))
     return "\n".join(parts)
 
 
@@ -1451,6 +1481,46 @@ def _plotly_section_html(chart_data: Optional[dict], log) -> dict:
     return sections
 
 
+#: level -> chip class, reusing the report's own `.chip` tokens.
+_INCIDENT_CHIP = {"ERROR": "serious", "CRITICAL": "serious"}
+
+
+def _incidents_section_html(context: dict) -> str:
+    """HTML twin of ``_incidents_section_md`` -- see that function's
+    docstring for what this is and why it exists. Same guard: ``''`` when
+    there is nothing to show.
+    """
+    incidents = [i for i in (context.get("incidents") or [])
+                 if str(i.get("level", "")).upper() in {"ERROR", "CRITICAL"}]
+    if not incidents:
+        return ""
+    # Built by hand (not `_html_table`, which escapes every cell): the
+    # "Nivel" column needs one real element (a colored chip), and escaping
+    # it through `_html_table` would double-escape it into literal text.
+    body_rows = "".join(
+        "<tr>"
+        f"<td>{html.escape(str(i.get('time', '')))}</td>"
+        f"<td><span class='chip {_INCIDENT_CHIP.get(i.get('level'), 'warning')}'>"
+        f"{html.escape(str(i.get('level', '')))}</span></td>"
+        f"<td>{html.escape(str(i.get('message', '')))}</td>"
+        "</tr>"
+        for i in incidents
+    )
+    return (
+        "<h2 id='incidents'>Qué no se ejecutó o falló</h2>"
+        "<div class='card'>"
+        "<p class='subtitle'>Vista rápida de los fallos registrados durante "
+        "esta corrida. Las advertencias se omiten para mantener limpio el "
+        "reporte; el detalle completo permanece "
+        "en <code>artifacts/logs/execution.log</code>.</p>"
+        "<div class='table-wrap'><table>"
+        "<tr><th>Hora</th><th>Nivel</th><th>Mensaje</th></tr>"
+        f"{body_rows}"
+        "</table></div>"
+        "</div>"
+    )
+
+
 def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
     title = context.get("title", "Reporte de Detección de Anomalías")
     generated_at = context.get("generated_at", "")
@@ -1569,6 +1639,8 @@ def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
         + "</pre>"
     )
     parts.append("</div>")
+
+    parts.append(_incidents_section_html(context))
 
     notes = context.get("notes")
     if notes:

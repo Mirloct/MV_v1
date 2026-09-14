@@ -364,8 +364,17 @@ python main.py --rare-min-frequency 0.01   # agrupa más categorías raras antes
                                             # ranking de atribución del VAE — ver feature_attribution.xlsx,
                                             # hoja vae_by_source)
 python main.py --no-live-view    # no abre la vista de progreso local en el navegador
+python main.py --diagnostic-segment-column region  # apartado 8 por una columna propia
+python main.py --diagnostic-experiment-capacity-grid 4 8 16  # refits VAE opt-in
+python main.py --no-auto-install-suite  # valida ifvae_diag, pero no lo instala
 python main.py --help
 ```
+
+La suite `ifvae_diag` está activa y se auto-instala desde la copia vendorizada
+del repositorio cuando hace falta; no requiere un `pip install` manual. Para una
+explicación breve de los modelos, las mallas experimentales, las tres pestañas
+del dashboard y la descarga OOT completa, empieza por
+[`docs/guia_practica.md`](docs/guia_practica.md).
 
 **La estrategia por defecto es NO SUPERVISADA.** Las etiquetas de ground truth se
 cargan siempre que exista el archivo (los diagnósticos las usan igual), pero sólo

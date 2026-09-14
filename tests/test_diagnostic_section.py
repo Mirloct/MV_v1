@@ -37,6 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.evaluation.ifvae_contract import (  # noqa: E402
     CONTRACT_VERSION,
+    NO_VALUE_TEXT,
     STATUS_EXECUTED,
     STATUS_NOT_APPLICABLE,
     STATUS_NOT_REQUESTED,
@@ -724,6 +725,99 @@ class RealStabilityTests(unittest.TestCase):
             x_fit, x_score, seeds_a, k=10,
         )
         self.assertEqual(result["runs"], 3)
+
+
+class ExperimentMatrixTests(unittest.TestCase):
+    """§9 now genuinely executes the cheap/already-computed families and
+    gives a specific (not generic) reason for the ones left NOT_REQUESTED."""
+
+    def _fit_tiny_detectors(self):
+        return RealStabilityTests._fit_tiny_detectors(self)
+
+    def test_ensembles_and_reconstruction_variants_execute_for_free(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            contract = build(tmp)["contract"]
+        rows = section_by_id(contract, "experiments")["blocks"][0]["rows"]
+        by_name = {r[0]: r for r in rows}
+        for name in ("Ensembles (máximo IF/VAE)", "Ensembles (promedio IF/VAE)",
+                    "Variantes de reconstrucción (VAE)"):
+            self.assertIn(STATUS_EXECUTED, by_name[name][1],
+                         f"{name} debería ejecutarse sin configuración adicional")
+
+    def test_contamination_sweep_runs_by_default_with_real_refits(self):
+        if_detector, x_if_fit, x_if_score, vae_detector = self._fit_tiny_detectors()
+        reference, scored, features = synthetic_frames(n_reference=60, n_scored=40)
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = diagnose_frames(
+                reference, scored, features, tmp,
+                stability={
+                    "if_detector": if_detector, "x_if_fit": x_if_fit,
+                    "x_if_score": x_if_score, "vae_detector": vae_detector,
+                    "x_vae_fit": x_if_fit, "x_vae_score": x_if_score,
+                    "valid_mask": None, "stability_refits": 0, "base_seed": 42,
+                },
+            )
+        rows = section_by_id(payload["contract"], "experiments")["blocks"][0]["rows"]
+        contamination_rows = [r for r in rows if "contaminación (IF, contamination=" in r[0]]
+        self.assertEqual(len(contamination_rows), 3)  # default grid: 0.01, 0.02, 0.05
+        for row in contamination_rows:
+            self.assertIn(STATUS_EXECUTED, row[1])
+            self.assertNotEqual(row[2], NO_VALUE_TEXT)  # a real "Resultado" was computed
+
+    def test_capacity_and_beta_are_not_requested_without_a_configured_grid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            contract = build(tmp)["contract"]
+        rows = section_by_id(contract, "experiments")["blocks"][0]["rows"]
+        by_name = {r[0]: r for r in rows}
+        for name in ("Capacidad y dimensión latente (VAE)", "Beta y programación KL (VAE)"):
+            self.assertIn(STATUS_NOT_REQUESTED, by_name[name][1])
+            self.assertTrue(by_name[name][-1], "debe traer un motivo específico")
+
+    def test_capacity_grid_executes_when_configured(self):
+        if_detector, x_if_fit, x_if_score, vae_detector = self._fit_tiny_detectors()
+        reference, scored, features = synthetic_frames(n_reference=60, n_scored=40)
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = diagnose_frames(
+                reference, scored, features, tmp,
+                stability={
+                    "if_detector": if_detector, "x_if_fit": x_if_fit,
+                    "x_if_score": x_if_score, "vae_detector": vae_detector,
+                    "x_vae_fit": x_if_fit, "x_vae_score": x_if_score,
+                    "valid_mask": None, "stability_refits": 0, "base_seed": 42,
+                },
+                experiment_capacity_grid=(2,),
+            )
+        rows = section_by_id(payload["contract"], "experiments")["blocks"][0]["rows"]
+        capacity_rows = [r for r in rows if "Capacidad y dimensión latente (VAE): latent_dim=" in r[0]]
+        self.assertEqual(len(capacity_rows), 1)
+        self.assertIn(STATUS_EXECUTED, capacity_rows[0][1])
+
+    def test_out_of_scope_families_carry_a_specific_not_generic_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            contract = build(tmp)["contract"]
+        rows = section_by_id(contract, "experiments")["blocks"][0]["rows"]
+        by_name = {r[0]: r for r in rows}
+        expectations = {
+            "Pérdidas por tipo de feature": "pérdida",
+            "Preprocesamiento": "fit_transform_panel",
+            "Ablación de familias de features": "matriz de features",
+            "Backtests temporales": "origen rodante",
+            "Estabilidad entre ventanas": "ventanas OOT",
+        }
+        for name, keyword in expectations.items():
+            self.assertIn(STATUS_NOT_REQUESTED, by_name[name][1])
+            self.assertIn(keyword, by_name[name][-1],
+                         f"{name} debería explicar POR QUÉ, no una razón genérica")
+
+    def test_no_generic_tracking_reason_leaks_into_any_row(self):
+        """The old blanket 'no hay registro de corridas' reason must be gone
+        from every row, not just some -- each family now explains itself."""
+        with tempfile.TemporaryDirectory() as tmp:
+            contract = build(tmp)["contract"]
+        rows = section_by_id(contract, "experiments")["blocks"][0]["rows"]
+        for row in rows:
+            self.assertNotIn("no lleva un registro de corridas por variante del que "
+                            "leer su estado", row[-1] or "")
 
 
 # --------------------------------------------------------------------------- #

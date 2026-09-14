@@ -17,12 +17,11 @@ live, on localhost only, while the run is still in progress.
 
 :func:`src.reporting.analyst_dashboard.build_analyst_dashboard` renders one
 self-contained "Cola de Revisión" HTML (not one per model -- both Isolation
-Forest and VAE percentiles are shown for every individual, joined in memory
-from each detector's own `true_oot_entity_scores`) fed exclusively by this
-project's own OOT block: the primary deliverable's OOT Excel table plus the
-OOT block's per-month recurrence -- no other data source, no business
-categorization layered on top. See `CONTEXT.md` "Downstream analyst
-dashboard".
+Forest and IF+VAE percentiles are joined in memory). The P95 union is split
+into only-IF, only-IF+VAE and intersection tabs; each profile can download
+the entity's complete raw OOT rows with every original column. No external
+data source or business categorization is layered on top. See `CONTEXT.md`
+"Downstream analyst dashboard".
 """
 
 from src.reporting.analyst_dashboard import build_analyst_dashboard

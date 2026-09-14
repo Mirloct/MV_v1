@@ -1,0 +1,32 @@
+{
+  "generatedAt": "2026-09-14T05:14:03.433Z",
+  "results": [
+    {
+      "iteration": 1,
+      "artifact": "dashboard",
+      "tabs": {
+        "if_only": 16,
+        "vae_only": 16,
+        "intersection": 10
+      },
+      "downloadedColumns": 22,
+      "screenshot": "01-dashboard-tabs-download.png",
+      "pageErrors": []
+    },
+    {
+      "iteration": 2,
+      "artifact": "report",
+      "executedRows": 6,
+      "incidentSection": false,
+      "screenshot": "02-report-experiments-no-warnings.png",
+      "pageErrors": []
+    },
+    {
+      "iteration": 3,
+      "artifact": "documentation",
+      "mermaidSvgs": 3,
+      "screenshot": "03-docs-mermaid-guide.png",
+      "pageErrors": []
+    }
+  ]
+}

@@ -7,9 +7,8 @@ routine recover from crashes. It is the sibling of
 `docs/models_isolation_forest.md` and follows the same conventions
 (score sign, SQLite/YAML resume, figures location).
 
-> Concept adapted from GeeksforGeeks, see
-> `geeksforgeeks_notes.md` (section 3, "Autoencoders and
-> Variational Autoencoders (VAE)").
+> Las fuentes introductorias consultadas están indexadas en
+> `geeksforgeeks_notes.md`; esta guía aplica el concepto al código del proyecto.
 
 ---
 

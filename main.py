@@ -21,11 +21,17 @@ import argparse
 import os
 import signal
 import time
+import warnings
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Optional
 
 import numpy as np
+
+# Operator preference: keep Python/library warnings out of console and report
+# artifacts. Runtime failures still use structured logging at ERROR/CRITICAL;
+# diagnostic non-execution remains explicit in the §9 status matrix.
+warnings.filterwarnings("ignore")
 
 from src.utils import console_ui, observability, paths
 from src.utils.logging_config import log_phase, setup_logging
@@ -179,6 +185,31 @@ class PipelineConfig:
     # UNAVAILABLE with a stated reason) on a machine where this cost is not
     # acceptable.
     diagnostic_stability_refits: int = 3
+    # Column in the raw panel (`df`) used for the diagnostic chapter's §8
+    # per-segment breakdown (temporal/segmentación). Default `"segment"`
+    # matches this project's own synthetic panel; point it at any other
+    # categorical column the real panel carries (e.g. `"region"`,
+    # `"product_type"`, `"channel"`) via `--diagnostic-segment-column NAME`,
+    # or pass `--diagnostic-segment-column ""` to disable the breakdown
+    # even if a column named "segment" happens to exist. A configured name
+    # that is not one of `df`'s columns logs a warning and falls back to
+    # NOT_APPLICABLE for that run -- never a silent no-op.
+    diagnostic_segment_column: Optional[str] = "segment"
+    # Auto-install the vendored IF-VAE Diagnostic Suite
+    # (`tools/if_vae_diagnostic_suite`) into this environment on first use if
+    # it is not already importable, instead of requiring a manual
+    # `pip install -e` beforehand. Always installs from THIS repo's own
+    # vendored copy, never from an index. `--no-auto-install-suite` disables
+    # it (the run then fails Phase 9c with a clear "not installed" reason
+    # instead of installing anything).
+    diagnostic_auto_install_suite: bool = True
+    # §9 "Experimentos diagnósticos" grids. Contamination is cheap (a forest
+    # refit is fast) so it runs by default; capacity/beta are VAE refits --
+    # a FULL retrain per grid point -- so they default to an empty grid
+    # (NOT_REQUESTED) and only run when explicitly configured.
+    diagnostic_experiment_contamination_grid: tuple = (0.01, 0.02, 0.05)
+    diagnostic_experiment_capacity_grid: tuple = ()
+    diagnostic_experiment_beta_grid: tuple = ()
     data_path: str = DATA_PATH
     # P95 checkpoint gate (Phase 6c, between the Isolation Forest fit and the
     # VAE layer): percentile of the in-time score distribution above which a
@@ -319,6 +350,22 @@ def run_pipeline(config: PipelineConfig) -> dict:
     # -- Phase 1: environment / logging ------------------------------------- #
     logger = setup_logging()
     _ensure_dirs()
+    # Mirrors ERROR/CRITICAL records for the report's "Qué no se ejecutó o
+    # falló" section. Warnings stay out of the report by operator request;
+    # `execution.log` remains the complete runtime record. It is detached
+    # before the final summary so a second in-process run never inherits
+    # the first run's incidents.
+    from src.utils.logging_config import IncidentCollector
+
+    # Idempotent: drop any collector left attached by a PRIOR failed
+    # `run_pipeline` call in this same process (e.g. repeated calls in a
+    # test session) before adding this run's own, so incidents never leak
+    # across runs sharing the process-global logger.
+    for _h in list(logger.handlers):
+        if isinstance(_h, IncidentCollector):
+            logger.removeHandler(_h)
+    incident_collector = IncidentCollector()
+    logger.addHandler(incident_collector)
     logger.info("=" * 72)
     logger.info("Anomaly-detection pipeline starting")
     logger.info("Effective config: %s", asdict(config))
@@ -831,6 +878,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     threshold=if_cal["threshold"],
                 )
                 oot_excels["iforest"] = if_oot_path
+                deliverable_tables["iforest"] = if_oot_table
                 logger.info(
                     "IF OOT validation export (pre-stacking, threshold=%.6f) -> %s "
                     "(%d rows). Compare against the VAE's stacked queue to check "
@@ -1304,12 +1352,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
     # Not one per deliverable model: the dashboard shows both detectors'
     # scores for the same individual side by side (an in-memory join on
     # `true_oot_entity_scores`, Phase 8 -- both detectors are always
-    # evaluated regardless of `--stack-iforest-into-vae`), so a single
-    # dashboard covers stacked and parallel modes alike. Selection, row
-    # order, `band`, and `top_5_variables` all come from the *primary*
-    # deliverable's own export table (`config.deliverable_models[-1]`, always
-    # "vae" today) -- the other detector's score is attached, not re-selected
-    # on. See CONTEXT.md "Downstream analyst dashboard".
+    # evaluated regardless of `--stack-iforest-into-vae`). The queue is the
+    # P95 union, split into only-IF, only-IF+VAE, and intersection tabs.
     with log_phase("Phase 9b: analyst dashboard"):
         try:
             from scipy.stats import rankdata
@@ -1322,7 +1366,6 @@ def run_pipeline(config: PipelineConfig) -> dict:
             from src.reporting import build_analyst_dashboard
 
             primary_name = config.deliverable_models[-1]
-            other_name = "iforest" if primary_name == "vae" else "vae"
             if primary_name not in deliverable_tables:
                 raise RuntimeError(
                     f"no OOT export found for the primary deliverable model {primary_name!r}"
@@ -1346,29 +1389,39 @@ def run_pipeline(config: PipelineConfig) -> dict:
             primary_scores_by_entity = (
                 vae_scores_by_entity if primary_name == "vae" else if_scores_by_entity
             )
+            if_percentiles = _percentiles(if_scores_by_entity)
+            vae_percentiles = _percentiles(vae_scores_by_entity)
 
             time_col = schema.time_col or "period"
             oot_periods = oot_period(
                 keys, time_col=time_col, n_oot_periods=config.n_oot_periods,
             )
             dash_score_col = "anomaly_score"  # build_scored_frame's default
-            p95_cutoff = (
-                float(np.percentile(list(primary_scores_by_entity.values()), 95.0))
-                if primary_scores_by_entity else float("nan")
-            )
-            scored_df_primary = build_scored_frame(
-                df, keys, models[primary_name][1], schema,
-            )
-            months_present = months_present_by_entity(
-                scored_df_primary, schema, oot_periods, cutoff=p95_cutoff,
-                score_col=dash_score_col,
-            )
+            months_by_model = {}
+            for dash_model_name, dash_scores in (
+                ("iforest", if_scores_by_entity), ("vae", vae_scores_by_entity),
+            ):
+                dash_cutoff = (
+                    float(np.percentile(list(dash_scores.values()), 95.0))
+                    if dash_scores else float("nan")
+                )
+                dash_scored_df = build_scored_frame(
+                    df, keys, models[dash_model_name][1], schema,
+                )
+                months_by_model[dash_model_name] = months_present_by_entity(
+                    dash_scored_df, schema, oot_periods, cutoff=dash_cutoff,
+                    score_col=dash_score_col,
+                )
+            raw_oot_records = df.loc[df[time_col].isin(oot_periods)].copy()
 
             dashboard_path = build_analyst_dashboard(
                 deliverable_tables[primary_name], schema, primary_name, oot_periods,
-                _percentiles(if_scores_by_entity), _percentiles(vae_scores_by_entity),
-                if_scores_by_entity, vae_scores_by_entity, months_present,
+                if_percentiles, vae_percentiles,
+                if_scores_by_entity, vae_scores_by_entity, months_by_model[primary_name],
                 n_total_oot=len(primary_scores_by_entity), score_col=dash_score_col,
+                model_tables=deliverable_tables,
+                months_present_by_model=months_by_model,
+                oot_records=raw_oot_records,
             )
             analyst_dashboard_path = dashboard_path
             _dash_ok = os.path.isfile(dashboard_path) and os.path.getsize(dashboard_path) > 0
@@ -1449,7 +1502,19 @@ def run_pipeline(config: PipelineConfig) -> dict:
                         },
                     },
                 }
-                _segment = df["segment"].to_numpy() if "segment" in df.columns else None
+                _segment_col = (config.diagnostic_segment_column or "").strip()
+                if not _segment_col:
+                    _segment = None
+                elif _segment_col in df.columns:
+                    _segment = df[_segment_col].to_numpy()
+                else:
+                    logger.warning(
+                        "diagnostic_segment_column=%r no existe en el panel "
+                        "(columnas disponibles: %s); la sección 8 quedará "
+                        "NOT_APPLICABLE para esta corrida.",
+                        _segment_col, ", ".join(df.columns[:20]),
+                    )
+                    _segment = None
                 diagnostic_suite_result = run_ifvae_diagnostic_suite(
                     keys, schema,
                     models["iforest"][0], models["iforest"][1], models["iforest"][3],
@@ -1463,6 +1528,10 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     stability_refits=config.diagnostic_stability_refits,
                     base_seed=config.seed,
                     segment=_segment,
+                    auto_install_suite=config.diagnostic_auto_install_suite,
+                    experiment_contamination_grid=config.diagnostic_experiment_contamination_grid,
+                    experiment_capacity_grid=config.diagnostic_experiment_capacity_grid,
+                    experiment_beta_grid=config.diagnostic_experiment_beta_grid,
                 )
                 _n_files = sum(
                     1 for name_ in (
@@ -1496,8 +1565,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
             except Exception as exc:  # noqa: BLE001 - never block the report above
                 logger.warning(
                     "IF-VAE diagnostic suite failed (%s); the report chapter for it "
-                    "will be omitted. Is the package installed "
-                    "(`pip install -e tools/if_vae_diagnostic_suite`)?", exc,
+                    "will be omitted. Review the auto-install result and vendored "
+                    "suite path in execution.log.", exc,
                 )
 
     # -- Phase 10: interpretability, AFTER every Excel deliverable ---------- #
@@ -1649,6 +1718,11 @@ def run_pipeline(config: PipelineConfig) -> dict:
                             "static": chart_static},
             "oot_excel": oot_excels,
             "diagnostic_suite": diagnostic_suite_result,
+            # Quick-glance mirror of ERROR/CRITICAL lines logged so far this
+            # run. Routine warnings are intentionally excluded from reports.
+            # `execution.log` is always the complete, authoritative record;
+            # this is additive, never a replacement.
+            "incidents": list(incident_collector.records),
             "preprocessing": {
                 "numeric_transform": config.numeric_transform,
                 "categorical_encoding": config.categorical_encoding,
@@ -1697,6 +1771,11 @@ def run_pipeline(config: PipelineConfig) -> dict:
             )
 
     # -- Phase 12: final summary -------------------------------------------- #
+    # Detach the incident collector now that the report has already read it
+    # (Phase 11, above) -- nothing later needs it, and leaving it attached
+    # would let a second in-process `run_pipeline` call inherit this run's
+    # records.
+    logger.removeHandler(incident_collector)
     # Tear the dashboard down *before* printing: the summary is the one thing
     # that must survive in the scrollback, and a Live display owns the bottom
     # of the terminal until it is stopped.
@@ -1866,13 +1945,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         default=True,
                         help="Cross-validate this run's IF+VAE against the vendored, "
                              "optional IF-VAE Diagnostic Suite (tools/if_vae_diagnostic_suite; "
-                             "requires `pip install -e tools/if_vae_diagnostic_suite`, not a "
-                             "core dependency) and add the 'Diagnóstico cruzado IF-VAE' and "
+                             "auto-installed from that local path when needed) and add the "
+                             "'Diagnóstico cruzado IF-VAE' and "
                              "'Interpretación y recomendaciones' report chapters (default ON "
                              "as of 2026-09-05). Runs label-free -- see CONTEXT.md "
                              "\"IF-VAE Diagnostic Suite integration\". "
-                             "--no-run-diagnostic-suite skips it, e.g. if the package is not "
-                             "installed on this machine.")
+                             "--no-run-diagnostic-suite skips the whole phase.")
     parser.add_argument("--diagnostic-sensitivity-grid", type=float, nargs="*",
                         default=None, metavar="P",
                         help="Percentile thresholds (each in (0,1)) the diagnostic "
@@ -1889,6 +1967,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "stability (default 3). VAE refits are full training runs -- "
                              "this is the most expensive part of the diagnostic chapter. "
                              "Pass 0 to disable (reports UNAVAILABLE with a stated reason).")
+    parser.add_argument("--diagnostic-segment-column", type=str, default=None,
+                        help="Column in the raw panel used for the diagnostic chapter's "
+                             "per-segment breakdown (default 'segment'). Point this at any "
+                             "other categorical column your real panel carries, e.g. "
+                             "--diagnostic-segment-column region. Pass an empty string "
+                             "(--diagnostic-segment-column '') to disable the breakdown.")
+    parser.add_argument("--auto-install-suite", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Auto-install the vendored IF-VAE Diagnostic Suite "
+                             "(tools/if_vae_diagnostic_suite) into this environment if it "
+                             "is not already importable (default ON; always installs from "
+                             "this repo's own vendored copy, never from an index). "
+                             "--no-auto-install-suite requires it pre-installed instead.")
+    parser.add_argument("--diagnostic-experiment-contamination-grid", type=float, nargs="*",
+                        default=None, metavar="C",
+                        help="Isolation Forest contamination values swept for the "
+                             "diagnostic chapter's §9 'Variantes de contaminación' "
+                             "experiment (default 0.01 0.02 0.05; cheap, IF refits only). "
+                             "Pass with no values to disable.")
+    parser.add_argument("--diagnostic-experiment-capacity-grid", type=int, nargs="*",
+                        default=None, metavar="DIM",
+                        help="VAE latent_dim values swept for §9 'Capacidad y dimensión "
+                             "latente' (default: none, disabled). Each value is a FULL "
+                             "VAE retrain -- opt in explicitly, e.g. "
+                             "--diagnostic-experiment-capacity-grid 4 8 16.")
+    parser.add_argument("--diagnostic-experiment-beta-grid", type=float, nargs="*",
+                        default=None, metavar="BETA",
+                        help="VAE beta (KL weight) values swept for §9 'Beta y "
+                             "programación KL' (default: none, disabled). Each value is "
+                             "a FULL VAE retrain -- opt in explicitly.")
     parser.add_argument("--contamination", type=float, default=None,
                         help="Isolation Forest operating-point contamination, used by both "
                              "the tuned and untuned paths (default 0.02; must be in (0, 0.5]). "
@@ -1973,6 +2081,7 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         stack_iforest_into_vae=args.stack_iforest_into_vae,
         run_diagnostic_suite=args.run_diagnostic_suite,
         diagnostic_entity_view=args.diagnostic_entity_view,
+        diagnostic_auto_install_suite=args.auto_install_suite,
     )
     # Validated here rather than inside the diagnostic bridge: a malformed
     # grid should stop the run at argument-parsing time, not halfway through
@@ -1991,6 +2100,30 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         if args.diagnostic_stability_refits < 0:
             raise SystemExit("--diagnostic-stability-refits cannot be negative.")
         config.diagnostic_stability_refits = args.diagnostic_stability_refits
+    # `is not None` here too: an explicit empty string ("disable the
+    # breakdown") must override the "segment" default, and must be told
+    # apart from the flag never being passed at all.
+    if args.diagnostic_segment_column is not None:
+        config.diagnostic_segment_column = args.diagnostic_segment_column
+    if args.diagnostic_experiment_contamination_grid is not None:
+        grid = tuple(float(c) for c in args.diagnostic_experiment_contamination_grid)
+        if any(not 0.0 < c < 0.5 for c in grid):
+            raise SystemExit(
+                "--diagnostic-experiment-contamination-grid takes values in (0, 0.5)."
+            )
+        config.diagnostic_experiment_contamination_grid = grid
+    if args.diagnostic_experiment_capacity_grid is not None:
+        grid = tuple(int(d) for d in args.diagnostic_experiment_capacity_grid)
+        if any(d <= 0 for d in grid):
+            raise SystemExit(
+                "--diagnostic-experiment-capacity-grid takes positive integers."
+            )
+        config.diagnostic_experiment_capacity_grid = grid
+    if args.diagnostic_experiment_beta_grid is not None:
+        grid = tuple(float(b) for b in args.diagnostic_experiment_beta_grid)
+        if any(b <= 0 for b in grid):
+            raise SystemExit("--diagnostic-experiment-beta-grid takes positive values.")
+        config.diagnostic_experiment_beta_grid = grid
     # Both apply after construction so they override the dataclass's own
     # `default_factory` dict rather than requiring the CLI to rebuild it.
     if args.contamination is not None:

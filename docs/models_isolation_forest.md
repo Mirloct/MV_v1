@@ -5,8 +5,8 @@ This document covers the Isolation Forest anomaly detector shipped in
 how it consumes the preprocessing matrix, and how the Optuna tuning routine
 recovers from crashes.
 
-> Concept adapted from GeeksforGeeks, see
-> `geeksforgeeks_notes.md` (section 2, "Isolation Forest").
+> Las fuentes introductorias consultadas están indexadas en
+> `geeksforgeeks_notes.md`; esta guía aplica el concepto al código del proyecto.
 
 ---
 

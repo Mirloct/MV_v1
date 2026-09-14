@@ -2375,3 +2375,66 @@ qué revisar si a alguien localmente no le aparece el capítulo (paquete
 entrada en `_PHASE_PLAN`), `src/reporting/flow_visualization.py`
 (formateador JS + call site). Ningún modelo ni lógica de preprocesamiento
 se tocó.
+
+---
+
+## 2026-09-13/14 — Diagnóstico ejecutable, incidentes, segmentación configurable y dashboard por consenso
+
+**La suite dejó de exigir instalación manual.**
+`src/evaluation/ifvae_diagnostic.py::ensure_suite_installed` comprueba primero
+si `ifvae_diag` es importable. Si falta, ejecuta `pip install -e` exclusivamente
+sobre `tools/if_vae_diagnostic_suite` y añade su `src/` vendorizado a
+`sys.path`, porque `importlib.invalidate_caches()` no vuelve a procesar por sí
+solo los `.pth` creados durante el proceso actual. Se probaron los estados
+`already_installed`, `installed_now` y `not_attempted`; el nuevo
+`--no-auto-install-suite` permite validar sin instalar.
+
+**El apartado 8 acepta cualquier columna de segmentación.**
+`--diagnostic-segment-column NAME` reemplaza el antiguo `df["segment"]`
+hardcodeado. Cadena vacía desactiva la tabla; una columna ausente registra un
+warning y produce `NOT_APPLICABLE` sin ocultar la causa.
+
+**El apartado 9 ahora ejecuta experimentos reales.** Ensembles máximo/promedio
+y variantes de reconstrucción reutilizan resultados de la corrida;
+contaminación IF reajusta un forest por punto (`0.01 0.02 0.05` por defecto).
+Las mallas `--diagnostic-experiment-capacity-grid` y
+`--diagnostic-experiment-beta-grid` son opt-in porque cada punto reentrena el
+VAE. Las cinco familias que necesitan cambios de arquitectura,
+preprocesamiento o varias ventanas conservadas quedan `NOT_REQUESTED` con un
+motivo específico.
+
+**El reporte hace visibles los fallos, sin ensuciarse con warnings.**
+`main.py` importa `warnings` y ejecuta `warnings.filterwarnings("ignore")` para
+silenciar advertencias de Python/librerías. `IncidentCollector` captura solo
+ERROR/CRITICAL y los renderers filtran defensivamente cualquier WARNING que
+reciban. “Qué no se ejecutó o falló” aparece únicamente con fallos reales; los
+estados omitidos/no solicitados siguen explicados en §9.
+
+**Dashboard por relación entre detectores.** La cola ya no depende únicamente
+del export primario. Usa la unión P95 real y la divide en “Solo IF”, “Solo
+IF+VAE” e “Intersección”; percentiles, explicaciones y recurrencia se conservan
+por detector. El perfil incorpora un botón que genera un CSV UTF-8 con todas
+las filas OOT del individuo y todas las columnas originales, no solo las cinco
+variables explicativas.
+
+**Documentación depurada y orientada a públicos mixtos.**
+`docs/guia_practica.md` explica IF, VAE, stacking y percentiles OOT con ejemplos
+y diagramas Mermaid; documenta auto-instalación, segmentación y las mallas. El
+generador consolidado renderiza fences Mermaid mediante el cliente oficial CDN
+y deja la fuente legible sin red. `geeksforgeeks_notes.md` se redujo de una
+segunda explicación completa a un índice de fuentes, eliminando la redundancia
+con las guías temáticas.
+
+**Pruebas automatizadas:** 51/51 pasan. Son las 46 existentes, tres contratos
+del dashboard para la partición de pestañas, la retención de todas las
+filas/columnas OOT y los detalles por detector, y dos pruebas que aseguran que
+WARNING no llega a HTML/Markdown pero ERROR sí.
+
+**Tres iteraciones visuales Playwright (Chrome real, 1440×1000):** dashboard
+(16 Solo IF / 16 Solo IF+VAE / 10 Intersección, descarga CSV real de 22
+columnas), reporte (6 filas `EXECUTED`, sin sección de warnings) y documentación
+(3 Mermaid convertidos a SVG), todas con 0 errores JavaScript. La primera pasada
+descubrió y corrigió dos defectos que las pruebas textuales no veían: `\r\n`
+quedaba como un salto literal que invalidaba el script del dashboard, y el modal
+mostraba la clave interna `p2` en lugar del `entity_id`. Evidencia versionada en
+`docs/validation/2026-09-14/`.

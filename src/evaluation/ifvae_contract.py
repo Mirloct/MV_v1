@@ -725,25 +725,32 @@ def _section_temporal(temporal: dict, segmentation: dict) -> dict:
 
 
 def _section_experiments(experiments: Sequence[dict]) -> dict:
-    """§9 Matriz de experimentos: seguimiento, sin resultados inventados."""
+    """§9 Matriz de experimentos: las familias que son genuinamente baratas o
+    ya se calculan en otra parte se ejecutan de verdad para esta corrida
+    (Ensembles, variantes de reconstrucción siempre; contaminación IF por
+    defecto; capacidad/beta VAE si se configura una malla); las que
+    requieren tocar código de modelo/preprocesamiento o múltiples ventanas
+    temporales quedan `NOT_REQUESTED` con el motivo específico de cada una,
+    no una limitación genérica."""
     rows = [
         [e["experiment"], STATUS_LABELS.get(e["status"], e["status"]) + f" ({e['status']})",
-         e.get("run_id") or NO_VALUE_TEXT, e.get("configuration") or NO_VALUE_TEXT,
-         e.get("artifact") or NO_VALUE_TEXT, e.get("date") or NO_VALUE_TEXT,
-         e.get("reason") or ""]
+         e.get("detail") or NO_VALUE_TEXT, e.get("configuration") or NO_VALUE_TEXT,
+         e.get("artifact") or NO_VALUE_TEXT, e.get("reason") or ""]
         for e in experiments
     ]
     return _section("experiments", "9. Experimentos diagnósticos", [
         _table_block(
-            ["Experimento", "Estado", "Identificador de corrida", "Configuración",
-             "Artefacto", "Fecha", "Motivo de no ejecución"],
+            ["Experimento", "Estado", "Resultado", "Configuración",
+             "Artefacto", "Motivo de no ejecución"],
             rows,
             caption="Familias tomadas de la matriz de experimentos de la suite "
-                    "diagnóstica (evidence/EXPERIMENT_MATRIX.md). Ninguna se "
-                    "ejecuta hoy: este pipeline no lleva un registro de "
-                    "corridas por variante del que leer su estado -- "
-                    "implementarlo es trabajo pendiente, no una limitación "
-                    "oculta.",
+                    "diagnóstica (evidence/EXPERIMENT_MATRIX.md). Se ejecutan "
+                    "las que son baratas o ya se calculan en otra sección de "
+                    "esta misma corrida (Ensembles, variantes de "
+                    "reconstrucción, contaminación IF); las que exigen tocar "
+                    "código de modelo o preprocesamiento, o comparar entre "
+                    "múltiples ventanas OOT que esta corrida no conserva, "
+                    "quedan NOT_REQUESTED con el motivo puntual de cada una.",
             empty_text="No se declararon experimentos.",
         ),
     ])

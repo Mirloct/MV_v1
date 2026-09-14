@@ -1,14 +1,16 @@
 """Regenerate docs/documentation.html from the project's markdown docs.
 
-Consolidates README.md, CONTEXT.md, and docs/*.md into a single, offline,
-self-contained HTML file with a sidebar table of contents. No third-party
+Consolidates README.md, CONTEXT.md, and the maintained docs/*.md guides into
+a single HTML file with a sidebar table of contents. No third-party Python
 markdown library is used (none is a project dependency) — this module
 implements a small hand-written converter for the subset of Markdown these
 files actually use: ATX headings (#..######), paragraphs, bullet/numbered
 lists (incl. "- [x] "/"- [ ] " checklists), fenced code blocks, inline code,
 bold/italic, links, tables, blockquotes, horizontal rules, and "$$...$$"
 LaTeX math blocks (rendered as preformatted text, matching the approach
-already used by src/reporting/report.py for its offline HTML output).
+already used by src/reporting/report.py for its offline HTML output), and
+Mermaid fences. Mermaid source remains readable if the optional CDN renderer
+is unavailable; when online it is upgraded to SVG in the browser.
 
 Usage (from the project root):
 
@@ -34,6 +36,7 @@ DOCS: list[tuple[str, str, str]] = [
     ("README.md", "readme", "README.md"),
     ("CONTEXT.md", "context", "CONTEXT.md"),
     ("CHANGELOG.md", "changelog", "CHANGELOG.md"),
+    ("docs/guia_practica.md", "guia-practica", "docs/guia_practica.md"),
     ("docs/leakage_free_pipeline.md", "leakage-free-pipeline",
      "docs/leakage_free_pipeline.md"),
     ("docs/escalamiento_lineal.md", "escalamiento-lineal",
@@ -50,7 +53,7 @@ DOCS: list[tuple[str, str, str]] = [
     ("docs/interpretability_and_reporting.md", "interpretability-reporting",
      "docs/interpretability_and_reporting.md"),
     ("docs/geeksforgeeks_notes.md", "geeksforgeeks-references",
-     "docs/geeksforgeeks_notes.md"),
+     "docs/geeksforgeeks_notes.md (fuentes)"),
 ]
 
 # Markdown link targets (as they literally appear in the source files) that
@@ -227,8 +230,11 @@ def render_blocks(lines: list[str], doc_id: str) -> tuple[str, list[tuple[int, s
                 i += 1
             i += 1  # skip closing fence
             code_html = html.escape("\n".join(code_lines))
-            cls = f' class="language-{html.escape(lang)}"' if lang else ""
-            out.append(f"<pre><code{cls}>{code_html}</code></pre>")
+            if lang.lower() == "mermaid":
+                out.append(f'<pre class="mermaid">{code_html}</pre>')
+            else:
+                cls = f' class="language-{html.escape(lang)}"' if lang else ""
+                out.append(f"<pre><code{cls}>{code_html}</code></pre>")
             continue
 
         # Multi-line "$$ ... $$" math block.
@@ -435,6 +441,8 @@ tr:nth-child(even) td { background: var(--bg-soft); }
 pre { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 4px;
       padding: .8rem; overflow-x: auto; font-size: .88rem; }
 pre.math { background: var(--math-bg); border-color: var(--math-border); font-style: italic; }
+.mermaid { background: var(--bg-page); border: 1px solid var(--border); text-align: center;
+           padding: 1.2rem; white-space: pre-wrap; }
 code { background: var(--bg-soft); padding: .1rem .35rem; border-radius: 3px;
        font-family: Consolas, "Courier New", monospace; font-size: .9em; }
 pre code { background: none; padding: 0; }
@@ -523,6 +531,8 @@ def build_documentation_html(project_root: Path) -> str:
         sections_html,
         "</main>",
         "</div>",
+        '<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>',
+        "<script>if(window.mermaid){mermaid.initialize({startOnLoad:true,securityLevel:'strict',theme:'default'});}</script>",
         f"<script>{_THEME_TOGGLE_JS}</script>",
         "</body></html>",
     ]

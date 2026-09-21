@@ -60,6 +60,13 @@ __all__ = [
     "RUN_EVENTS_LOG",
     "FLOW_VISUALIZATION_DEFAULT",
     "ANALYST_DASHBOARD_DEFAULT",
+    "SENSITIVITY_HTML_DEFAULT",
+    "SENSITIVITY_WORKBOOK_DEFAULT",
+    "SENSITIVITY_SCENARIOS_CSV",
+    "SENSITIVITY_VARIABLES_CSV",
+    "SENSITIVITY_MATRIX_CSV",
+    "SENSITIVITY_HIGH_ZERO_CSV",
+    "SENSITIVITY_SUMMARY_JSON",
 ]
 
 # -- roots ------------------------------------------------------------------ #
@@ -144,6 +151,13 @@ FLOW_VISUALIZATION_DEFAULT = os.path.join(REPORTS_DIR, "flow_visualization.html"
 # same individual side by side, so there is exactly one file regardless of
 # `--stack-iforest-into-vae` -- see `src/reporting/analyst_dashboard.py`.
 ANALYST_DASHBOARD_DEFAULT = os.path.join(REPORTS_DIR, "analyst_dashboard.html")
+SENSITIVITY_HTML_DEFAULT = os.path.join(REPORTS_DIR, "sensitivity_analysis.html")
+SENSITIVITY_WORKBOOK_DEFAULT = os.path.join(REPORTS_DIR, "sensitivity_analysis.xlsx")
+SENSITIVITY_SCENARIOS_CSV = os.path.join(REPORTS_DIR, "sensitivity_scenarios.csv")
+SENSITIVITY_VARIABLES_CSV = os.path.join(REPORTS_DIR, "sensitivity_variables.csv")
+SENSITIVITY_MATRIX_CSV = os.path.join(REPORTS_DIR, "sensitivity_matrix.csv")
+SENSITIVITY_HIGH_ZERO_CSV = os.path.join(REPORTS_DIR, "sensitivity_high_zero_records.csv")
+SENSITIVITY_SUMMARY_JSON = os.path.join(REPORTS_DIR, "sensitivity_summary.json")
 
 # -- observability ------------------------------------------------------------ #
 # Structured JSON-Lines event stream (src/utils/observability.py); the source

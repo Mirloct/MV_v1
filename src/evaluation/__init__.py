@@ -22,6 +22,7 @@ from src.evaluation.oot_report import (
     months_present_by_entity,
 )
 from src.evaluation.scoring import build_scored_frame
+from src.evaluation.sensitivity import run_post_training_sensitivity
 from src.evaluation.splits import (
     ChronologicalSplit,
     chronological_split,
@@ -59,4 +60,5 @@ __all__ = [
     "plot_embedding",
     "plot_roc_pr",
     "run_ifvae_diagnostic_suite",
+    "run_post_training_sensitivity",
 ]

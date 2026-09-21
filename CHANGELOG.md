@@ -2438,3 +2438,62 @@ descubrió y corrigió dos defectos que las pruebas textuales no veían: `\r\n`
 quedaba como un salto literal que invalidaba el script del dashboard, y el modal
 mostraba la clave interna `p2` en lugar del `entity_id`. Evidencia versionada en
 `docs/validation/2026-09-14/`.
+
+---
+
+## 2026-09-17 — Gestión de casos, historial completo y sensibilidad post-entrenamiento
+
+**Dashboard del analista.** La descarga individual dejó de recibir solo el
+bloque OOT: ahora incorpora todas las filas y columnas disponibles de la
+entidad. Se agregó el identificador configurable `puesto` bajo el ID, estados
+persistentes `Sin revisión` / `En revisión` / `Cerrado`, la vista dinámica
+“Casos revisados” y su CSV con fecha/hora del último cambio. Las explicaciones
+IF ya no se leen de la exportación P90 filtrada sino del frame OOT explicado
+completo; así, una entidad seleccionada por VAE con IF <P90 conserva sus
+variables IF en el perfil.
+
+**Sensibilidad post-entrenamiento (Fase 9d).** Nuevo módulo
+`src/evaluation/sensitivity.py`, activado por defecto. Reutiliza el
+preprocesador y los detectores ya ajustados y prueba, sin refit: ablación
+neutral por variable, null, cero cuando corresponde, pares de variables,
+niveles aleatorios de pérdida de información y poda acumulativa. Compara
+variación porcentual/dirección del score, correlación de rangos, Jaccard top
+10%, cambio de alertas y métricas post-label. La matriz/ranking clasifica
+variables indispensables, intermedias y marginales.
+
+Los registros con ≥90% de entradas cero/faltantes se analizan por score, CDF,
+alerta, label, variables críticas, prueba KS y performance antes/después de
+excluirlos. Las reglas explícitas producen una recomendación de conservar en
+train/test, reservar para prueba/monitoreo o excluir en futuras evaluaciones.
+Se generan HTML interactivo, Excel multih hoja, cuatro CSV y JSON, todos
+enlazados desde el reporte principal.
+
+**Verificación:** compilación de los módulos modificados; 5/5 pruebas focales
+(`test_analyst_dashboard` + `test_sensitivity`) pasan; JavaScript generado del
+dashboard validado con Node (`new Function`) sin errores. La ejecución focal
+de sensibilidad confirmó 15 escenarios × 2 modelos, el libro/CSV/JSON/HTML y
+el caso sintético con 100% de información cero.
+
+## 2026-09-20 — Filtro de filas en cero exacto (Fase 2)
+
+`src/data/loader.py::drop_exact_zero_rows`, invocado en la Fase 2 de
+`main.py` justo después de cargar el panel y **antes** de cualquier split,
+ajuste, umbral, exportación, dashboard o reporte. Elimina toda fila con al
+menos `--exact-zero-row-cutoff` (default 0.90) de sus columnas numéricas/
+booleanas en 0 exacto. Los faltantes (`NaN`) no cuentan como cero, y las
+columnas categóricas, las llaves y el target quedan fuera del denominador
+(con 8 de 20 entradas categóricas, ninguna fila podría superar 60%).
+
+Se registra en `execution.log`: `Filtro de filas en cero exacto: N/M filas
+(x%) ... quedan K filas`, seguido de la línea `Panel: K rows ...`, más la
+estadística "Filas excluidas (cero exacto)" en la consola. Es una exclusión
+real; el análisis de la Fase 9d (`--sensitivity-high-zero-cutoff`) sigue
+siendo solo una medición post-entrenamiento que no retira filas.
+
+El reporte (MD y HTML) incluye la sección "Filtro de filas en cero exacto" con
+registros cargados, excluidos y que entran al flujo.
+
+**Verificación:** 8 pruebas (`tests/test_zero_row_filter.py`) y corrida
+`--quick` sobre el panel sintético con 60 filas inyectadas en cero (50 en
+100%, 10 en 12/13 columnas) más 10 en 11/13 que debían sobrevivir:
+`60/6000 filas (1.0%) ... quedan 5940 filas`.

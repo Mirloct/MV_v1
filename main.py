@@ -137,6 +137,12 @@ class PipelineConfig:
     # one-off or a recurring case across the window, which the last-3-months
     # analyst dashboard depends on. `--n-oot-periods` overrides.
     n_oot_periods: int = 3
+    # Extra identification field displayed directly below the entity ID in
+    # the analyst profile.  It is deliberately configurable because real
+    # panels may use a different source-column name; the business default is
+    # ``puesto``.  A missing column is rendered explicitly as "No disponible"
+    # and never prevents the dashboard from being generated.
+    analyst_identity_column: str = "puesto"
     # Headline deliverable: everyone at or above this percentile of the OOT
     # score distribution, each row graded p90/p95/p99 so the queue can be
     # triaged. A percentile rather than a fixed headcount because the cut then
@@ -210,6 +216,21 @@ class PipelineConfig:
     diagnostic_experiment_contamination_grid: tuple = (0.01, 0.02, 0.05)
     diagnostic_experiment_capacity_grid: tuple = ()
     diagnostic_experiment_beta_grid: tuple = ()
+    # Post-training robustness analysis. It reuses the already fitted
+    # preprocessor and detectors (never refits) and introduces labels only for
+    # post-hoc performance comparison when they exist.
+    run_sensitivity_analysis: bool = True
+    sensitivity_max_test_rows: int = 5000
+    sensitivity_combination_top_k: int = 6
+    sensitivity_random_subsets_per_level: int = 5
+    sensitivity_missing_levels: tuple = (0.10, 0.25, 0.50, 0.75, 0.90)
+    sensitivity_high_zero_cutoff: float = 0.90
+    # Hard, pre-split exclusion (Phase 2): rows where at least this share of
+    # input columns are an exact 0 are dropped from `df` itself, before any
+    # split, fit, or export -- see the "exact-zero row filter" block above.
+    # Distinct from `sensitivity_high_zero_cutoff`, which only studies such
+    # rows post-hoc without removing them.
+    exact_zero_row_cutoff: float = 0.90
     data_path: str = DATA_PATH
     # P95 checkpoint gate (Phase 6c, between the Isolation Forest fit and the
     # VAE layer): percentile of the in-time score distribution above which a
@@ -411,8 +432,14 @@ def run_pipeline(config: PipelineConfig) -> dict:
     figures: list = []
     oot_excels: dict = {}
     deliverable_tables: dict = {}
+    # One representative, explained OOT row per entity and detector.  Unlike
+    # ``deliverable_tables`` these are not P90/P95 filtered: the dashboard's
+    # P95 union can contain a VAE-only entity below IF's export threshold (or
+    # vice versa), and its profile must still show both detectors' variables.
+    dashboard_explanation_tables: dict = {}
     analyst_dashboard_path: Optional[str] = None
     diagnostic_suite_result: Optional[dict] = None
+    sensitivity_result: Optional[dict] = None
     model_specs: dict = {}
     chart_data: dict = {"models": {}}
     # Numeric payloads behind the charts that used to be embedded PNGs. The
@@ -442,13 +469,25 @@ def run_pipeline(config: PipelineConfig) -> dict:
 
     # -- Phase 2: data ------------------------------------------------------ #
     with log_phase("Phase 2: data load/generate"):
-        from src.data import load_or_generate_panel
+        from src.data import drop_exact_zero_rows, load_or_generate_panel
 
         df, schema = load_or_generate_panel(
             data_path=config.data_path,
             n_individuals=config.n_individuals,
             n_periods=config.n_periods,
             seed=config.seed,
+        )
+        # -- exact-zero row filter ------------------------------------------- #
+        # Hard exclusion, applied to `df` itself before the chronological
+        # split, any fit, and every export: a row whose input columns are
+        # (almost) all a literal 0 is nearly empty, so both detectors would
+        # score it as extreme (or trivially normal) for that reason alone.
+        # Unlike the post-training `sensitivity_high_zero_cutoff` study in
+        # Phase 9d -- which only *measures* such rows' effect on fitted
+        # models -- this removes them, so nothing downstream ever sees them.
+        # The helper logs rows before / dropped / after to execution.log.
+        df, zero_filter_stats = drop_exact_zero_rows(
+            df, schema, logger, cutoff=config.exact_zero_row_cutoff,
         )
         entity_col = schema.entity_col or "entity_id"
         time_col = schema.time_col or "period"
@@ -462,6 +501,9 @@ def run_pipeline(config: PipelineConfig) -> dict:
         console_ui.set_stat("Filas", f"{df.shape[0]:,}")
         console_ui.set_stat("Entidades", f"{n_entities:,}")
         console_ui.set_stat("Períodos", f"{n_periods:,}")
+        console_ui.set_stat(
+            "Filas excluidas (cero exacto)", f"{zero_filter_stats['n_rows_dropped']:,}"
+        )
 
         # -- official vs development run ------------------------------------ #
         # A run on generated data is a rehearsal, not the real thing. Its tuned
@@ -620,7 +662,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         # features are still computed over the whole panel -- see the
         # `fit_transform_panel` docstring for why the naive alternative would
         # zero out every lag on exactly the OOT rows.
-        X, keys, feature_names = fit_transform_panel(
+        X, keys, feature_names, fitted_preprocessor = fit_transform_panel(
             df,
             schema,
             fit_mask=train_mask,
@@ -630,6 +672,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             impute_numeric=config.impute_numeric,
             add_panel_features=config.panel_features,
             random_state=config.seed,
+            return_pipeline=True,
         )
         n_features = len(feature_names)
         console_ui.set_stat("Features", f"{n_features:,}")
@@ -864,6 +907,12 @@ def run_pipeline(config: PipelineConfig) -> dict:
                             if_detector, X_if[oot_mask], feature_names=names_if,
                         )
                         if_scored_df.loc[oot_mask, "top_5_variables"] = top_vars
+                        dashboard_explanation_tables["iforest"] = (
+                            if_scored_df.loc[oot_mask]
+                            .sort_values("anomaly_score", ascending=False)
+                            .drop_duplicates(schema.entity_col or "entity_id", keep="first")
+                            .reset_index(drop=True)
+                        )
                 except Exception as exc:  # noqa: BLE001 - never block this export
                     logger.warning(
                         "[iforest] per-row explanation for the OOT validation "
@@ -1269,6 +1318,12 @@ def run_pipeline(config: PipelineConfig) -> dict:
                                 categorical_columns=categorical_columns,
                             )
                         scored_df.loc[oot_row_mask, "top_5_variables"] = top_vars
+                        dashboard_explanation_tables[name] = (
+                            scored_df.loc[oot_row_mask]
+                            .sort_values("anomaly_score", ascending=False)
+                            .drop_duplicates(schema.entity_col or "entity_id", keep="first")
+                            .reset_index(drop=True)
+                        )
                         logger.info(
                             "[%s] per-row top-5 explanation computed for %d OOT row(s).",
                             name, int(oot_row_mask.sum()),
@@ -1412,16 +1467,18 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     dash_scored_df, schema, oot_periods, cutoff=dash_cutoff,
                     score_col=dash_score_col,
                 )
-            raw_oot_records = df.loc[df[time_col].isin(oot_periods)].copy()
-
             dashboard_path = build_analyst_dashboard(
                 deliverable_tables[primary_name], schema, primary_name, oot_periods,
                 if_percentiles, vae_percentiles,
                 if_scores_by_entity, vae_scores_by_entity, months_by_model[primary_name],
                 n_total_oot=len(primary_scores_by_entity), score_col=dash_score_col,
-                model_tables=deliverable_tables,
+                model_tables={
+                    name: dashboard_explanation_tables.get(name, export_table)
+                    for name, export_table in deliverable_tables.items()
+                },
                 months_present_by_model=months_by_model,
-                oot_records=raw_oot_records,
+                entity_records=df,
+                identity_column=config.analyst_identity_column,
             )
             analyst_dashboard_path = dashboard_path
             _dash_ok = os.path.isfile(dashboard_path) and os.path.getsize(dashboard_path) > 0
@@ -1567,6 +1624,65 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     "IF-VAE diagnostic suite failed (%s); the report chapter for it "
                     "will be omitted. Review the auto-install result and vendored "
                     "suite path in execution.log.", exc,
+                )
+
+    # -- Phase 9d: post-training sensitivity and data-quality stress test --- #
+    # Reuses the fitted preprocessor and fitted detectors. Labels are allowed
+    # here even for an unsupervised training run because they are consumed only
+    # after fitting to assess hit/miss degradation; they never influence a
+    # scenario, transformation, threshold or score.
+    if config.run_sensitivity_analysis:
+        with log_phase("Phase 9d: post-training sensitivity analysis"):
+            try:
+                from src.evaluation import run_post_training_sensitivity
+
+                sensitivity_result = run_post_training_sensitivity(
+                    df=df,
+                    schema=schema,
+                    preprocessor=fitted_preprocessor,
+                    feature_names=feature_names,
+                    models={name: spec[0] for name, spec in models.items()},
+                    baseline_scores={name: spec[1] for name, spec in models.items()},
+                    thresholds={
+                        name: model_specs[name]["threshold"]["threshold"]
+                        for name in models
+                    },
+                    train_mask=train_mask,
+                    test_mask=test_mask,
+                    labels=(labels if n_pos > 0 else None),
+                    stack_context=(
+                        {"detector": stack_detector, "scaler": stacked.scaler}
+                        if config.stack_iforest_into_vae else None
+                    ),
+                    max_test_rows=config.sensitivity_max_test_rows,
+                    combination_top_k=config.sensitivity_combination_top_k,
+                    random_subsets_per_level=config.sensitivity_random_subsets_per_level,
+                    missing_levels=config.sensitivity_missing_levels,
+                    high_zero_cutoff=config.sensitivity_high_zero_cutoff,
+                    random_state=config.seed,
+                    out_dir=REPORTS_DIR,
+                )
+                _sens_artifacts = sensitivity_result.get("artifacts", {})
+                _sens_ok = all(
+                    path and os.path.isfile(path) and os.path.getsize(path) > 0
+                    for path in _sens_artifacts.values()
+                )
+                observability.check(
+                    name="artifact.sensitivity_analysis_written", category="artifact",
+                    definition="Post-training sensitivity workbook, tables, summary and "
+                               "interactive report exist and are non-empty.",
+                    expected="all sensitivity artifacts exist and size_bytes > 0",
+                    severity="warning", passed=_sens_ok,
+                    observed={"artifacts": _sens_artifacts,
+                              "required_variables": sensitivity_result.get("required_variables")},
+                    failure_action="Review Phase 9d logs; fitted models and OOT deliverables "
+                                   "remain valid but robustness conclusions are unavailable.",
+                    evidence=REPORTS_DIR,
+                )
+            except Exception as exc:  # noqa: BLE001 - never invalidate fitted models
+                logger.warning(
+                    "Post-training sensitivity analysis failed (%s); fitted models, "
+                    "OOT deliverables and the analyst dashboard remain available.", exc,
                 )
 
     # -- Phase 10: interpretability, AFTER every Excel deliverable ---------- #
@@ -1718,11 +1834,13 @@ def run_pipeline(config: PipelineConfig) -> dict:
                             "static": chart_static},
             "oot_excel": oot_excels,
             "diagnostic_suite": diagnostic_suite_result,
+            "sensitivity_analysis": sensitivity_result,
             # Quick-glance mirror of ERROR/CRITICAL lines logged so far this
             # run. Routine warnings are intentionally excluded from reports.
             # `execution.log` is always the complete, authoritative record;
             # this is additive, never a replacement.
             "incidents": list(incident_collector.records),
+            "row_filter": zero_filter_stats,
             "preprocessing": {
                 "numeric_transform": config.numeric_transform,
                 "categorical_encoding": config.categorical_encoding,
@@ -1731,6 +1849,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 "threshold_method": config.threshold_method,
                 "threshold_percentile": config.threshold_percentile,
                 "threshold_target_far": config.threshold_target_far,
+                "post_training_sensitivity": config.run_sensitivity_analysis,
             },
             "notes": (
                 f"Entregables Excel "
@@ -1787,6 +1906,9 @@ def run_pipeline(config: PipelineConfig) -> dict:
         "ifvae_diagnostic_report": (
             diagnostic_suite_result["report_md_path"] if diagnostic_suite_result else None
         ),
+        "sensitivity_analysis": (
+            sensitivity_result.get("artifacts", {}) if sensitivity_result else {}
+        ),
         "p95_checkpoint": p95_path,
         "attribution_workbook": attribution_path,
         "reports": report_paths,
@@ -1802,6 +1924,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         f"  OOT Excel(s)   : {', '.join(oot_excels.values()) or '(none)'}",
         f"  Analyst dashboard: {analyst_dashboard_path or '(none)'}",
         f"  IF-VAE diagnostic suite: {artifacts['ifvae_diagnostic_report'] or '(not run)'}",
+        f"  Sensitivity analysis: {artifacts['sensitivity_analysis'].get('html', '(not run)')}",
         f"  Feature attribution (xlsx): {attribution_path}",
         f"  Report (html)  : {report_paths.get('html')}",
         f"  Report (md)    : {report_paths.get('md')}",
@@ -1997,6 +2120,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="VAE beta (KL weight) values swept for §9 'Beta y "
                              "programación KL' (default: none, disabled). Each value is "
                              "a FULL VAE retrain -- opt in explicitly.")
+    parser.add_argument("--run-sensitivity-analysis", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Run the post-training variable/data-quality sensitivity study "
+                             "without refitting either detector (default ON).")
+    parser.add_argument("--sensitivity-max-test-rows", type=int, default=5000,
+                        help="Maximum test records sampled for perturbation scoring "
+                             "(default 5000; full entity histories are retained).")
+    parser.add_argument("--sensitivity-combination-top-k", type=int, default=6,
+                        help="Highest-leverage variables used for pairwise-removal scenarios "
+                             "(default 6).")
+    parser.add_argument("--sensitivity-random-subsets", type=int, default=5,
+                        help="Random variable subsets per missing-information level for the "
+                             "fan chart (default 5).")
+    parser.add_argument("--sensitivity-missing-levels", type=float, nargs="*", default=None,
+                        metavar="P",
+                        help="Fractions of inputs removed/zeroed in data-quality stress tests "
+                             "(default 0.10 0.25 0.50 0.75 0.90).")
+    parser.add_argument("--sensitivity-high-zero-cutoff", type=float, default=0.90,
+                        help="Record-level share of zero-or-missing inputs used for the "
+                             "exclusion analysis (default 0.90).")
+    parser.add_argument("--exact-zero-row-cutoff", type=float, default=0.90,
+                        help="Record-level share of input columns that must be an exact 0 "
+                             "for the row to be dropped from the panel before the split, "
+                             "fitting, and every downstream artifact (default 0.90).")
     parser.add_argument("--contamination", type=float, default=None,
                         help="Isolation Forest operating-point contamination, used by both "
                              "the tuned and untuned paths (default 0.02; must be in (0, 0.5]). "
@@ -2023,6 +2170,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Trailing months reserved AFTER test, exclusively for the OOT "
                              "Excel deliverable -- never used for fitting, tuning, threshold "
                              "calibration, or test-set metrics (default 3: the last 3 months).")
+    parser.add_argument("--analyst-identity-column", type=str, default="puesto",
+                        help="Source column shown below the entity ID in the analyst profile "
+                             "(default 'puesto'). Missing values are shown as unavailable.")
     parser.add_argument("--threshold-method", default="pot", choices=["pot", "percentile"],
                         help="Threshold calibration on validation scores (default 'pot').")
     parser.add_argument("--threshold-percentile", type=float, default=99.0,
@@ -2075,6 +2225,7 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         n_val_periods=args.n_val_periods,
         n_test_periods=args.n_test_periods,
         n_oot_periods=args.n_oot_periods,
+        analyst_identity_column=args.analyst_identity_column,
         threshold_method=args.threshold_method,
         threshold_percentile=args.threshold_percentile,
         threshold_target_far=args.threshold_target_far,
@@ -2082,6 +2233,12 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         run_diagnostic_suite=args.run_diagnostic_suite,
         diagnostic_entity_view=args.diagnostic_entity_view,
         diagnostic_auto_install_suite=args.auto_install_suite,
+        run_sensitivity_analysis=args.run_sensitivity_analysis,
+        sensitivity_max_test_rows=args.sensitivity_max_test_rows,
+        sensitivity_combination_top_k=args.sensitivity_combination_top_k,
+        sensitivity_random_subsets_per_level=args.sensitivity_random_subsets,
+        sensitivity_high_zero_cutoff=args.sensitivity_high_zero_cutoff,
+        exact_zero_row_cutoff=args.exact_zero_row_cutoff,
     )
     # Validated here rather than inside the diagnostic bridge: a malformed
     # grid should stop the run at argument-parsing time, not halfway through
@@ -2124,6 +2281,21 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         if any(b <= 0 for b in grid):
             raise SystemExit("--diagnostic-experiment-beta-grid takes positive values.")
         config.diagnostic_experiment_beta_grid = grid
+    if args.sensitivity_max_test_rows <= 0:
+        raise SystemExit("--sensitivity-max-test-rows must be positive.")
+    if args.sensitivity_combination_top_k < 2:
+        raise SystemExit("--sensitivity-combination-top-k must be at least 2.")
+    if args.sensitivity_random_subsets <= 0:
+        raise SystemExit("--sensitivity-random-subsets must be positive.")
+    if not 0.0 < args.sensitivity_high_zero_cutoff <= 1.0:
+        raise SystemExit("--sensitivity-high-zero-cutoff must be in (0, 1].")
+    if not 0.0 < args.exact_zero_row_cutoff <= 1.0:
+        raise SystemExit("--exact-zero-row-cutoff must be in (0, 1].")
+    if args.sensitivity_missing_levels is not None:
+        levels = tuple(float(p) for p in args.sensitivity_missing_levels)
+        if any(not 0.0 < p <= 1.0 for p in levels):
+            raise SystemExit("--sensitivity-missing-levels values must be in (0, 1].")
+        config.sensitivity_missing_levels = levels
     # Both apply after construction so they override the dataclass's own
     # `default_factory` dict rather than requiring the CLI to rebuild it.
     if args.contamination is not None:

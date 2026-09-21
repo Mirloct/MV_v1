@@ -17,9 +17,10 @@ categorization is invented over `top_5_variables`.
 
 One dashboard, not one per model: both detector percentiles are shown for
 every individual in the union of both P95 queues. Three tabs make agreement
-explicit: only IF, only IF+VAE, and their intersection. The detail view also
-embeds the selected individual's complete raw OOT rows for an offline CSV
-download; every value remains tied to its original period.
+explicit: only IF, only IF+VAE, and their intersection. The detail view embeds
+the selected individual's complete raw history (every available source row
+and column) for an offline CSV download. Case-review state is maintained in
+the browser so this self-contained HTML can be used without a backend.
 """
 
 from __future__ import annotations
@@ -86,6 +87,8 @@ def build_analyst_dashboard(
     model_tables: Optional[dict[str, pd.DataFrame]] = None,
     months_present_by_model: Optional[dict[str, dict]] = None,
     oot_records: Optional[pd.DataFrame] = None,
+    entity_records: Optional[pd.DataFrame] = None,
+    identity_column: str = "puesto",
 ) -> str:
     """Render the single, unified analyst review-queue dashboard.
 
@@ -117,9 +120,13 @@ def build_analyst_dashboard(
             tabs retain each model's own top-variable explanation.
         months_present_by_model: Per-detector recurrence maps. When omitted,
             the legacy ``months_present`` map is assigned to the base model.
-        oot_records: Raw OOT rows, with every source column. Only records for
-            entities in the P95 review union are embedded; the profile modal
-            downloads them as a CSV without reducing the source columns.
+        oot_records: Deprecated backwards-compatible alias for
+            ``entity_records``.
+        entity_records: Complete raw panel. Every available row and source
+            column for entities in the P95 review union is embedded so the
+            profile download covers full history, not only OOT.
+        identity_column: Source column displayed below the entity ID in the
+            profile. Defaults to the configured business field ``"puesto"``.
         out_path: Destination ``.html``. Defaults to
             ``artifacts/reports/analyst_dashboard.html``.
 
@@ -161,17 +168,31 @@ def build_analyst_dashboard(
         ),
     )
 
-    raw_by_entity: dict[str, list[dict]] = {}
-    oot_columns: list[str] = []
-    if oot_records is not None and entity_col in oot_records.columns:
-        oot_columns = [str(c) for c in oot_records.columns]
+    source_records = entity_records if entity_records is not None else oot_records
+    records_by_entity: dict[str, list[dict]] = {}
+    record_columns: list[str] = []
+    if source_records is not None and entity_col in source_records.columns:
+        record_columns = [str(c) for c in source_records.columns]
         wanted = set(entity_ids)
-        raw = oot_records.loc[oot_records[entity_col].astype(str).isin(wanted)].copy()
+        raw = source_records.loc[source_records[entity_col].astype(str).isin(wanted)].copy()
+        time_col = schema.time_col or "period"
+        if time_col in raw.columns:
+            # Stable chronological order makes both the downloaded history
+            # and the "latest puesto" rule deterministic.
+            raw = raw.sort_values([entity_col, time_col], kind="stable")
         # pandas' JSON encoder handles Timestamp/numpy scalars and emits null
         # for NaN, producing a safe, exact-enough browser payload.
         safe_rows = json.loads(raw.to_json(orient="records", date_format="iso", force_ascii=False))
         for original_id, safe_row in zip(raw[entity_col].astype(str), safe_rows):
-            raw_by_entity.setdefault(original_id, []).append(safe_row)
+            records_by_entity.setdefault(original_id, []).append(safe_row)
+
+    def _identity_for(eid: str) -> str:
+        """Return the latest non-empty configured identity value."""
+        for row in reversed(records_by_entity.get(eid, [])):
+            value = row.get(identity_column)
+            if value is not None and str(value).strip():
+                return str(value)
+        return ""
 
     counts = {"if_only": 0, "vae_only": 0, "intersection": 0}
     recurrent_counts = {"if_only": 0, "vae_only": 0, "intersection": 0}
@@ -210,6 +231,7 @@ def build_analyst_dashboard(
 
         row_html_list.append(f"""
         <tr data-id="{safe_eid}" data-tab="{tab}" data-profile="{profile_key}"
+            data-case-status="sin_revision"
             onclick="openProfile('{profile_key}')" tabindex="0"
             onkeypress="if(event.key==='Enter')openProfile('{profile_key}')">
           <td class="idx">{i}</td>
@@ -222,17 +244,29 @@ def build_analyst_dashboard(
             <span class="mcount mcount-{sev}">{months_count}/{n_months}</span>
             <span class="mdots">{_month_dots_html(present, all_periods, sev)}</span>
           </td>
+          <td class="casecell" onclick="event.stopPropagation()">
+            <select class="case-select status-sin_revision" data-profile="{profile_key}"
+                    aria-label="Estado del caso {safe_eid}"
+                    onkeydown="event.stopPropagation()"
+                    onchange="changeCaseStatus('{profile_key}',this.value,event)">
+              <option value="sin_revision">Sin revisión</option>
+              <option value="en_revision">En revisión</option>
+              <option value="cerrado">Cerrado</option>
+            </select>
+            <small class="case-date" data-case-date="{profile_key}">&mdash;</small>
+          </td>
         </tr>""")
 
         profiles[profile_key] = {
             "id": eid, "band": band,
+            "identity": _identity_for(eid),
             "tab": tab,
             "if_score": if_score, "vae_score": vae_score,
             "if_pctl": if_pctl, "vae_pctl": vae_pctl,
             "months": present, "months_count": months_count,
             "if_months": if_months, "vae_months": vae_months,
             "if_top5": if_top5, "vae_top5": vae_top5,
-            "oot_records": raw_by_entity.get(eid, []),
+            "records": records_by_entity.get(eid, []),
         }
 
     rows_html = "\n".join(row_html_list)
@@ -289,11 +323,13 @@ def build_analyst_dashboard(
           <div class="panel-title">Individuos priorizados<span class="hint">clic en una fila &rarr; perfil completo</span></div>
           <span class="badge" id="rowCountBadge">mostrando {n_rows:,} de {n_total_oot:,}</span>
         </div>
-        <p class="tablenote"><b>Definición fija:</b> "en revisión" = score &ge; percentil 95 del bloque OOT completo. Las pestañas separan quién fue priorizado solo por Isolation Forest, solo por el detector IF+VAE, o por ambos. El perfil permite descargar todas las filas y variables OOT del individuo, sin resumirlas a top-5.</p>
+        <p class="tablenote"><b>Definición fija:</b> la cola priorizada contiene scores &ge; percentil 95 del bloque OOT completo. Las pestañas separan quién fue priorizado solo por Isolation Forest, solo por el detector IF+VAE, o por ambos. El estado operativo del caso es independiente del modelo y el perfil permite descargar todo el historial disponible del individuo, no solo OOT.</p>
         <div class="tabs" role="tablist" aria-label="Coincidencia entre detectores">
           <button class="tabbtn" role="tab" data-tab-target="if_only" onclick="setActiveTab('if_only')">Solo IF <span>{counts['if_only']:,}</span></button>
           <button class="tabbtn" role="tab" data-tab-target="vae_only" onclick="setActiveTab('vae_only')">Solo IF+VAE <span>{counts['vae_only']:,}</span></button>
           <button class="tabbtn active" role="tab" data-tab-target="intersection" onclick="setActiveTab('intersection')">Intersección <span>{counts['intersection']:,}</span></button>
+          <button class="tabbtn tab-reviewed" role="tab" data-tab-target="reviewed" onclick="setActiveTab('reviewed')">Casos revisados <span id="reviewedCount">0</span></button>
+          <button class="export-cases-btn" id="exportCasesBtn" onclick="exportReviewedCases()" disabled>Exportar casos revisados (.csv)</button>
         </div>
         <div class="searchbar">
           <input type="search" id="tableSearch" class="search-input"
@@ -307,7 +343,7 @@ def build_analyst_dashboard(
               <tr>
                 <th></th><th>ID</th><th>Banda</th>
                 <th>Percentil IF</th><th>Percentil VAE</th>
-                <th>Top-5 variables (salida del modelo)</th><th>Meses ({n_months})</th>
+                <th>Top-5 variables (salida del modelo)</th><th>Meses ({n_months})</th><th>Estado del caso</th>
               </tr>
             </thead>
             <tbody id="priorityTableBody">{rows_html}
@@ -337,8 +373,18 @@ def build_analyst_dashboard(
       <div>
         <div class="meyebrow">Perfil de individuo priorizado</div>
         <div class="mid" id="mId">&mdash;</div>
+        <div class="midentity"><span>{html.escape(identity_column)}</span><b id="mIdentity">No disponible</b></div>
       </div>
       <span class="mband" id="mBand">&mdash;</span>
+    </div>
+    <div class="case-panel">
+      <label for="mCaseStatus">Estado del caso</label>
+      <select id="mCaseStatus" onchange="changeActiveCaseStatus(this.value)">
+        <option value="sin_revision">Sin revisión</option>
+        <option value="en_revision">En revisión</option>
+        <option value="cerrado">Cerrado</option>
+      </select>
+      <small id="mCaseChanged">Sin cambios registrados</small>
     </div>
     <div class="mscores">
       <div class="mscore">
@@ -361,7 +407,7 @@ def build_analyst_dashboard(
     <div class="detector-detail"><span><i class="lswatch if"></i>Isolation Forest</span><div class="mchips" id="mIfChips"></div></div>
     <div class="detector-detail"><span><i class="lswatch vae"></i>IF+VAE</span><div class="mchips" id="mVaeChips"></div></div>
     <div class="download-panel">
-      <div><b>Registro OOT completo</b><small id="mDownloadMeta">&mdash;</small></div>
+      <div><b>Historial completo de la entidad</b><small id="mDownloadMeta">&mdash;</small></div>
       <button class="download-btn" id="downloadBtn" onclick="downloadObservation()">Descargar todas las variables (.csv)</button>
     </div>
   </div>
@@ -376,10 +422,13 @@ var N_ROWS_TOTAL = {n_rows};
 var N_TOTAL_OOT = {n_total_oot};
 var COUNTS = {json.dumps(counts)};
 var RECURRENT_COUNTS = {json.dumps(recurrent_counts)};
-var OOT_COLUMNS = {json.dumps(oot_columns, ensure_ascii=False)};
+var RECORD_COLUMNS = {json.dumps(record_columns, ensure_ascii=False)};
 var ACTIVE_TAB = "intersection";
 var ACTIVE_PROFILE = null;
-var TAB_LABELS = {{if_only:"Solo IF", vae_only:"Solo IF+VAE", intersection:"Intersección"}};
+var TAB_LABELS = {{if_only:"Solo IF", vae_only:"Solo IF+VAE", intersection:"Intersección", reviewed:"Casos revisados"}};
+var STATUS_LABELS = {{sin_revision:"Sin revisión", en_revision:"En revisión", cerrado:"Cerrado"}};
+var CASE_STORAGE_KEY = "analyst-case-status:v1:" + window.location.pathname;
+var CASES = loadCases();
 
 function pad(n){{return n<10?"0"+n:""+n}}
 var MESES=["ENE","FEB","MAR","ABR","MAY","JUN","JUL","AGO","SEP","OCT","NOV","DIC"];
@@ -392,6 +441,62 @@ function tick(){{
   }}catch(e){{}}
 }}
 tick(); setInterval(tick,1000);
+
+function loadCases(){{
+  try{{
+    var parsed=JSON.parse(localStorage.getItem(CASE_STORAGE_KEY)||"{{}}");
+    return parsed && typeof parsed==="object" ? parsed : {{}};
+  }}catch(e){{return {{}};}}
+}}
+function saveCases(){{
+  try{{localStorage.setItem(CASE_STORAGE_KEY,JSON.stringify(CASES));}}catch(e){{}}
+}}
+function caseFor(profileKey){{
+  var r=PROFILES[profileKey];
+  return (r && CASES[r.id]) || {{status:"sin_revision",changed_at:null}};
+}}
+function formatChanged(iso){{
+  if(!iso) return "Sin cambios registrados";
+  var d=new Date(iso);
+  return isNaN(d.getTime()) ? iso : d.toLocaleString("es-PE",{{dateStyle:"short",timeStyle:"medium"}});
+}}
+function syncCaseUI(profileKey){{
+  var c=caseFor(profileKey);
+  var row=document.querySelector('tr[data-profile="'+profileKey+'"]');
+  if(row) row.dataset.caseStatus=c.status;
+  var select=document.querySelector('.case-select[data-profile="'+profileKey+'"]');
+  if(select){{select.value=c.status;select.className="case-select status-"+c.status;}}
+  var date=document.querySelector('[data-case-date="'+profileKey+'"]');
+  if(date) date.textContent=c.changed_at ? formatChanged(c.changed_at) : "—";
+  if(ACTIVE_PROFILE===PROFILES[profileKey]){{
+    document.getElementById("mCaseStatus").value=c.status;
+    document.getElementById("mCaseChanged").textContent=c.changed_at ? "Último cambio: "+formatChanged(c.changed_at) : "Sin cambios registrados";
+  }}
+}}
+function refreshCaseSummary(){{
+  var reviewed=Object.keys(PROFILES).filter(function(k){{return caseFor(k).status!=="sin_revision";}}).length;
+  document.getElementById("reviewedCount").textContent=reviewed.toLocaleString("es");
+  document.getElementById("exportCasesBtn").disabled=reviewed===0;
+  return reviewed;
+}}
+function changeCaseStatus(profileKey,status,event){{
+  if(event) event.stopPropagation();
+  if(!STATUS_LABELS[status] || !PROFILES[profileKey]) return;
+  var eid=PROFILES[profileKey].id;
+  var current=caseFor(profileKey);
+  if(current.status===status) return;
+  if(status==="sin_revision") delete CASES[eid];
+  else CASES[eid]={{status:status,changed_at:new Date().toISOString()}};
+  saveCases();syncCaseUI(profileKey);refreshCaseSummary();
+  filterTable(document.getElementById("tableSearch").value);
+}}
+function changeActiveCaseStatus(status){{
+  if(!ACTIVE_PROFILE) return;
+  var key=Object.keys(PROFILES).find(function(k){{return PROFILES[k]===ACTIVE_PROFILE;}});
+  if(key) changeCaseStatus(key,status,null);
+}}
+Object.keys(PROFILES).forEach(syncCaseUI);
+refreshCaseSummary();
 
 // Client-side filter: matches the query against every visible cell in the
 // row (ID, banda, percentiles, top-5 variables, meses) -- not just the ID
@@ -406,7 +511,9 @@ function filterTable(query){{
     var rows = document.querySelectorAll("#priorityTableBody tr[data-id]");
     var shown = 0;
     rows.forEach(function(row){{
-      var inTab = row.dataset.tab === ACTIVE_TAB;
+      var inTab = ACTIVE_TAB === "reviewed"
+        ? row.dataset.caseStatus !== "sin_revision"
+        : row.dataset.tab === ACTIVE_TAB;
       var match = inTab && (!needle || row.textContent.toLowerCase().indexOf(needle) !== -1);
       row.hidden = !match;
       if (match) shown++;
@@ -416,7 +523,7 @@ function filterTable(query){{
       if (!emptyRow){{
         emptyRow = document.createElement("tr");
         emptyRow.id = "noMatchRow";
-        emptyRow.innerHTML = "<td colspan='7' class='no-match'>"
+        emptyRow.innerHTML = "<td colspan='8' class='no-match'>"
           + "Ningún individuo coincide con el filtro.</td>";
         document.getElementById("priorityTableBody").appendChild(emptyRow);
       }}
@@ -442,13 +549,20 @@ function setActiveTab(tab){{
     btn.classList.toggle("active", selected);
     btn.setAttribute("aria-selected", selected ? "true" : "false");
   }});
-  var count = COUNTS[tab] || 0;
-  var recurrent = RECURRENT_COUNTS[tab] || 0;
+  var count = tab === "reviewed" ? refreshCaseSummary() : (COUNTS[tab] || 0);
+  var recurrent = tab === "reviewed"
+    ? Array.from(document.querySelectorAll('#priorityTableBody tr[data-profile]')).filter(function(row){{
+        var r=PROFILES[row.dataset.profile];
+        return row.dataset.caseStatus!=="sin_revision" && r && r.months_count>=2;
+      }}).length
+    : (RECURRENT_COUNTS[tab] || 0);
   var pct = N_TOTAL_OOT ? (100*count/N_TOTAL_OOT) : 0;
   var recurrentPct = count ? (100*recurrent/count) : 0;
-  document.getElementById("queueKpiLabel").textContent = TAB_LABELS[tab] + " (≥ P95)";
+  document.getElementById("queueKpiLabel").textContent = TAB_LABELS[tab] + (tab === "reviewed" ? "" : " (≥ P95)");
   document.getElementById("queueKpiValue").textContent = count.toLocaleString("es");
-  document.getElementById("queueKpiSub").textContent = pct.toFixed(1)+"% de "+N_TOTAL_OOT.toLocaleString("es")+" individuos únicos OOT";
+  document.getElementById("queueKpiSub").textContent = tab === "reviewed"
+    ? pct.toFixed(1)+"% de "+N_TOTAL_OOT.toLocaleString("es")+" individuos únicos OOT con gestión iniciada"
+    : pct.toFixed(1)+"% de "+N_TOTAL_OOT.toLocaleString("es")+" individuos únicos OOT";
   document.getElementById("recurrentKpiValue").textContent = recurrent.toLocaleString("es");
   document.getElementById("recurrentKpiSub").textContent = recurrentPct.toFixed(1)+"% reaparece en 2 o más meses";
   filterTable(document.getElementById("tableSearch").value);
@@ -466,6 +580,8 @@ function openProfile(id){{
   var r = PROFILES[id]; if(!r) return;
   ACTIVE_PROFILE = r;
   document.getElementById("mId").textContent = r.id;
+  document.getElementById("mIdentity").textContent = r.identity || "No disponible";
+  syncCaseUI(id);
   var bandEl = document.getElementById("mBand");
   bandEl.textContent = (r.band || "-").toUpperCase();
   bandEl.className = "mband mband-"+(r.band || "p90");
@@ -480,9 +596,9 @@ function openProfile(id){{
   renderMonths("mVaeMonths", r.vae_months);
   renderChips("mIfChips", r.if_top5);
   renderChips("mVaeChips", r.vae_top5);
-  var recordCount = (r.oot_records || []).length;
-  document.getElementById("mDownloadMeta").textContent = recordCount+" fila"+(recordCount===1?"":"s")+" · "+OOT_COLUMNS.length+" columnas originales";
-  document.getElementById("downloadBtn").disabled = recordCount === 0 || OOT_COLUMNS.length === 0;
+  var recordCount = (r.records || []).length;
+  document.getElementById("mDownloadMeta").textContent = recordCount+" fila"+(recordCount===1?"":"s")+" de todos los periodos · "+RECORD_COLUMNS.length+" columnas originales";
+  document.getElementById("downloadBtn").disabled = recordCount === 0 || RECORD_COLUMNS.length === 0;
 
   document.getElementById("overlay").classList.add("open");
 }}
@@ -508,13 +624,38 @@ function csvCell(value){{
   return '"'+text.replace(/"/g,'""')+'"';
 }}
 function downloadObservation(){{
-  var r=ACTIVE_PROFILE; if(!r || !(r.oot_records||[]).length) return;
-  var lines=[OOT_COLUMNS.map(csvCell).join(",")];
-  r.oot_records.forEach(function(row){{lines.push(OOT_COLUMNS.map(function(c){{return csvCell(row[c]);}}).join(","));}});
+  var r=ACTIVE_PROFILE; if(!r || !(r.records||[]).length) return;
+  var lines=[RECORD_COLUMNS.map(csvCell).join(",")];
+  r.records.forEach(function(row){{lines.push(RECORD_COLUMNS.map(function(c){{return csvCell(row[c]);}}).join(","));}});
   var blob=new Blob(["\\ufeff"+lines.join("\\r\\n")],{{type:"text/csv;charset=utf-8"}});
   var url=URL.createObjectURL(blob); var a=document.createElement("a");
-  a.href=url; a.download="oot_"+String(r.id).replace(/[^a-zA-Z0-9._-]+/g,"_")+".csv";
+  a.href=url; a.download="entidad_"+String(r.id).replace(/[^a-zA-Z0-9._-]+/g,"_")+"_historial_completo.csv";
   document.body.appendChild(a); a.click(); a.remove(); setTimeout(function(){{URL.revokeObjectURL(url);}},1000);
+}}
+function exportReviewedCases(){{
+  var rows=[];
+  Object.keys(PROFILES).forEach(function(key){{
+    var r=PROFILES[key], c=caseFor(key);
+    if(c.status==="sin_revision") return;
+    var d=new Date(c.changed_at);
+    rows.push({{
+      id:r.id,
+      identity:r.identity||"",
+      status:STATUS_LABELS[c.status],
+      changed_at:c.changed_at||"",
+      changed_date:c.changed_at && !isNaN(d.getTime()) ? d.toLocaleDateString("es-PE") : "",
+      changed_time:c.changed_at && !isNaN(d.getTime()) ? d.toLocaleTimeString("es-PE") : ""
+    }});
+  }});
+  if(!rows.length) return;
+  rows.sort(function(a,b){{return String(b.changed_at).localeCompare(String(a.changed_at));}});
+  var headers=[{json.dumps(entity_col, ensure_ascii=False)},{json.dumps(identity_column, ensure_ascii=False)},"estado","fecha_cambio_estado","hora_cambio_estado","timestamp_cambio_estado"];
+  var lines=[headers.map(csvCell).join(",")];
+  rows.forEach(function(r){{lines.push([r.id,r.identity,r.status,r.changed_date,r.changed_time,r.changed_at].map(csvCell).join(","));}});
+  var blob=new Blob(["\\ufeff"+lines.join("\\r\\n")],{{type:"text/csv;charset=utf-8"}});
+  var url=URL.createObjectURL(blob), a=document.createElement("a");
+  a.href=url;a.download="casos_revisados.csv";document.body.appendChild(a);a.click();a.remove();
+  setTimeout(function(){{URL.revokeObjectURL(url);}},1000);
 }}
 function closeProfile(){{ document.getElementById("overlay").classList.remove("open"); }}
 document.addEventListener("keydown", function(e){{ if(e.key==="Escape") closeProfile(); }});
@@ -532,9 +673,9 @@ setActiveTab(ACTIVE_TAB);
 
     log.info(
         "Analyst dashboard [base=%s] -> %s (%d in P95 union of %d unique OOT "
-        "individuals; tabs=%s; recurrent>=2=%s; %d OOT columns downloadable)",
+        "individuals; tabs=%s; recurrent>=2=%s; %d source columns downloadable)",
         base_model_name, resolved_out, n_rows, n_total_oot, counts,
-        recurrent_counts, len(oot_columns),
+        recurrent_counts, len(record_columns),
     )
     return os.path.abspath(resolved_out)
 
@@ -636,6 +777,12 @@ body{background:var(--paper);color:var(--ink);
 .tabbtn:hover{background:var(--surface-2)}
 .tabbtn.active{border-color:var(--if);background:var(--if-soft);color:var(--ink)}
 .tabbtn.active span{background:var(--if);color:#fff}
+.tabbtn.tab-reviewed.active{border-color:var(--good);background:var(--good-soft)}
+.tabbtn.tab-reviewed.active span{background:var(--good);color:#fff}
+.export-cases-btn{margin-left:auto;border:1px solid var(--good);border-radius:8px;padding:7px 11px;
+  color:var(--good);background:var(--surface);font-size:11.5px;font-weight:700}
+.export-cases-btn:hover{background:var(--good-soft)}
+.export-cases-btn:disabled{opacity:.4;cursor:not-allowed;background:var(--surface)}
 
 .searchbar{margin:0 24px 10px;display:flex;align-items:center;gap:10px;flex-shrink:0}
 .search-input{flex:1;max-width:360px;font-family:"Public Sans",sans-serif;font-size:12.5px;
@@ -652,7 +799,7 @@ body{background:var(--paper);color:var(--ink);
    own synthetic "CUST_000123" format, so the ID cell also wraps rather
    than forcing the table wider indefinitely. */
 .tablewrap{flex:1;overflow:auto;padding:0 24px 16px}
-#priorityTable{min-width:760px}
+#priorityTable{min-width:980px}
 thead th{position:sticky;top:0;background:var(--surface);z-index:2;text-align:left;
   font-size:10px;font-weight:700;letter-spacing:.06em;color:var(--ink-mute);text-transform:uppercase;
   padding:8px 10px;border-bottom:1px solid var(--border)}
@@ -695,6 +842,12 @@ tbody td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12.5px
 .dot-on.dot-crit{background:var(--crit)}
 .dot-on.dot-warn{background:var(--warn)}
 .dot-on.dot-mute{background:var(--ink-mute)}
+.casecell{min-width:150px;cursor:default}
+.case-select{width:100%;border:1px solid var(--border);border-radius:7px;padding:5px 8px;
+  background:var(--surface);color:var(--ink);font-size:11px;font-weight:700}
+.case-select.status-en_revision{border-color:var(--warn);background:var(--warn-soft);color:var(--warn)}
+.case-select.status-cerrado{border-color:var(--good);background:var(--good-soft);color:var(--good)}
+.case-date{display:block;margin-top:4px;color:var(--ink-mute);font-family:"IBM Plex Mono",monospace;font-size:9px}
 
 .bottom{display:flex;align-items:center;justify-content:space-between;padding:12px 28px;
   border-top:1px solid var(--border);flex-shrink:0}
@@ -719,11 +872,18 @@ tbody td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12.5px
 .mhead{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:18px}
 .meyebrow{font-size:10px;font-weight:700;color:var(--ink-mute);text-transform:uppercase;letter-spacing:.07em;margin-bottom:4px}
 .mid{font-family:"IBM Plex Mono",monospace;font-size:20px;font-weight:700}
+.midentity{margin-top:6px;display:flex;gap:7px;align-items:baseline;color:var(--ink-soft);font-size:12px}
+.midentity span{color:var(--ink-mute);text-transform:capitalize}.midentity b{font-weight:700}
 .mband{font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:700;padding:5px 12px;
   border-radius:20px;text-transform:uppercase;margin-right:36px}
 .mband-p90{background:var(--surface-2);color:var(--ink-soft)}
 .mband-p95{background:var(--warn-soft);color:var(--warn)}
 .mband-p99{background:var(--crit-soft);color:var(--crit)}
+.case-panel{display:grid;grid-template-columns:auto minmax(150px,220px) 1fr;gap:10px;align-items:center;
+  margin:-4px 0 18px;padding:11px 13px;border:1px solid var(--border);border-radius:10px;background:var(--surface-2)}
+.case-panel label{font-size:11px;font-weight:700;color:var(--ink-soft)}
+.case-panel select{border:1px solid var(--border);border-radius:7px;padding:6px 8px;background:var(--surface);color:var(--ink)}
+.case-panel small{color:var(--ink-mute);font-size:10px;text-align:right}
 .mscores{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:18px}
 .mscore{background:var(--surface-2);border-radius:10px;padding:12px 14px}
 .mscore-label{display:flex;align-items:center;gap:6px;font-size:11px;font-weight:700;color:var(--ink-soft);margin-bottom:6px}
@@ -756,6 +916,8 @@ tbody td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12.5px
   .kpi{border-left:0;border-top:1px solid var(--border)}
   .kpi:first-child{border-top:0}
   .search-input{max-width:none}
+  .export-cases-btn{margin-left:0}
+  .case-panel{grid-template-columns:1fr}.case-panel small{text-align:left}
   .download-panel{align-items:stretch;flex-direction:column}.download-btn{width:100%}
 }
 """

@@ -319,6 +319,37 @@ def _interpretation_section_md(context: dict) -> str:
     return render_interpretation_markdown(interpretation)
 
 
+def _sensitivity_section_md(context: dict, out_dir: str) -> str:
+    payload = context.get("sensitivity_analysis")
+    if not isinstance(payload, dict):
+        return ""
+    parts = ["## Sensibilidad post-entrenamiento y calidad de datos\n"]
+    parts.append(
+        "Los escenarios reutilizan el preprocesador y los modelos ya ajustados; "
+        "ninguno reentrena. Las etiquetas, cuando existen, se usan únicamente "
+        "para evaluación post-hoc.\n"
+    )
+    rows = []
+    for model, values in (payload.get("required_variables") or {}).items():
+        rows.append((model, str(values.get("required_count")),
+                     str(values.get("total_count")),
+                     str(values.get("max_stably_removable"))))
+    if rows:
+        parts.append(_md_table(
+            ["Modelo", "Variables necesarias", "Variables evaluadas", "Removibles con estabilidad"],
+            rows,
+        ))
+    for item in payload.get("high_zero_summary") or []:
+        parts.append(
+            f"- **{item.get('model')}**, registros con ≥90% cero/faltante: "
+            f"{item.get('recommendation')} ({item.get('n_high_zero_test', 0)} en test).\n"
+        )
+    for label, path in (payload.get("artifacts") or {}).items():
+        rel = os.path.relpath(path, out_dir).replace(os.sep, "/")
+        parts.append(f"- {label}: [`{os.path.basename(path)}`]({rel})\n")
+    return "\n".join(parts)
+
+
 def _md_table(headers: Sequence[str], rows: list[tuple[str, ...]]) -> str:
     """Generic n-column markdown table."""
     if not rows:
@@ -405,6 +436,7 @@ def _build_markdown(context: dict, out_dir: str) -> str:
     # -- IF-VAE diagnostic suite (optional, external cross-validation) ------- #
     parts.append(_diagnostic_suite_section_md(context))
     parts.append(_interpretation_section_md(context))
+    parts.append(_sensitivity_section_md(context, out_dir))
 
     # -- figures gallery ----------------------------------------------------- #
     figures = context.get("figures") or []
@@ -437,6 +469,7 @@ def _build_markdown(context: dict, out_dir: str) -> str:
     parts.append("con la KL gaussiana disponible en forma cerrada:\n")
     parts.append(f"$$\n{_KL_LATEX}\n$$\n")
 
+    parts.append(_row_filter_section_md(context))
     parts.append(_incidents_section_md(context))
 
     notes = context.get("notes")
@@ -445,6 +478,34 @@ def _build_markdown(context: dict, out_dir: str) -> str:
         parts.append(f"{notes}\n")
 
     return "\n".join(parts)
+
+
+def _row_filter_rows(context: dict):
+    """Rows of the exact-zero filter table, or ``None`` when the run carries
+    no filter stats (older callers)."""
+    f = context.get("row_filter")
+    if not f:
+        return None
+    return [
+        ("Registros al cargar la base", f"{f['n_rows_before']:,}"),
+        ("Excluidos por cero exacto", f"{f['n_rows_dropped']:,}"),
+        ("Registros que entran al flujo", f"{f['n_rows_after']:,}"),
+        ("Regla", f">= {round(100 * f['cutoff'])}% de {f['n_columns_checked']} "
+                  "columnas numéricas en 0 exacto"),
+    ]
+
+
+def _row_filter_section_md(context: dict) -> str:
+    """Records loaded vs. dropped by the pre-split exact-zero filter."""
+    rows = _row_filter_rows(context)
+    if rows is None:
+        return ""
+    return "\n".join([
+        "## Filtro de filas en cero exacto\n",
+        "_Las filas excluidas se eliminan antes del split y no participan "
+        "en ninguna parte del flujo. Los faltantes no cuentan como cero._\n",
+        _md_table(["Concepto", "Valor"], rows),
+    ])
 
 
 def _incidents_section_md(context: dict) -> str:
@@ -1041,6 +1102,53 @@ def _interpretation_section_html(context: dict) -> str:
     return render_interpretation_html(interpretation)
 
 
+def _sensitivity_section_html(context: dict, out_dir: str) -> str:
+    payload = context.get("sensitivity_analysis")
+    if not isinstance(payload, dict):
+        return ""
+    scope_rows = []
+    for model, values in (payload.get("required_variables") or {}).items():
+        scope_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(model))}</td>"
+            f"<td>{int(values.get('required_count', 0))}</td>"
+            f"<td>{int(values.get('total_count', 0))}</td>"
+            f"<td>{int(values.get('max_stably_removable', 0))}</td>"
+            "</tr>"
+        )
+    zero_rows = []
+    for item in payload.get("high_zero_summary") or []:
+        zero_rows.append(
+            "<li>"
+            f"<b>{html.escape(str(item.get('model')))}</b>: "
+            f"{html.escape(str(item.get('recommendation')))} "
+            f"({int(item.get('n_high_zero_test', 0))} registros en test)."
+            "</li>"
+        )
+    links = []
+    for label, path in (payload.get("artifacts") or {}).items():
+        rel = os.path.relpath(path, out_dir).replace(os.sep, "/")
+        links.append(
+            f"<li><a href='{html.escape(rel)}'>{html.escape(str(label))}</a>"
+            f"<span class='fname'>{html.escape(os.path.basename(str(path)))}</span></li>"
+        )
+    table = (
+        "<div class='table-wrap'><table><thead><tr><th>Modelo</th>"
+        "<th>Variables necesarias</th><th>Evaluadas</th><th>Removibles estables</th>"
+        "</tr></thead><tbody>" + "".join(scope_rows) + "</tbody></table></div>"
+        if scope_rows else ""
+    )
+    return (
+        "<h2 id='sensitivity'>Sensibilidad post-entrenamiento y calidad de datos</h2>"
+        "<div class='card'><p class='lead'>Los escenarios reutilizan el preprocesador "
+        "y los modelos ya ajustados: no hay reentrenamiento. Las etiquetas, cuando "
+        "existen, se incorporan únicamente después del entrenamiento para medir el "
+        "impacto sobre aciertos, errores y clasificación final.</p>"
+        f"{table}<h3>Registros con ≥90% cero o faltante</h3><ul>{''.join(zero_rows)}</ul>"
+        f"<h3>Entregables detallados</h3><ul class='oot-list'>{''.join(links)}</ul></div>"
+    )
+
+
 def _model_headline_tiles_html(metrics: Optional[dict]) -> str:
     groups = _metric_prefix_split(metrics)
     headline_keys = _HEADLINE_SUPERVISED if groups["oot"] else _HEADLINE_UNSUPERVISED
@@ -1485,6 +1593,22 @@ def _plotly_section_html(chart_data: Optional[dict], log) -> dict:
 _INCIDENT_CHIP = {"ERROR": "serious", "CRITICAL": "serious"}
 
 
+def _row_filter_section_html(context: dict) -> str:
+    """HTML twin of ``_row_filter_section_md``."""
+    rows = _row_filter_rows(context)
+    if rows is None:
+        return ""
+    return (
+        "<h2 id='row-filter'>Filtro de filas en cero exacto</h2>"
+        "<div class='card'>"
+        "<p class='subtitle'>Las filas excluidas se eliminan antes del split "
+        "y no participan en ninguna parte del flujo. Los faltantes no cuentan "
+        "como cero.</p>"
+        f"{_html_table(['Concepto', 'Valor'], rows)}"
+        "</div>"
+    )
+
+
 def _incidents_section_html(context: dict) -> str:
     """HTML twin of ``_incidents_section_md`` -- see that function's
     docstring for what this is and why it exists. Same guard: ``''`` when
@@ -1557,6 +1681,7 @@ def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
         "<a href='#explain'>Explicabilidad</a>"
         "<a href='#diagnostic-suite'>Diagnóstico cruzado</a>"
         "<a href='#diagnostic-interpretation'>Interpretación</a>"
+        "<a href='#sensitivity'>Sensibilidad</a>"
         "<a href='#models'>Modelos</a>"
         "<a href='#indicators'>Indicadores</a>"
         "<a href='#reliability'>Confiabilidad</a>"
@@ -1592,6 +1717,7 @@ def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
     # -- IF-VAE diagnostic suite (optional, external cross-validation) -------- #
     parts.append(_diagnostic_suite_section_html(context))
     parts.append(_interpretation_section_html(context))
+    parts.append(_sensitivity_section_html(context, out_dir))
 
     # -- models ---------------------------------------------------------------- #
     if models:
@@ -1640,6 +1766,7 @@ def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
     )
     parts.append("</div>")
 
+    parts.append(_row_filter_section_html(context))
     parts.append(_incidents_section_html(context))
 
     notes = context.get("notes")
@@ -1692,6 +1819,10 @@ def _artifact_catalog_rows(
     diag = context.get("diagnostic_suite")
     if isinstance(diag, dict) and diag.get("report_md_path"):
         rows.append(("Reporte técnico del IF-VAE Diagnostic Suite", diag["report_md_path"]))
+    sensitivity = context.get("sensitivity_analysis")
+    if isinstance(sensitivity, dict):
+        for name, path in (sensitivity.get("artifacts") or {}).items():
+            rows.append((f"Sensibilidad post-entrenamiento ({name})", path))
     rows.append(("Documentación técnica (este archivo)", doc_path))
     return rows
 

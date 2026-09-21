@@ -28,6 +28,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Optional
 
+import numpy as np
 import pandas as pd
 
 from src.data.synthetic import generate_synthetic_panel
@@ -299,6 +300,85 @@ def _infer_schema(
         ground_truth_path=ground_truth_path,
         is_synthetic=is_synthetic,
     )
+
+
+def drop_exact_zero_rows(
+    df: pd.DataFrame, schema: "PanelSchema", logger: logging.Logger,
+    cutoff: float = 0.90,
+) -> tuple[pd.DataFrame, dict]:
+    """Drop rows where at least `cutoff` of the input columns are an exact 0.
+
+    Such a row carries no usable signal for either detector -- the Isolation
+    Forest isolates it fast and the VAE reconstructs it trivially, purely
+    because it is nearly empty, not because it describes anomalous behavior.
+    It is removed here, before the caller does anything else with `df`
+    (chronological split, fitting, scoring, export), so it is never
+    considered anywhere downstream.
+
+    Only numeric and boolean columns are checked: "exactly 0" has no meaning
+    for a text category, and counting categoricals in the denominator would
+    cap a row's zero share below the cutoff on any panel that has them (a
+    panel with 8 of 20 categorical inputs could never exceed 60%).
+
+    Only an exact 0 counts -- a missing value (`NaN`) never does, even though
+    both can mean "no data" in this domain. That distinction is deliberate:
+    the diagnostic suite's `sensitivity_high_zero_cutoff` post-hoc study also
+    counts missing values as zero-like when *measuring* the effect of such
+    rows on already-fitted models, but this function *removes* rows from the
+    panel itself, so it only acts on what is unambiguously a literal 0.
+
+    Args:
+        df: The panel, as loaded (before any split).
+        schema: The panel's `PanelSchema`; `entity_col`/`time_col`/
+            `target_col` are excluded from the checked columns, as is
+            anything that is not numeric or boolean.
+        logger: Logger the caller already has, so this reuses the caller's
+            phase context instead of opening a new one.
+        cutoff: Minimum share (0, 1] of checked columns that must equal 0 for
+            the row to be dropped.
+
+    Returns:
+        A `(df, stats)` tuple. `df` is a fresh, index-reset frame with the
+        matching rows removed (or the original frame, uncopied, if none
+        matched). `stats` has `n_rows_before`, `n_rows_dropped`,
+        `n_rows_after`, `n_columns_checked`, and `cutoff`.
+    """
+    key_cols = {c for c in (schema.entity_col, schema.time_col, schema.target_col) if c}
+    check_cols = [
+        c for c in df.columns
+        if c not in key_cols
+        and (pd.api.types.is_numeric_dtype(df[c]) or pd.api.types.is_bool_dtype(df[c]))
+    ]
+    n_before = int(df.shape[0])
+    if check_cols:
+        zero_share = (df[check_cols] == 0).mean(axis=1)
+        drop_mask = (zero_share >= cutoff).to_numpy()
+    else:
+        drop_mask = np.zeros(n_before, dtype=bool)
+    n_dropped = int(drop_mask.sum())
+    stats = {
+        "n_rows_before": n_before,
+        "n_rows_dropped": n_dropped,
+        "n_rows_after": n_before - n_dropped,
+        "n_columns_checked": len(check_cols),
+        "cutoff": cutoff,
+    }
+    if n_dropped:
+        logger.warning(
+            "Filtro de filas en cero exacto: %d/%d filas (%.1f%%) tienen >= %.0f%% "
+            "de sus %d columnas numéricas en 0 exacto y se excluyen antes de cualquier "
+            "split, ajuste o exportación; quedan %d filas.",
+            n_dropped, n_before, 100.0 * n_dropped / max(n_before, 1),
+            100.0 * cutoff, len(check_cols), stats["n_rows_after"],
+        )
+        df = df.loc[~drop_mask].reset_index(drop=True)
+    else:
+        logger.info(
+            "Filtro de filas en cero exacto: 0/%d filas alcanzan >= %.0f%% de sus %d "
+            "columnas numéricas en 0 exacto; no se excluye ninguna.",
+            n_before, 100.0 * cutoff, len(check_cols),
+        )
+    return df, stats
 
 
 def load_or_generate_panel(

@@ -1148,6 +1148,7 @@ def fit_transform_panel(
     schema: PanelSchema,
     logger: Optional[logging.Logger] = None,
     fit_mask: Optional[np.ndarray] = None,
+    return_pipeline: bool = False,
     **config,
 ):
     """Fit the preprocessing pipeline on ``df`` and return ``(X, keys, names)``.
@@ -1160,6 +1161,10 @@ def fit_transform_panel(
         fit_mask: Optional boolean row mask (typically the in-time rows) that
             restricts what the **estimated** part of the pipeline learns from.
             ``None`` fits everything on every row (the historical behaviour).
+        return_pipeline: When true, append the fitted sklearn pipeline to the
+            returned tuple. This is used by post-training sensitivity tests so
+            perturbed inputs are transformed with the exact same learned
+            imputers, encoders and scalers instead of refitting them.
         **config: Forwarded verbatim to :func:`build_preprocessing_pipeline`.
 
     The ``fit_mask`` split, and why it is not a plain ``fit``/``transform``
@@ -1274,4 +1279,6 @@ def fit_transform_panel(
         # 1e18 in the matrix.
         _warn_on_extreme_magnitudes(X, feature_names, log)
 
+    if return_pipeline:
+        return X, keys, feature_names, pipeline
     return X, keys, feature_names

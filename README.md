@@ -367,14 +367,25 @@ python main.py --no-live-view    # no abre la vista de progreso local en el nave
 python main.py --diagnostic-segment-column region  # apartado 8 por una columna propia
 python main.py --diagnostic-experiment-capacity-grid 4 8 16  # refits VAE opt-in
 python main.py --no-auto-install-suite  # valida ifvae_diag, pero no lo instala
+python main.py --analyst-identity-column puesto  # identificación visible bajo el ID
+python main.py --sensitivity-high-zero-cutoff 0.90  # regla de registros casi vacíos
+python main.py --no-run-sensitivity-analysis  # omite la Fase 9d post-entrenamiento
 python main.py --help
 ```
 
 La suite `ifvae_diag` está activa y se auto-instala desde la copia vendorizada
 del repositorio cuando hace falta; no requiere un `pip install` manual. Para una
-explicación breve de los modelos, las mallas experimentales, las tres pestañas
-del dashboard y la descarga OOT completa, empieza por
+explicación breve de los modelos, las mallas experimentales, la gestión de
+casos del dashboard y la descarga del historial completo, empieza por
 [`docs/guia_practica.md`](docs/guia_practica.md).
+
+La Fase 9d genera `sensitivity_analysis.html/.xlsx`, cuatro tablas CSV y un
+resumen JSON. Prueba ablación, null, cero, combinaciones y niveles crecientes
+de pérdida de información sin reajustar los modelos. Las etiquetas disponibles
+se usan únicamente después del entrenamiento para medir el cambio de
+performance. El análisis de calidad cuenta cero como información faltante y
+evalúa expresamente la exclusión de registros con al menos 90% de entradas en
+cero o nulas.
 
 **La estrategia por defecto es NO SUPERVISADA.** Las etiquetas de ground truth se
 cargan siempre que exista el archivo (los diagnósticos las usan igual), pero sólo

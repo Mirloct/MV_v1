@@ -19,7 +19,7 @@ live, on localhost only, while the run is still in progress.
 self-contained "Cola de Revisión" HTML (not one per model -- both Isolation
 Forest and IF+VAE percentiles are joined in memory). The P95 union is split
 into only-IF, only-IF+VAE and intersection tabs; each profile can download
-the entity's complete raw OOT rows with every original column. No external
+the entity's complete raw history with every original column. No external
 data source or business categorization is layered on top. See `CONTEXT.md`
 "Downstream analyst dashboard".
 """

@@ -135,6 +135,7 @@ Produced by `src/data`, consumed by every downstream module:
   coerced with `errors="coerce"` — `assumptions.validate_panel`'s
   `temporal.parseable` check is what turns an unparsed period column into an
   actual stop, instead of silent `NaT`s flowing into the split/feature code.
+- **Exact-zero row filter**: `drop_exact_zero_rows` (Phase 2, before any split/fit) removes rows whose numeric/boolean input columns are >= `exact_zero_row_cutoff` (default 0.90, `--exact-zero-row-cutoff`) exact 0. `NaN` is not 0; keys, target and categoricals are outside the denominator. Rows/dropped/kept are logged to `execution.log`. Distinct from the Phase 9d post-hoc study, which removes nothing.
 - **Anomaly semantics** (load-bearing for evaluation; full definitions in
   `src/data/synthetic.py`): `global` = extreme in the overall distribution;
   `local` = normal globally but inconsistent with the entity's own history
@@ -735,18 +736,49 @@ recurrence are kept per detector: `months_present_by_entity` runs once for
 IF and once for IF+VAE against each detector's own P95 cut-off. Search only
 filters the active tab; the KPIs update with that same partition.
 
-**Per-observation full OOT download.** `main.py` passes the raw, undeduplicated
-OOT rows into the dashboard. Only rows belonging to entities in the P95 union
-are embedded. Opening a profile shows detector-specific variables/months and
-offers “Descargar todas las variables (.csv)”: the browser creates a UTF-8
-CSV containing every OOT row for that entity and every original database
-column, including its period. This is deliberately separate from the top-5
-explanation; no time-varying value is flattened or shown without its date.
+**Full-history download and case workflow.** `main.py` passes the complete raw
+panel into the dashboard; only entities in the P95 union are embedded, but all
+their available periods and original columns are retained. The UTF-8 profile
+download is therefore a complete entity history, not only OOT. Each case has
+exactly three operational states (`Sin revisión`, `En revisión`, `Cerrado`),
+persisted in browser storage with an ISO change timestamp. “Casos revisados”
+shows only the two non-default states and exports their ID, configured identity
+field (default `puesto`), status, date and time. `puesto` is shown immediately
+below the ID in the profile; `--analyst-identity-column` changes the source
+column without changing model inputs.
+
+Detector explanations are sourced from the complete, de-duplicated explained
+OOT frame, not the filtered P90 export. This matters for a VAE-only P95 entity
+whose IF percentile is below P90: its IF variables still exist and must render.
 
 The dashboard remains self-contained and client-side: no API, server, or
 external business taxonomy is introduced. Entity IDs and variable labels are
 escaped before HTML insertion, and detail chips are populated with
 `textContent`.
+
+## Post-training sensitivity and data-quality validation
+
+Phase 9d (`src/evaluation/sensitivity.py`) is on by default and never refits a
+model. It reuses the fitted preprocessor, Isolation Forest, VAE and calibrated
+thresholds. Raw-variable ablation uses a neutral value learned only from the
+training window; explicit null and numeric/boolean zero replacement are
+separate scenarios. Pairwise combinations are generated from the six
+highest-leverage variables by default, followed by random 10/25/50/75/90%
+information-loss scenarios and a cumulative least-impact-first pruning path.
+
+Stability is defined objectively as rank correlation ≥0.98, alert-flip rate
+≤5%, and post-label PR-AUC/F1 deterioration ≤2 percentage points. Labels are
+optional and, when present, enter only this post-training evaluation. Zeros,
+false booleans, empty strings and nulls all count as missing information for
+the record-quality analysis. Records at or above 90% are compared with the
+rest using score CDFs, a KS test, alert rates and performance before/after
+exclusion, producing one of three recommendations: retain in train/test,
+retain only for test/monitoring, or exclude from future evaluations.
+
+Artifacts under `artifacts/reports/`: `sensitivity_analysis.html`,
+`sensitivity_analysis.xlsx`, scenario/variable/matrix/high-zero CSVs and
+`sensitivity_summary.json`. The main HTML/Markdown report links them and shows
+the minimum stable variable count plus the ≥90% record recommendation.
 
 ## IF-VAE Diagnostic Suite integration
 

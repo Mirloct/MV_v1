@@ -340,6 +340,40 @@ fuentes primarias verificadas y una limitación declarada explícitamente: el
 diseño *leave-one-period-out* aplicado a ranking no supervisado es una
 construcción metodológica propia, no un método publicado con ese nombre.
 
+### Labels revisados por eventos y compuerta de supervisión
+
+`data.csv` no trae la columna target. Si existe una tabla aparte con los
+resultados revisados, la Fase 8c la usa **después** de ajustar IF y VAE (nunca
+para entrenarlos): evalúa sus scores contra esos labels, decide la **compuerta
+4.5** y, solo si hay evidencia suficiente, corre challengers supervisados.
+
+- **Dónde va la tabla:** un CSV (o parquet) en `data/reviewed_labels/` (o
+  `--labels-path archivo.csv`) con al menos `entity_id`, `codmes` (`YYYYMM`) y
+  `target` (`1` anomalía confirmada, `0` normal confirmado, vacío = sin decisión).
+  Opcionales: `label_status`, `episode_id`, `maturity_date`.
+- **Sin inventar negativos:** una fila del panel que el archivo no menciona es
+  *desconocida*, no 0; `pending`/`uncertain`/`conflict`/... tampoco son negativos.
+- **Semáforo por episodios positivos maduros e independientes:** `< 30` ->
+  seguir con IF/VAE; `30-99` -> exploración con logística penalizada o hazard
+  discreto (con muy pocos grados de libertad); `100-199` piloto; `>= 200` y
+  cálculo formal -> candidato. Cualquier veto (target ambiguo, labels en
+  conflicto, no revisado convertido en negativo, ...) lo baja a rojo.
+- **Si la carpeta está vacía, el archivo no tiene nada o está corrupto, el
+  proceso no se cae:** se ignora (queda escrito en el log y en el reporte) y todo
+  lo demás corre igual.
+
+```bash
+python main.py                                   # busca data/reviewed_labels/ solo
+python main.py --labels-path C:\datos\labels.csv --review-capacity-k 200
+python main.py --event-challengers off           # solo evaluar IF/VAE, sin challengers
+python main.py --event-challengers force         # exploratorio aunque la compuerta esté en rojo
+python main.py --no-run-event-supervision        # omite la Fase 8c
+```
+
+Salidas: `artifacts/reports/label_gate.json` (acta de la compuerta),
+`event_evaluation.csv` y `event_challengers.json`, y un capítulo en el reporte.
+Detalle completo, umbrales y fallbacks: `CONTEXT.md` y `docs/guia_practica.md`.
+
 ### Dashboard de consola
 
 Durante la corrida, `main.py` muestra un panel en vivo en lugar de líneas de log
@@ -355,7 +389,7 @@ desplazándose:
 - **una barra estilo tqdm por cada prueba en curso** (p. ej. las pruebas de la
   suite diagnóstica, los reajustes de estabilidad, los puntos de las mallas de
   experimentos) con `n/total`, porcentaje, tiempo, ETA y el elemento en proceso;
-- checklist fijo de las 19 fases, panel de supuestos IF/VAE, KPIs de la corrida,
+- checklist fijo de las 20 fases, panel de supuestos IF/VAE, KPIs de la corrida,
   salud del equipo (RAM/CPU) y cola del log.
 
 Teclas: `v` detalle del log, `o` abrir la vista web, `p` pausa.

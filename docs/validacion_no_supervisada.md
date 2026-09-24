@@ -131,7 +131,7 @@ huella del dataset, eventos de fase con duración, y health checks tipados.
 Estados `PENDING`/`RUNNING`/`COMPLETED`/`FAILED` con progreso incremental: **ya
 existe en dos formas**.
 
-* **Terminal** — `src/utils/console_ui.py`: checklist fijo de las 19 fases
+* **Terminal** — `src/utils/console_ui.py`: checklist fijo de las 20 fases
   (cajas que se encienden en su sitio), línea `↳ función` con las funciones en
   ejecución y su tiempo, una barra estilo tqdm por cada prueba en curso (p. ej.
   las de la suite diagnóstica), panel de supuestos IF/VAE en vivo, KPIs por

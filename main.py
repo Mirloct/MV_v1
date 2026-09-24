@@ -231,6 +231,38 @@ class PipelineConfig:
     # Distinct from `sensitivity_high_zero_cutoff`, which only studies such
     # rows post-hoc without removing them.
     exact_zero_row_cutoff: float = 0.90
+    # -- Reviewed event labels (Phase 8c) ------------------------------------ #
+    # data.csv has NO target column. A separate CSV (default folder
+    # `data/reviewed_labels/`, or an explicit file via `--labels-path`) gives
+    # (entity_id, codmes) rows a reviewed target; it is read only AFTER the
+    # detectors are fitted, to evaluate IF/VAE, decide gate 4.5 (how many
+    # mature independent positive episodes exist) and, if the gate allows it,
+    # run small supervised challengers. No file, an unusable file or a red gate
+    # all fall back to the unsupervised IF/VAE run. See
+    # `src/evaluation/event_supervision.py`.
+    run_event_supervision: bool = True
+    labels_path: Optional[str] = None
+    labels_dir: str = paths.REVIEWED_LABELS_DIR
+    labels_entity_col: Optional[str] = None
+    labels_period_col: Optional[str] = None
+    labels_target_col: Optional[str] = None
+    labels_status_col: Optional[str] = None
+    labels_usable_statuses: tuple = ("confirmed", "adjudicated")
+    # Rows the file does not mention are UNKNOWN by default ("unreviewed" is never
+    # a negative). Turn this on only for a file that is an exhaustive base, and
+    # attest the audit, or the gate vetoes it.
+    labels_unlisted_as_negative: bool = False
+    labels_audit_attested: bool = False
+    labels_formal_calc_ok: bool = False
+    label_horizon_months: int = 1
+    label_confirm_delay_months: int = 0
+    label_maturity_buffer_months: int = 0
+    label_washout_months: int = 1
+    labels_as_of: Optional[str] = None
+    review_capacity_k: Optional[int] = None
+    hazard_horizon_months: int = 3
+    event_challengers: str = "auto"     # off | auto (gate decides) | force
+    event_bootstrap_reps: int = 100
     data_path: str = DATA_PATH
     # P95 checkpoint gate (Phase 6c, between the Isolation Forest fit and the
     # VAE layer): percentile of the in-time score distribution above which a
@@ -1408,6 +1440,87 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 "so its queue already reflects this detector's score.", name,
             )
 
+    # -- Phase 8c: reviewed event labels, gate 4.5, challengers ------------- #
+    # data.csv carries no target; a separate reviewed-labels CSV is read HERE,
+    # after both detectors are fitted and scored, so labels can never touch
+    # training. Best-effort: no file, an unusable file or a red gate all leave
+    # the unsupervised IF/VAE run exactly as it was. See
+    # `src/evaluation/event_supervision.py` and CONTEXT.md.
+    event_supervision_result = None
+    if config.run_event_supervision:
+        with log_phase("Phase 8c: event labels, gate 4.5 and challengers"):
+            try:
+                from src.evaluation.event_labels import LabelSpec
+                from src.evaluation.event_supervision import (
+                    EventSupervisionConfig,
+                    run_event_supervision,
+                )
+                from src.models.event_challenger import ChallengerConfig
+
+                event_supervision_result = run_event_supervision(
+                    cfg=EventSupervisionConfig(
+                        labels_path=config.labels_path,
+                        labels_dir=config.labels_dir,
+                        spec=LabelSpec(
+                            entity_col=config.labels_entity_col,
+                            period_col=config.labels_period_col,
+                            target_col=config.labels_target_col,
+                            status_col=config.labels_status_col,
+                            usable_statuses=tuple(s.lower() for s in config.labels_usable_statuses),
+                            unlisted_as_negative=config.labels_unlisted_as_negative,
+                            horizon_months=config.label_horizon_months,
+                            confirm_delay_months=config.label_confirm_delay_months,
+                            maturity_buffer_months=config.label_maturity_buffer_months,
+                            washout_months=config.label_washout_months,
+                            as_of=config.labels_as_of,
+                        ),
+                        challenger=ChallengerConfig(
+                            hazard_horizon_months=config.hazard_horizon_months,
+                            review_capacity_k=config.review_capacity_k,
+                            n_boot=config.event_bootstrap_reps, seed=config.seed,
+                        ),
+                        challenger_mode=config.event_challengers,
+                        formal_calculation_ok=config.labels_formal_calc_ok,
+                        unlisted_attested=config.labels_audit_attested,
+                        out_dir=REPORTS_DIR,
+                    ),
+                    schema=schema, keys=keys,
+                    masks={"train": train_mask, "val": val_mask,
+                           "test": test_mask, "oot": oot_mask},
+                    scores={"if_score": if_scores, "vae_score": vae_scores},
+                    X=X_if, feature_names=names_if,
+                )
+                _es = event_supervision_result
+                if _es["status"] == "executed":
+                    _gate = _es["gate"]
+                    console_ui.set_stat("Compuerta de labels 4.5", _gate["level"])
+                    console_ui.set_stat(
+                        "Episodios positivos maduros",
+                        f"{_gate['metrics']['n_mature_positive_episodes']:,} · "
+                        f"{_gate['metrics']['n_positive_entities']:,} entidades",
+                    )
+                    observability.check(
+                        name="artifact.event_supervision_written", category="artifact",
+                        definition="The gate 4.5 acta, the event evaluation table and the "
+                                   "challenger summary exist and are non-empty.",
+                        expected="all three artifacts exist and size_bytes > 0",
+                        severity="warning",
+                        passed=all(os.path.isfile(p) and os.path.getsize(p) > 0
+                                   for p in _es["artifacts"].values()),
+                        observed={"gate": _gate["level"], "vetoes": [v["code"] for v in _gate["vetoes"]],
+                                  "artifacts": _es["artifacts"]},
+                        failure_action="Best-effort artifact; IF/VAE results and the OOT "
+                                       "deliverables are unaffected.",
+                        evidence=REPORTS_DIR,
+                    )
+                else:
+                    logger.info("Phase 8c: %s", _es.get("reason"))
+            except Exception as exc:  # noqa: BLE001 - never invalidate fitted models
+                logger.warning(
+                    "Event-label supervision failed (%s); IF/VAE results and the OOT "
+                    "deliverables are unaffected.", exc,
+                )
+
     # -- Analyst dashboard: ONE file, IF + VAE scores together -------------- #
     # Not one per deliverable model: the dashboard shows both detectors'
     # scores for the same individual side by side (an in-memory join on
@@ -1840,6 +1953,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             "oot_excel": oot_excels,
             "diagnostic_suite": diagnostic_suite_result,
             "sensitivity_analysis": sensitivity_result,
+            "event_supervision": event_supervision_result,
             # Quick-glance mirror of ERROR/CRITICAL lines logged so far this
             # run. Routine warnings are intentionally excluded from reports.
             # `execution.log` is always the complete, authoritative record;
@@ -1914,6 +2028,10 @@ def run_pipeline(config: PipelineConfig) -> dict:
         "sensitivity_analysis": (
             sensitivity_result.get("artifacts", {}) if sensitivity_result else {}
         ),
+        "event_supervision": (
+            event_supervision_result.get("artifacts", {})
+            if event_supervision_result and event_supervision_result.get("status") == "executed" else {}
+        ),
         "p95_checkpoint": p95_path,
         "attribution_workbook": attribution_path,
         "reports": report_paths,
@@ -1930,6 +2048,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         f"  Analyst dashboard: {analyst_dashboard_path or '(none)'}",
         f"  IF-VAE diagnostic suite: {artifacts['ifvae_diagnostic_report'] or '(not run)'}",
         f"  Sensitivity analysis: {artifacts['sensitivity_analysis'].get('html', '(not run)')}",
+        f"  Event-label gate 4.5: {(artifacts['event_supervision'] or {}).get('label_gate', '(not run / no labels file)')}",
         f"  Feature attribution (xlsx): {attribution_path}",
         f"  Report (html)  : {report_paths.get('html')}",
         f"  Report (md)    : {report_paths.get('md')}",
@@ -2149,6 +2268,63 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Record-level share of input columns that must be an exact 0 "
                              "for the row to be dropped from the panel before the split, "
                              "fitting, and every downstream artifact (default 0.90).")
+    parser.add_argument("--run-event-supervision", action=argparse.BooleanOptionalAction,
+                        default=True,
+                        help="Phase 8c: evaluate IF/VAE against reviewed event labels, decide "
+                             "gate 4.5 and (if authorised) run supervised challengers. Does "
+                             "nothing when no labels file is found (default ON).")
+    parser.add_argument("--labels-path", type=str, default=None,
+                        help="CSV/parquet with at least entity_id, codmes and target (plus "
+                             "optional label_status, episode_id, maturity_date). Default: the "
+                             "newest file under data/reviewed_labels/.")
+    parser.add_argument("--labels-dir", type=str, default=None,
+                        help="Folder searched when --labels-path is not given "
+                             "(default data/reviewed_labels/).")
+    parser.add_argument("--labels-entity-column", type=str, default=None,
+                        help="Entity column in the labels file (default: auto-detect entity_id/...).")
+    parser.add_argument("--labels-period-column", type=str, default=None,
+                        help="Month column in the labels file (default: auto-detect codmes/period/...).")
+    parser.add_argument("--labels-target-column", type=str, default=None,
+                        help="Target column in the labels file (default: auto-detect target/label/...).")
+    parser.add_argument("--labels-status-column", type=str, default=None,
+                        help="Status column (default: auto-detect label_status).")
+    parser.add_argument("--labels-usable-statuses", type=str, nargs="+",
+                        default=None,
+                        help="label_status values that count as a usable decision "
+                             "(default: confirmed adjudicated). pending/uncertain/conflict/"
+                             "superseded/withdrawn are never negatives.")
+    parser.add_argument("--labels-unlisted-as-negative", action="store_true",
+                        help="Treat panel rows the labels file does not mention as confirmed "
+                             "negatives. Only for an exhaustive base; vetoed by the gate unless "
+                             "--labels-audit-attested.")
+    parser.add_argument("--labels-audit-attested", action="store_true",
+                        help="Attest that unlisted rows were audited as negatives.")
+    parser.add_argument("--labels-formal-calc-ok", action="store_true",
+                        help="Attest that the formal sample-size calculation (Riley/pmsampsize) "
+                             "is satisfied; required for the green gate level.")
+    parser.add_argument("--label-horizon-months", type=int, default=1,
+                        help="Months a label needs to be mature (default 1).")
+    parser.add_argument("--label-confirm-delay-months", type=int, default=0,
+                        help="Operational delay to confirm a label, in months (default 0).")
+    parser.add_argument("--label-maturity-buffer-months", type=int, default=0,
+                        help="Extra maturity buffer, in months (default 0).")
+    parser.add_argument("--label-washout-months", type=int, default=1,
+                        help="Non-positive months that close an episode (default 1: only "
+                             "consecutive positive months collapse into one episode).")
+    parser.add_argument("--labels-as-of", type=str, default=None,
+                        help="Point-in-time cut-off (YYYYMM or YYYY-MM-DD) for maturity and "
+                             "label availability (default: last panel month).")
+    parser.add_argument("--review-capacity-k", type=int, default=None,
+                        help="Rows the business can review per evaluation window (K for "
+                             "precision@K/recall@K). Default: 5%% of eligible rows (an assumption).")
+    parser.add_argument("--hazard-horizon-months", type=int, default=3,
+                        help="Horizon H of the discrete-hazard challenger: 'a new episode "
+                             "starts within H months' (default 3).")
+    parser.add_argument("--event-challengers", choices=("off", "auto", "force"), default="auto",
+                        help="Supervised challengers: off; auto = only if gate 4.5 authorises "
+                             "them (default); force = exploratory run despite a red gate.")
+    parser.add_argument("--event-bootstrap-reps", type=int, default=100,
+                        help="Entity-cluster bootstrap replicates for the intervals (0 = off).")
     parser.add_argument("--contamination", type=float, default=None,
                         help="Isolation Forest operating-point contamination, used by both "
                              "the tuned and untuned paths (default 0.02; must be in (0, 0.5]). "
@@ -2244,7 +2420,41 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         sensitivity_random_subsets_per_level=args.sensitivity_random_subsets,
         sensitivity_high_zero_cutoff=args.sensitivity_high_zero_cutoff,
         exact_zero_row_cutoff=args.exact_zero_row_cutoff,
+        run_event_supervision=args.run_event_supervision,
+        labels_path=args.labels_path,
+        labels_entity_col=args.labels_entity_column,
+        labels_period_col=args.labels_period_column,
+        labels_target_col=args.labels_target_column,
+        labels_status_col=args.labels_status_column,
+        labels_unlisted_as_negative=args.labels_unlisted_as_negative,
+        labels_audit_attested=args.labels_audit_attested,
+        labels_formal_calc_ok=args.labels_formal_calc_ok,
+        label_horizon_months=args.label_horizon_months,
+        label_confirm_delay_months=args.label_confirm_delay_months,
+        label_maturity_buffer_months=args.label_maturity_buffer_months,
+        label_washout_months=args.label_washout_months,
+        labels_as_of=args.labels_as_of,
+        review_capacity_k=args.review_capacity_k,
+        hazard_horizon_months=args.hazard_horizon_months,
+        event_challengers=args.event_challengers,
+        event_bootstrap_reps=args.event_bootstrap_reps,
     )
+    if args.labels_dir is not None:
+        config.labels_dir = args.labels_dir
+    if args.labels_usable_statuses is not None:
+        config.labels_usable_statuses = tuple(args.labels_usable_statuses)
+    for _flag, _val in (("--label-horizon-months", args.label_horizon_months),
+                        ("--label-confirm-delay-months", args.label_confirm_delay_months),
+                        ("--label-maturity-buffer-months", args.label_maturity_buffer_months),
+                        ("--hazard-horizon-months", args.hazard_horizon_months)):
+        if _val < 0 or (_flag == "--hazard-horizon-months" and _val < 1):
+            raise SystemExit(f"{_flag} must be a non-negative number of months (hazard: at least 1).")
+    if args.label_washout_months < 1:
+        raise SystemExit("--label-washout-months must be at least 1.")
+    if args.review_capacity_k is not None and args.review_capacity_k < 1:
+        raise SystemExit("--review-capacity-k must be a positive number of rows.")
+    if args.event_bootstrap_reps < 0:
+        raise SystemExit("--event-bootstrap-reps cannot be negative.")
     # Validated here rather than inside the diagnostic bridge: a malformed
     # grid should stop the run at argument-parsing time, not halfway through
     # a fitted pipeline. `is not None` (not truthiness): `--diagnostic-

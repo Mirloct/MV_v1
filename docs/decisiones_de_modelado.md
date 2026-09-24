@@ -378,7 +378,7 @@ un número que no cambia esa rápido.
 
 **Rediseño:** el panel de fases pasó de una tabla que solo mostraba las
 últimas completadas (creciendo/desplazándose a medida que avanzaba la corrida)
-a una **lista fija de las fases planeadas (15 en esa ronda; hoy 19, ver
+a una **lista fija de las fases planeadas (15 en esa ronda; hoy 20, ver
 `_PHASE_PLAN`), visible completa desde el primer cuadro**: cada fila empieza en `□` (pendiente, atenuada) y cambia en el mismo
 lugar a `▣` (en curso, cian) o `■` (completada, verde / roja si falló) -- nada
 se agrega ni se desplaza, solo cambia de estado.

@@ -67,6 +67,10 @@ __all__ = [
     "SENSITIVITY_MATRIX_CSV",
     "SENSITIVITY_HIGH_ZERO_CSV",
     "SENSITIVITY_SUMMARY_JSON",
+    "REVIEWED_LABELS_DIR",
+    "LABEL_GATE_JSON",
+    "EVENT_EVALUATION_CSV",
+    "EVENT_CHALLENGERS_JSON",
 ]
 
 # -- roots ------------------------------------------------------------------ #
@@ -158,6 +162,16 @@ SENSITIVITY_VARIABLES_CSV = os.path.join(REPORTS_DIR, "sensitivity_variables.csv
 SENSITIVITY_MATRIX_CSV = os.path.join(REPORTS_DIR, "sensitivity_matrix.csv")
 SENSITIVITY_HIGH_ZERO_CSV = os.path.join(REPORTS_DIR, "sensitivity_high_zero_records.csv")
 SENSITIVITY_SUMMARY_JSON = os.path.join(REPORTS_DIR, "sensitivity_summary.json")
+
+# -- reviewed event labels (Phase 8c) ------------------------------------------ #
+# INPUT, human-provided and outside `artifacts/` (which the pipeline may rebuild
+# from scratch): a CSV with at least entity_id, codmes and target that gives
+# (entity, month) rows a reviewed target. Never created by the pipeline.
+REVIEWED_LABELS_DIR = os.path.join("data", "reviewed_labels")
+# OUTPUTS of `src/evaluation/event_supervision.py`.
+LABEL_GATE_JSON = os.path.join(REPORTS_DIR, "label_gate.json")
+EVENT_EVALUATION_CSV = os.path.join(REPORTS_DIR, "event_evaluation.csv")
+EVENT_CHALLENGERS_JSON = os.path.join(REPORTS_DIR, "event_challengers.json")
 
 # -- observability ------------------------------------------------------------ #
 # Structured JSON-Lines event stream (src/utils/observability.py); the source

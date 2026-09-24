@@ -2599,3 +2599,73 @@ el README, `TRADEOFFS.md` y `EVIDENCE_PACKAGE.md` de la suite.
 así que usan `artifacts/models/vae/` por defecto. En esta máquina restauraron el
 checkpoint existente sin modificarlo (mtime intacto), pero en una máquina sin
 checkpoint compatible lo crearían ahí.
+
+
+---
+
+## 2026-09-23 — Labels revisados por eventos, compuerta 4.5 y challengers supervisados (Fase 8c)
+
+**Pedido:** `data.csv` no tiene columna target; debe poder existir otra tabla (en otra
+carpeta) con al menos `entity_id`, `codmes` y `target` para asignar un target a
+cada (entidad, mes) y usarlo en la evaluación del modelo, siguiendo
+`reports/Supervisión temporal por eventos.md`: con menos de 30 episodios positivos
+maduros e independientes se continúa con IF/VAE; con 30-99 se explora logística
+penalizada o hazard discreto; construir ambas partes con fallbacks; y que una
+carpeta vacía o un archivo sin contenido **no tumbe la corrida**.
+
+**Módulos nuevos.**
+`src/evaluation/event_labels.py` (lee la tabla, resuelve columnas y estados,
+descarta duplicados en conflicto, colapsa meses positivos en episodios y calcula
+madurez; una fila que el archivo no menciona es *desconocida*, nunca 0),
+`label_gate.py` (semáforo rojo / ámbar 1 / ámbar 2 / verde condicionado por
+episodios maduros, entidades, orígenes temporales y positivos OOS, con vetos que
+prevalecen sobre el conteo), `event_evaluation.py` (AP, precision/recall/lift/FP
+@K, recall de episodios, IC por bootstrap por entidad, marca `conclusive` con el
+mínimo de 20 episodios por ventana, calibración), `src/models/event_challenger.py`
+(cabeza logística sobre scores congelados, ridge logístico y hazard discreto, con
+purga temporal, `C` elegido solo en validación y fallbacks por familia) y
+`event_supervision.py` (orquesta la fase y escribe `label_gate.json`,
+`event_evaluation.csv`, `event_challengers.json`). Capítulo nuevo en el reporte
+(`src/reporting/event_supervision_section.py`), fase 8c en el dashboard, 20
+entradas en el plan de fases.
+
+**Decisiones que conviene conocer.** (1) Los labels se leen después de ajustar
+IF/VAE: no influyen en el entrenamiento ni en el tuneo. (2) La compuerta exige,
+además del conteo, las condiciones de evidencia del documento (p. ej. ≥2 orígenes
+temporales para ámbar 1): 40 episodios con un único origen siguen en rojo, y
+`unmet_for_next_level` dice qué falta. (3) Los cortes 30/100/200 son heurísticas
+internas de gobierno del documento, no umbrales publicados; están en
+`GateThresholds`. (4) El verde exige `--labels-formal-calc-ok` (cálculo formal de
+tamaño, que este código no hace). (5) Boosting y ensembles balanceados están
+*autorizados* por el semáforo pero **no implementados**; el acta los lista como
+tales. (6) `--labels-unlisted-as-negative` existe para una base exhaustiva, pero
+el veto `unreviewed_converted_to_negative` lo bloquea sin
+`--labels-audit-attested`. (7) K por defecto es el 5% de las filas elegibles (un
+supuesto, marcado como tal); conviene fijar `--review-capacity-k`.
+
+**Fallbacks.** Sin archivo / carpeta vacía o inexistente → `no_labels_file`; archivo
+de 0 bytes, solo encabezado, en blanco o con target vacío → `empty_labels_file`;
+archivo corrupto/binario, sin columnas clave, meses ilegibles o sin coincidencias
+con el panel → `contract_error`; compuerta roja → se evalúa IF/VAE y no se corre
+ningún challenger; una familia con pocos episodios de ajuste, una sola clase o un
+ajuste fallido → esa familia `skipped`/`failed` con su motivo. Todo se registra en
+el log y en el reporte, y el resto del pipeline corre igual.
+
+**Verificación.** 36 pruebas nuevas en `tests/test_event_supervision.py` con CSV
+reales en disco (episodios, madurez, hazard, cada nivel y veto de la compuerta,
+métricas con respuesta conocida, challengers con señal aprendible, todos los
+casos vacíos/corruptos); suite del proyecto completa verde. Además, una corrida
+real de `main.py` en un directorio temporal (las rutas del proyecto son relativas
+al CWD, por lo que `artifacts/` de la corrida oficial no se tocó): primero con
+`data/reviewed_labels/` vacía y luego con una tabla construida desde el ground
+truth sintético.
+
+**Resultado de esa corrida real (datos sintéticos, 400 entidades x 16 meses).** Con la carpeta
+vacía: `Phase 8c` registró "No se encontró el archivo de labels ... sigue solo con IF/VAE" en 0.05 s y el
+pipeline completo (Excel OOT, dashboard, interpretabilidad, reporte) terminó igual. Con la tabla:
+6 400 filas etiquetadas, 141 episodios positivos (133 maduros, 115 entidades, 5 orígenes, 28 positivos OOS),
+nivel **ámbar 1** (faltaban los 50 positivos OOS para ámbar 2), las tres familias de challengers
+ejecutadas y comparadas con IF/VAE sobre las mismas filas; el reporte y el HTML del flow incluyen el
+capítulo y la fase. Con el hazard a 3 meses la ventana OOT (últimos 3 meses) queda censurada por diseño y
+se informa como "sin filas elegibles". Es un panel sintético: prueba el cableado y los fallbacks, no el
+desempeño sobre datos reales.

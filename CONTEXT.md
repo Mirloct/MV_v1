@@ -700,7 +700,7 @@ P95 checkpoint, stacking, or the VAE deliverable.
 - During a run, `main.py` shows a live console dashboard (`rich`, disables
   itself when stdout is not a terminal or `rich` is missing; `--no-console-ui`
   forces it off): a fixed phase checklist (one row per `_PHASE_PLAN` entry,
-  19 today), an "Supuestos (IF/VAE)" panel fed by genuine assumption/gate
+  20 today), an "Supuestos (IF/VAE)" panel fed by genuine assumption/gate
   `observability.check(...)` calls, a dedicated interpretability sub-step line
   under the current-phase readout (see "Live view: interpretability's
   checkpoints..." above), a **"↳ función" line** (the nested functions
@@ -834,6 +834,103 @@ Artifacts under `artifacts/reports/`: `sensitivity_analysis.html`,
 `sensitivity_analysis.xlsx`, scenario/variable/matrix/high-zero CSVs and
 `sensitivity_summary.json`. The main HTML/Markdown report links them and shows
 the minimum stable variable count plus the ≥90% record recommendation.
+
+## Reviewed event labels, gate 4.5 and challengers (Phase 8c)
+
+`data.csv` has **no target column**. A separate table gives `(entity_id, codmes)`
+rows a reviewed target, and Phase 8c (`src/evaluation/event_supervision.py`)
+uses it **after** IF and VAE are fitted and scored, so labels can never touch
+training. The design comes from `reports/Supervisión temporal por eventos.md`
+(a referential gate, not a model): supervision is conditioned on evidence
+counted in **mature, independent positive episodes**, not on a row rate.
+
+**Where the table lives.** Any CSV/parquet with at least `entity_id`, `codmes`
+(`YYYYMM`) and `target` (`0` confirmed normal, `1` confirmed anomaly, empty = no
+decision). Default folder `data/reviewed_labels/` (input, outside `artifacts/`,
+gitignored, never created by the pipeline; `current/reviewed_labels.csv` wins,
+else the newest table; `quarantine/`, `fixtures/`, `schema/` are skipped);
+`--labels-path FILE` / `--labels-dir DIR` override it. Column names are
+auto-detected (`entity_id|id_entidad|...`, `codmes|period|periodo|mes`,
+`target|label|is_anomaly|y`) or mapped with `--labels-entity-column`,
+`--labels-period-column`, `--labels-target-column`, `--labels-status-column`.
+Optional columns: `label_status` (only `confirmed`/`adjudicated` count; override
+with `--labels-usable-statuses`; `pending`, `uncertain`, `conflict`,
+`superseded`, `withdrawn` never become negatives), `episode_id`,
+`maturity_date`, `label_available_at` (rows available after the cut-off are
+excluded).
+
+**Never invented negatives.** A panel row the file does not mention is *unknown*,
+not 0; so are null/invalid targets, excluded statuses and conflicting duplicates
+(same entity+month, different target -> dropped and counted).
+`--labels-unlisted-as-negative` is an explicit opt-in for an exhaustive base and
+the gate **vetoes** it unless `--labels-audit-attested`. Positive months are
+collapsed into **episodes** (`episode_id` if the file has it, else consecutive
+positive months of one entity; `--label-washout-months` is how many non-positive
+months close one). A row is usable only if **mature**: positives when their
+episode's end + horizon (`--label-horizon-months`, default 1) +
+`--label-confirm-delay-months` + `--label-maturity-buffer-months` has elapsed by
+the cut-off (`--labels-as-of`, default last panel month); negatives when their own
+horizon has elapsed.
+
+**Gate 4.5 (`label_gate.py`).** Level by mature positive episodes, plus evidence
+requirements; any veto forces `rojo`:
+
+| Level | Episodes | Also required | Authorised |
+| --- | --- | --- | --- |
+| `rojo` | `<30` (or `<10` positive entities) | -- | IF/VAE only |
+| `ambar_1` | 30-99 | >=10 entities, >=2 temporal origins, no month with >50% of episodes | + penalised logistic, discrete hazard, head over frozen scores |
+| `ambar_2` | 100-199 | >=20 entities, >=3 origins, >=50 OOS positive episodes | + restricted boosting (authorised, **not implemented**) |
+| `verde_condicionado` | >=200 | >=30 entities, >=3 origins, >=50 OOS, `--labels-formal-calc-ok` | + balanced ensembles (not implemented) |
+
+The cut-offs are the document's internal governance heuristics
+(`GateThresholds`), not published thresholds. Vetoes: `no_usable_labels`,
+`no_confirmed_negatives`, `invalid_target_values`, `label_conflicts`,
+`unreviewed_converted_to_negative`, `episodes_not_collapsed` (positives without
+`episode_id` in a file that has the column). Unknowable fields (audited
+non-alerts, regimes) are reported `None`, never made up. A file with 40 mature
+episodes but a single temporal origin is still `rojo`; `unmet_for_next_level`
+says exactly what is missing.
+
+**Evaluation (`event_evaluation.py`).** Frozen IF and VAE scores against the
+labels on the test and OOT windows, for two targets: `current_month` and
+`onset_within_<H>m` (a NEW episode starts within `--hazard-horizon-months`;
+rows inside an episode are not at risk, right-censored rows are dropped, not
+called negative -- so with the default 3-month horizon the last 3 months of the
+panel, i.e. the default OOT window, have no eligible rows for this target and
+the report says "sin filas elegibles" instead of inventing a result). Metrics: AP (with its base rate), ROC-AUC (secondary),
+precision/recall/lift/FP @K (`--review-capacity-k`, default 5% of eligible rows --
+an assumption, flagged), episode recall@K, entity-cluster bootstrap 95% intervals
+(`--event-bootstrap-reps`). A window with `< 20` positive episodes is
+`conclusive: false` -- descriptive only, it cannot decide which model wins.
+
+**Challengers (`src/models/event_challenger.py`).** L2 logistic regressions at
+natural prevalence, no resampling: `logit_scores_head` (2 frozen scores),
+`ridge_logistic` (<= `max_features` train-screened columns) and `discrete_hazard`
+(person-period). Leakage is enforced in code: fit rows end `purge` months
+(maturity lag; hazard: its horizon) before the first evaluation month and any
+episode touching that embargo is dropped from fitting; `C` is chosen on the
+validation months only. Reported: coefficients, events per parameter (warning
+`< 10`), Brier/log-loss/calibration slope+intercept (only with >= 20 events),
+and the IF/VAE baselines on the *same* rows. Nothing is promoted from this acta.
+`--event-challengers off|auto|force`: `auto` runs them only if the gate allows
+(red -> skipped with the reason); `force` runs them anyway, flagged exploratory.
+
+**Fallbacks (the run never stops because of labels).** No file / empty or
+missing folder -> `no_labels_file`; 0-byte file, header only, blank lines or an
+all-empty target -> `empty_labels_file`; corrupt/binary/locked file, missing
+key columns, unparseable months, no overlap with the panel -> `contract_error`;
+red gate -> IF/VAE evaluated, no challenger; a family with too few training
+episodes, one class, or a failed fit -> that family `skipped`/`failed` with its
+reason. Any other exception inside the phase is caught in `main.py` and logged.
+In every case the rest of the pipeline (Excel, dashboard, suite, sensitivity,
+interpretability, report) runs unchanged, and the report chapter says whether
+labels were used or ignored and why. `--no-run-event-supervision` skips the phase.
+
+Artifacts under `artifacts/reports/`: `label_gate.json` (the acta: audit of the
+file, metrics, level, vetoes, authorised families, thresholds),
+`event_evaluation.csv` (one row per detector/challenger x target x window) and
+`event_challengers.json`; the report gains "Labels de eventos y compuerta de
+supervisión (4.5)". Tests: `tests/test_event_supervision.py`.
 
 ## IF-VAE Diagnostic Suite integration
 

@@ -35,6 +35,10 @@ from typing import Iterable, Optional, Sequence
 
 from src.utils import paths
 from src.utils.logging_config import log_phase, setup_logging
+from src.reporting.event_supervision_section import (
+    event_supervision_html,
+    event_supervision_markdown,
+)
 from src.utils.progress import Bar
 
 __all__ = ["build_report"]
@@ -438,6 +442,7 @@ def _build_markdown(context: dict, out_dir: str) -> str:
     parts.append(_diagnostic_suite_section_md(context))
     parts.append(_interpretation_section_md(context))
     parts.append(_sensitivity_section_md(context, out_dir))
+    parts.append(event_supervision_markdown(context, out_dir))
 
     # -- figures gallery ----------------------------------------------------- #
     figures = context.get("figures") or []
@@ -1719,6 +1724,7 @@ def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
     parts.append(_diagnostic_suite_section_html(context))
     parts.append(_interpretation_section_html(context))
     parts.append(_sensitivity_section_html(context, out_dir))
+    parts.append(event_supervision_html(context, out_dir))
 
     # -- models ---------------------------------------------------------------- #
     if models:

@@ -91,6 +91,45 @@ python main.py --quick --no-tune --no-auto-install-suite
 En ese modo la fase diagnóstica informa claramente que la suite no está
 disponible; no intenta descargar un paquete por nombre desde internet.
 
+## Labels revisados: cómo preparar la tabla y qué esperar
+
+Tu panel (`data.csv`) no tiene target. Para medir IF/VAE contra resultados reales
+hace falta una tabla aparte, por ejemplo `data/reviewed_labels/reviewed_labels.csv`:
+
+```csv
+entity_id,codmes,target,label_status
+00123,202403,1,confirmed
+00123,202404,1,confirmed
+00456,202403,0,confirmed
+00789,202405,,pending
+```
+
+- `entity_id` y `codmes` deben coincidir con el panel (los ceros a la izquierda se
+  conservan). `target` es `1`/`0`; vacío significa "sin decisión", **nunca** 0.
+- Las filas del panel que la tabla no menciona quedan fuera de toda métrica.
+- Varios meses positivos seguidos de una misma entidad son **un** episodio, no
+  varios eventos.
+- Un label solo cuenta cuando está *maduro*: han pasado el horizonte y el retraso
+  de confirmación (`--label-horizon-months`, `--label-confirm-delay-months`).
+
+```mermaid
+flowchart TD
+    A[Tabla de labels] --> B{¿Existe, tiene filas y cumple el contrato?}
+    B -->|No| Z[Se ignora y se registra: todo lo demás corre igual]
+    B -->|Sí| C[Episodios y madurez]
+    C --> D{Compuerta 4.5}
+    D -->|"< 30 episodios o veto"| E[Solo IF/VAE evaluados con los labels]
+    D -->|"30-99"| F[+ logística penalizada / hazard discreto, exploratorio]
+    D -->|"100-199"| G[+ piloto]
+    D -->|">= 200 y cálculo formal"| H[+ candidato]
+```
+
+Cómo leer el resultado: `label_gate.json` dice el nivel, qué falta para el
+siguiente y los vetos; `event_evaluation.csv` compara IF, VAE y los challengers en
+las mismas filas y ventanas (test y OOT). Una ventana con menos de 20 episodios
+positivos es **solo descriptiva**: no decide qué modelo gana. Ningún challenger se
+promueve automáticamente; IF/VAE siguen siendo el baseline.
+
 ## Seguir la suite diagnóstica mientras corre
 
 La Fase 9c es la parte más lenta del diagnóstico porque reajusta los detectores

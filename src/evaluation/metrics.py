@@ -32,6 +32,9 @@ from sklearn.metrics import (
     silhouette_score,
 )
 
+from src.utils.logging_config import log_phase
+from src.utils.progress import track
+
 __all__ = ["supervised_metrics", "unsupervised_metrics", "metrics_by_anomaly_type"]
 
 _NAN = float("nan")
@@ -338,7 +341,7 @@ def _rank_stability(scores: np.ndarray, sample_size: int, rng: np.random.Generat
         return 1.0  # a constant score is (degenerately) perfectly stable
     ref_rank = rankdata(ref_scores)
     corrs = []
-    for _ in range(n_boot):
+    for _ in track(range(n_boot), desc="rank_stability[bootstraps]", unit="bootstrap"):
         jitter = rng.normal(0.0, 0.01 * std, size=m)
         boot_rank = rankdata(ref_scores + jitter)
         rho = spearmanr(ref_rank, boot_rank).correlation
@@ -401,12 +404,17 @@ def unsupervised_metrics(
         X_sub = _to_dense_subsample(X, sub_idx)
         # Guard non-finite values that would break the distance computations.
         X_sub = np.nan_to_num(X_sub, nan=0.0, posinf=0.0, neginf=0.0)
+        # The silhouette is O(m^2) in the subsample and is what makes this
+        # function slow on a large panel, so it is named as its own step.
         try:
-            out["silhouette"] = _safe_float(silhouette_score(X_sub, sub_labels))
+            with log_phase("evaluation.silhouette_score"):
+                out["silhouette"] = _safe_float(silhouette_score(X_sub, sub_labels))
         except (ValueError, RuntimeWarning):
             out["silhouette"] = _NAN
         try:
-            out["calinski_harabasz"] = _safe_float(calinski_harabasz_score(X_sub, sub_labels))
+            with log_phase("evaluation.calinski_harabasz_score"):
+                out["calinski_harabasz"] = _safe_float(
+                    calinski_harabasz_score(X_sub, sub_labels))
         except (ValueError, RuntimeWarning):
             out["calinski_harabasz"] = _NAN
     else:
@@ -414,5 +422,6 @@ def unsupervised_metrics(
         out["silhouette"] = _NAN
         out["calinski_harabasz"] = _NAN
 
-    out["rank_stability"] = _rank_stability(s, sample_size, rng)
+    with log_phase("evaluation.rank_stability"):
+        out["rank_stability"] = _rank_stability(s, sample_size, rng)
     return out

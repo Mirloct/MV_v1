@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from . import progress
 from .config import DiagnosticConfig
 from .contracts import DataContractError, validate_frames
 from .data_quality import compare_populations, leakage_name_warnings
@@ -160,6 +161,34 @@ def _add_percentiles(
     return percentile_columns
 
 
+def _percentile_frame(
+    scored: pd.DataFrame,
+    reference_scores: pd.DataFrame,
+    scored_scores: pd.DataFrame,
+    if_reference: np.ndarray,
+    if_scored: np.ndarray,
+    config: DiagnosticConfig,
+) -> tuple[pd.DataFrame, list[str]]:
+    """The scored frame plus every percentile/ensemble/quadrant column, and
+    the four columns that downstream metrics rank by."""
+    if config.vae_primary_score not in scored_scores:
+        raise DataContractError(
+            f"vae_primary_score {config.vae_primary_score!r} is unavailable; "
+            f"choose one of {list(scored_scores.columns)}"
+        )
+    output = scored.copy()
+    _add_percentiles(output, reference_scores, scored_scores)
+    output["if_score"] = if_scored
+    output["if_percentile"] = anomaly_percentile(if_reference, if_scored)
+    output["vae_percentile"] = output[f"{config.vae_primary_score}_percentile"]
+    output["ensemble_max"] = output[["if_percentile", "vae_percentile"]].max(axis=1)
+    output["ensemble_mean"] = output[["if_percentile", "vae_percentile"]].mean(axis=1)
+    output["quadrant"] = assign_disagreement_quadrant(
+        output["if_percentile"], output["vae_percentile"], config.percentile_threshold
+    )
+    return output, ["if_percentile", "vae_percentile", "ensemble_max", "ensemble_mean"]
+
+
 def _group_metrics(
     scored: pd.DataFrame,
     config: DiagnosticConfig,
@@ -271,22 +300,42 @@ def _write_outputs(
     stability: dict[str, Any] | None,
     config: DiagnosticConfig,
 ) -> None:
-    result.scored.to_csv(output_dir / "scored_diagnostics.csv", index=False)
-    result.metrics.to_csv(output_dir / "metrics.csv", index=False)
-    result.drift.to_csv(output_dir / "drift.csv", index=False)
-    result.autopsies.to_csv(output_dir / "autopsies.csv", index=False)
-    group_metrics.to_csv(output_dir / "metrics_by_group.csv", index=False)
-    write_json(result.summary, output_dir / "summary.json")
-    write_json({"warnings": result.warnings}, output_dir / "warnings.json")
-    write_json({"coverage": coverage}, output_dir / "coverage.json")
-    write_json({"stability": stability}, output_dir / "if_stability.json")
-    write_json(config.to_dict(), output_dir / "resolved_config.json")
-    disagreement_plot(result.scored, output_dir / "disagreement.png", config.label_col)
-    has_metrics_plot = metrics_bar_plot(result.metrics, output_dir / "metrics.png")
-    write_markdown_report(
-        output_dir / "report.md", result.summary, result.metrics, result.drift,
-        result.warnings, has_metrics_plot,
+    # `report.md` links the metrics plot only if it was actually drawn, so the
+    # plot writer records whether it was, and the report writer reads that.
+    has_metrics_plot: list[bool] = []
+    writers = (
+        ("scored_diagnostics.csv",
+         lambda: result.scored.to_csv(output_dir / "scored_diagnostics.csv", index=False)),
+        ("metrics.csv", lambda: result.metrics.to_csv(output_dir / "metrics.csv", index=False)),
+        ("drift.csv", lambda: result.drift.to_csv(output_dir / "drift.csv", index=False)),
+        ("autopsies.csv",
+         lambda: result.autopsies.to_csv(output_dir / "autopsies.csv", index=False)),
+        ("metrics_by_group.csv",
+         lambda: group_metrics.to_csv(output_dir / "metrics_by_group.csv", index=False)),
+        ("summary.json", lambda: write_json(result.summary, output_dir / "summary.json")),
+        ("warnings.json",
+         lambda: write_json({"warnings": result.warnings}, output_dir / "warnings.json")),
+        ("coverage.json",
+         lambda: write_json({"coverage": coverage}, output_dir / "coverage.json")),
+        ("if_stability.json",
+         lambda: write_json({"stability": stability}, output_dir / "if_stability.json")),
+        ("resolved_config.json",
+         lambda: write_json(config.to_dict(), output_dir / "resolved_config.json")),
+        ("disagreement.png",
+         lambda: disagreement_plot(
+             result.scored, output_dir / "disagreement.png", config.label_col)),
+        ("metrics.png",
+         lambda: has_metrics_plot.append(
+             metrics_bar_plot(result.metrics, output_dir / "metrics.png"))),
+        ("report.md",
+         lambda: write_markdown_report(
+             output_dir / "report.md", result.summary, result.metrics, result.drift,
+             result.warnings, has_metrics_plot[0])),
     )
+    for _name, write in progress.track(
+        writers, desc="write_outputs[files]", unit="file", label=lambda item: item[0]
+    ):
+        write()
 
 
 def run_diagnostic(
@@ -297,57 +346,63 @@ def run_diagnostic(
 ) -> DiagnosticResult:
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
-    base_warnings = validate_frames(
-        reference, scored, config.features, config.id_col, config.label_col, config.time_col
-    )
-    reference_x, scored_x = prepare_features(reference, scored, config.features)
-    if_reference, if_scored, if_runs = _if_outputs(
-        reference, scored, reference_x, scored_x, config
-    )
-    ref_residual, score_residual, _, score_recon = _reconstruction_arrays(
-        reference, scored, config, reference_x, scored_x
-    )
-    reference_scores, scored_scores, contributions = _score_reconstruction_candidates(
-        ref_residual, score_residual, config
-    )
-    latent = _add_latent_candidates(reference, scored, config, reference_scores, scored_scores)
-    if config.vae_primary_score not in scored_scores:
-        raise DataContractError(
-            f"vae_primary_score {config.vae_primary_score!r} is unavailable; "
-            f"choose one of {list(scored_scores.columns)}"
-        )
-    output = scored.copy()
-    _add_percentiles(output, reference_scores, scored_scores)
-    output["if_score"] = if_scored
-    output["if_percentile"] = anomaly_percentile(if_reference, if_scored)
-    output["vae_percentile"] = output[f"{config.vae_primary_score}_percentile"]
-    output["ensemble_max"] = output[["if_percentile", "vae_percentile"]].max(axis=1)
-    output["ensemble_mean"] = output[["if_percentile", "vae_percentile"]].mean(axis=1)
-    output["quadrant"] = assign_disagreement_quadrant(
-        output["if_percentile"], output["vae_percentile"], config.percentile_threshold
-    )
-    score_columns = ["if_percentile", "vae_percentile", "ensemble_max", "ensemble_mean"]
-    metrics, group_metrics, coverage, autopsies, known_positives, positive_quadrants = (
-        _supervised_outputs(
-            output, reference, scored, scored_x, score_recon, contributions,
-            score_columns, config,
-        )
-    )
-    stability = top_k_stability(if_runs, max(config.alert_budgets)) if if_runs is not None else None
-    warnings = _build_warnings(base_warnings, output, config, latent, stability is not None)
-    drift = compare_populations(reference, scored, config.features)
-    summary = {
-        "rows_scored": len(output),
-        "known_positives": known_positives,
-        "vae_primary_score": config.vae_primary_score,
-        "percentile_threshold": config.percentile_threshold,
-        "quadrants": output["quadrant"].value_counts().to_dict(),
-        "positive_quadrants": positive_quadrants,
-        "latent_diagnostics": latent,
-        "warning_count": len(warnings),
-        "reference_fingerprint": _frame_fingerprint(reference),
-        "scored_fingerprint": _frame_fingerprint(scored),
-    }
-    result = DiagnosticResult(output, metrics, drift, autopsies, summary, warnings)
-    _write_outputs(destination, result, group_metrics, coverage, stability, config)
+    with progress.stages("run_diagnostic", total=12) as stages:
+        with stages.stage("validate_frames", label="Data contract checks"):
+            base_warnings = validate_frames(
+                reference, scored, config.features, config.id_col, config.label_col,
+                config.time_col,
+            )
+        with stages.stage("prepare_features", label="Median-impute the feature matrix"):
+            reference_x, scored_x = prepare_features(reference, scored, config.features)
+        with stages.stage("if_outputs", label="Isolation Forest scores"):
+            if_reference, if_scored, if_runs = _if_outputs(
+                reference, scored, reference_x, scored_x, config
+            )
+        with stages.stage("reconstruction_arrays", label="VAE reconstruction residuals"):
+            ref_residual, score_residual, _, score_recon = _reconstruction_arrays(
+                reference, scored, config, reference_x, scored_x
+            )
+        with stages.stage("reconstruction_scores", label="VAE reconstruction score candidates"):
+            reference_scores, scored_scores, contributions = _score_reconstruction_candidates(
+                ref_residual, score_residual, config
+            )
+        with stages.stage("latent_candidates", label="Latent-space score candidates"):
+            latent = _add_latent_candidates(
+                reference, scored, config, reference_scores, scored_scores
+            )
+        with stages.stage("percentiles_and_quadrants", label="Percentiles and quadrants"):
+            output, score_columns = _percentile_frame(
+                scored, reference_scores, scored_scores, if_reference, if_scored, config
+            )
+        with stages.stage("supervised_outputs", label="Label-conditioned metrics (if any)"):
+            metrics, group_metrics, coverage, autopsies, known_positives, positive_quadrants = (
+                _supervised_outputs(
+                    output, reference, scored, scored_x, score_recon, contributions,
+                    score_columns, config,
+                )
+            )
+        with stages.stage("top_k_stability", label="Top-K stability across IF seeds"):
+            stability = (
+                top_k_stability(if_runs, max(config.alert_budgets))
+                if if_runs is not None else None
+            )
+        with stages.stage("compare_populations", label="Reference vs scored drift"):
+            drift = compare_populations(reference, scored, config.features)
+        with stages.stage("build_summary", label="Warnings and run summary"):
+            warnings = _build_warnings(base_warnings, output, config, latent, stability is not None)
+            summary = {
+                "rows_scored": len(output),
+                "known_positives": known_positives,
+                "vae_primary_score": config.vae_primary_score,
+                "percentile_threshold": config.percentile_threshold,
+                "quadrants": output["quadrant"].value_counts().to_dict(),
+                "positive_quadrants": positive_quadrants,
+                "latent_diagnostics": latent,
+                "warning_count": len(warnings),
+                "reference_fingerprint": _frame_fingerprint(reference),
+                "scored_fingerprint": _frame_fingerprint(scored),
+            }
+        result = DiagnosticResult(output, metrics, drift, autopsies, summary, warnings)
+        with stages.stage("write_outputs", label="Write reports, tables and plots"):
+            _write_outputs(destination, result, group_metrics, coverage, stability, config)
     return result

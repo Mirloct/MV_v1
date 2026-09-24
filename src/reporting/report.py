@@ -35,6 +35,7 @@ from typing import Iterable, Optional, Sequence
 
 from src.utils import paths
 from src.utils.logging_config import log_phase, setup_logging
+from src.utils.progress import Bar
 
 __all__ = ["build_report"]
 
@@ -1943,26 +1944,45 @@ def build_report(
 
     with log_phase("reporting.build_report", log):
         os.makedirs(out_dir, exist_ok=True)
+        want_md = "md" in fmts or "markdown" in fmts
+        want_html = "html" in fmts
+        want_doc = "model_doc" in fmts or "doc" in fmts or "documentation" in fmts
+        # One tick per format actually requested; the HTML report (inlined
+        # plotly.js + every figure) is by far the slowest, which is exactly
+        # what a phase-level timer cannot tell apart from a hang.
+        bar = Bar(desc="build_report[formats]", unit="formato",
+                  total=int(want_md) + int(want_html) + int(want_doc))
+        try:
+            if want_md:
+                bar.set_postfix_str("Markdown")
+                md_path = os.path.join(out_dir, f"{basename}.md")
+                with log_phase("reporting.build_markdown", log):
+                    with open(md_path, "w", encoding="utf-8") as fh:
+                        fh.write(_build_markdown(context, out_dir))
+                result["md"] = os.path.abspath(md_path)
+                log.info("Wrote Markdown report -> %s", md_path)
+                bar.update(1)
 
-        if "md" in fmts or "markdown" in fmts:
-            md_path = os.path.join(out_dir, f"{basename}.md")
-            with open(md_path, "w", encoding="utf-8") as fh:
-                fh.write(_build_markdown(context, out_dir))
-            result["md"] = os.path.abspath(md_path)
-            log.info("Wrote Markdown report -> %s", md_path)
+            if want_html:
+                bar.set_postfix_str("HTML")
+                html_path = os.path.join(out_dir, f"{basename}.html")
+                with log_phase("reporting.build_html", log):
+                    with open(html_path, "w", encoding="utf-8") as fh:
+                        fh.write(_build_html(context, log, out_dir))
+                result["html"] = os.path.abspath(html_path)
+                log.info("Wrote HTML report -> %s", html_path)
+                bar.update(1)
 
-        if "html" in fmts:
-            html_path = os.path.join(out_dir, f"{basename}.html")
-            with open(html_path, "w", encoding="utf-8") as fh:
-                fh.write(_build_html(context, log, out_dir))
-            result["html"] = os.path.abspath(html_path)
-            log.info("Wrote HTML report -> %s", html_path)
-
-        if "model_doc" in fmts or "doc" in fmts or "documentation" in fmts:
-            doc_path = os.path.join(out_dir, "model_documentation.md")
-            with open(doc_path, "w", encoding="utf-8") as fh:
-                fh.write(_build_model_documentation(context, out_dir, result, doc_path))
-            result["model_doc"] = os.path.abspath(doc_path)
-            log.info("Wrote model documentation -> %s", doc_path)
+            if want_doc:
+                bar.set_postfix_str("model_documentation")
+                doc_path = os.path.join(out_dir, "model_documentation.md")
+                with log_phase("reporting.build_model_documentation", log):
+                    with open(doc_path, "w", encoding="utf-8") as fh:
+                        fh.write(_build_model_documentation(context, out_dir, result, doc_path))
+                result["model_doc"] = os.path.abspath(doc_path)
+                log.info("Wrote model documentation -> %s", doc_path)
+                bar.update(1)
+        finally:
+            bar.close()
 
     return result

@@ -2497,3 +2497,105 @@ registros cargados, excluidos y que entran al flujo.
 `--quick` sobre el panel sintético con 60 filas inyectadas en cero (50 en
 100%, 10 en 12/13 columnas) más 10 en 11/13 que debían sobrevivir:
 `60/6000 filas (1.0%) ... quedan 5940 filas`.
+
+---
+
+## 2026-09-23 — Seguimiento en vivo de la suite diagnóstica (tqdm, función en ejecución, cronómetros) y depuración de documentación
+
+**Pedido:** ver cada prueba de la suite diagnóstica avanzar con barras tqdm, y ver
+en el flujo en vivo qué función se ejecuta y cuánto lleva, para seguir la Fase 9c
+(minutos dentro de un solo bucle: reajustes de estabilidad, mallas de experimentos).
+
+**Suite (`tools/if_vae_diagnostic_suite`).** Nuevo `ifvae_diag/progress.py`
+(autónomo, sin importar nada de `src/`): `step(name)` (una función con inicio,
+fin/fallo y duración medida), `track(iterable, desc=, unit=, label=)` (barra
+tqdm; un ítem cuenta como hecho solo cuando el llamador terminó con él) y
+`stages(desc, total=)` (barra sobre una secuencia fija de pruebas). Publica
+eventos a observadores (`add_observer`), con las actualizaciones limitadas a una
+por 0.5 s por barra (inicio y fin siempre). tqdm es opcional (extra `progress`).
+Instrumentado: los 12 pasos de `run_diagnostic` (`_percentile_frame` extraído
+para mantener la complejidad ≤10) y los bucles `isolation_forest[seeds]`,
+`compare_populations[features]` y `write_outputs[files]` (13 archivos). No cambia
+ningún valor calculado.
+
+**Puente (`src/evaluation/ifvae_diagnostic.py`).** `_suite_progress` (reentrante)
+reenvía los eventos de la suite a `logging_config.report_phase_event` (nueva:
+línea de log + `run_events.jsonl` + observadores de fase) y a
+`observability.progress_event` (nueva: evento `progress` + observadores). Se
+instrumentaron `_vae_forward[batches]`, las 11 pruebas de `diagnose_frames`
+(barra `ifvae_diagnostic`), cada reajuste de estabilidad
+(`stability_refit[<Detector>]`, paso `refit[<Detector> seed=N]`) y cada punto de
+las mallas de experimentos (`experiment[...]`).
+
+**tqdm vs. dashboard.** Un dashboard `rich` y las redibujadas `\r` de tqdm sobre
+stderr se destruyen mutuamente, así que los tqdm reales solo se dibujan cuando
+`console_ui.is_live()` es falso (`--no-console-ui`, CI). Con el dashboard activo,
+las mismas barras se muestran dentro del panel con `tqdm.format_meter` (formato
+idéntico, sin escribir en la terminal). Las barras antiguas (`vae[epochs]`,
+`optuna[...]`) no se tocaron.
+
+**Dashboard de consola.** Nueva línea `↳ función` (funciones anidadas en
+ejecución, la más interna resaltada, cada una con su tiempo) y una barra por
+prueba en curso; el cronómetro de cada barra sigue corriendo entre eventos.
+Corrección de un defecto previo: "n/total fases" contaba también las funciones
+anidadas (`iforest.fit`, ...) y se inflaba más allá de las fases reales; ahora
+cuenta solo entradas `Phase N`. La línea "ahora" nombra la fase del plan y las
+funciones anidadas tienen la suya.
+
+**Vista web en vivo.** Los eventos llevan ahora `t` (epoch con milisegundos) junto
+a `ts`. `/state` devuelve `live.running_functions`, `live.progress`,
+`live.recent_functions` y `server_now`; la página añade los paneles *Function
+running* (con cronómetro), *Progress of running tests* (n/total, %, tiempo, ETA,
+ítem en proceso) y *Last finished functions*, y los cronómetros avanzan cada
+250 ms entre sondeos. `_build_nodes` sigue siendo función pura del archivo de
+eventos; el reloj solo entra en `_annotate_live`. Terminada la corrida no se
+muestra nada como "todavía corriendo".
+
+**Verificación.** 82 pruebas del proyecto (21 nuevas en
+`tests/test_live_progress.py`: puente sobre `diagnose_frames` real, refits reales
+de un Isolation Forest, `/state` sobre un servidor local real, casos límite del
+estado del flujo, render del dashboard) y 47 de la suite (16 nuevas en
+`tests/test_progress.py`), con el quality gate de la suite en dos rondas
+consecutivas verdes (4/4 mutantes, complejidad ≤10). El JavaScript de la página
+se validó con `node --check`. Se renderizó el dashboard durante refits reales
+(IF y VAE) confirmando que las barras aparecen dentro del panel y que stderr
+queda vacío. **No** se ejecutó `main.py` completo: reescribiría `artifacts/` (la
+corrida oficial); la verificación de extremo a extremo se hizo en directorios
+temporales.
+
+**Seguimiento en todas las fases (misma fecha, segunda parte).** Nuevo
+`src/utils/progress.py` (`Bar`, `track`, `show_best_trial`): mismo contrato que el
+de la suite pero del lado del pipeline (eventos `progress` + tqdm solo sin
+dashboard vivo). Sustituye los seis `tqdm` sueltos (épocas del VAE, Optuna IF y
+VAE con el mejor valor como postfix, permutation importance, grupos colectivos
+del generador), que antes rompían el dashboard y no llegaban al flow. Nuevas
+barras/pasos con nombre: diagnósticos y figuras de transformación (Fase 4),
+`silhouette`/`calinski_harabasz`/`rank_stability` y el reductor 2D/UMAP (Fase 8),
+explicación por fila y por lotes del VAE (Fases 9-10), los cuatro bloques de
+escenarios de la Fase 9d y la escritura de sus salidas, y cada formato del
+reporte (Fase 11). En el HTML del flow, cada tarjeta de fase lleva las barras que
+corrieron dentro de ella (mini-barras en la página en vivo; tabla con n/total,
+tiempo y último ítem en el detalle del HTML estático). Verificación: 104 pruebas
+del proyecto (nuevas: `test_progress_bars.py`, `test_phase_progress.py`, casos
+de `test_live_progress.py`), gate de la suite verde, JS de ambas páginas con
+`node --check`. Corregido de paso el texto de ayuda de `--n-periods` (decía 8;
+el default es 16).
+
+**Depuración de documentación.** `CONTEXT.md` (1198 → ~1060 líneas): sección de
+la suite reducida al contrato vigente (la narrativa fechada ya estaba aquí, en
+las entradas de 2026-09-03/04/05); corregido "no hay suite de pruebas / `tests/`
+fue eliminado" (existe `tests/` y el quality gate de la suite), "12 fases",
+"checklist de 15 filas" (son 19), periodos por defecto (16, `--quick` 13,
+partición 8/2/3/3) y "no existe medición de estabilidad entre semillas"
+(la Fase 9c la mide para IF y VAE). `README.md`: mismos valores por defecto, teclas
+reales del dashboard (`v`/`o`/`p`, no `d`), estructura con `tests/` y `tools/`,
+sección de pruebas y descripción del seguimiento en vivo. También
+`docs/guia_practica.md` (cómo seguir la suite), `docs/decisiones_de_modelado.md`
+§4.3, `docs/validacion_no_supervisada.md` §4, `docs/leakage_free_pipeline.md` y
+el README, `TRADEOFFS.md` y `EVIDENCE_PACKAGE.md` de la suite.
+
+**Riesgo preexistente detectado (no corregido):** las pruebas que ajustan un
+`VAEDetector` real (`tests/test_diagnostic_section.py`) no pasan `checkpoint_dir`,
+así que usan `artifacts/models/vae/` por defecto. En esta máquina restauraron el
+checkpoint existente sin modificarlo (mtime intacto), pero en una máquina sin
+checkpoint compatible lo crearían ahí.

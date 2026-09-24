@@ -5,10 +5,13 @@ each phase does, **where it lives in the code**, and the reasoning behind the
 choice. It doubles as the checklist to re-run whenever the pipeline changes.
 
 Every claim below was, at the time it was written, backed by a project test
-suite naming the exact assertion. That suite was removed 2026-08-22 (not
-needed to run the project — see `CHANGELOG.md`), so the `Test*`/`test_*.py`
-names below no longer resolve to files on disk; they are kept as a record of
-what was checked, and as a guide for what a reintroduced test should cover.
+suite naming the exact assertion. That original suite was removed 2026-08-22
+(see `CHANGELOG.md`); a smaller one has since been rebuilt under `tests/` for
+the features added later (diagnostic chapter, analyst dashboard, sensitivity,
+zero-row filter, live progress), but it does not cover the leakage guarantees
+below. The `Test*`/`test_*.py` names in this document therefore still do not
+resolve to files on disk; they are kept as a record of what was checked, and as
+a guide for what a reintroduced test should cover.
 
 ---
 

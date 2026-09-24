@@ -61,7 +61,7 @@ from typing import Optional
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
+from src.utils.progress import track
 
 from src.utils import paths
 from src.utils.logging_config import log_phase, setup_logging
@@ -809,7 +809,7 @@ def _inject_anomalies(
         group_periods = np.tile(candidate_periods, reps)[:n_groups].copy()
         rng.shuffle(group_periods)
 
-        for period_idx in tqdm(group_periods, desc="collective anomaly groups"):
+        for period_idx in track(group_periods, desc="collective anomaly groups", unit="group"):
             group_size = int(rng.integers(group_min, group_max + 1))
             entities = rng.choice(n_individuals, size=min(group_size, n_individuals), replace=False)
             rows = entities * n_periods + int(period_idx)

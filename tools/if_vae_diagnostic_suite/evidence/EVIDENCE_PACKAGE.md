@@ -68,6 +68,24 @@ installed into a temporary `--system-site-packages` virtual environment using
 `--no-index --no-deps`, and the installed `ifvae-diagnose simulate` console command
 completed and wrote its report. No external package service was retried.
 
+## Addendum 2026-09-23 — live progress (`ifvae_diag/progress.py`)
+
+Behavior added: named steps with measured durations, tqdm bars for loop-shaped
+tests, and an observer hook, all instrumentation-only (no computed value changes).
+
+| Phase | Result | Executed evidence |
+|---|---|---|
+| Red | pass | `tests/test_progress.py` failed with `ImportError` (module absent) before implementation; a second red/green cycle fixed `running()` not publishing the in-flight item (test asserts the newest event already names it) |
+| Green | pass | 16 new tests in `tests/test_progress.py`, including one that drives the real `run_diagnostic` and asserts its stage names, ordering and inner bars |
+| Refactor | pass | `run_diagnostic` stayed <=10 complexity by extracting `_percentile_frame`; `_write_outputs` became a tracked list of writers |
+| Validate round 1 | pass | `scripts/quality_gate.py`: 47 tests, 4/4 mutants killed, compile ok, complexity <=10 |
+| Validate round 2 | pass | identical result, no source change between rounds |
+
+Result of both rounds: `Ran 47 tests ... OK`, `compile=True tests=True
+mutations=True complexity_limit=10`. Unresolved: progress state is module-global
+and not thread-safe (see `TRADEOFFS.md`); no dedicated mutant targets the new
+module, so its tests are the only guard on it.
+
 ## Scope of proof
 
 The evidence proves the diagnostic software behaviors above. It does not prove

@@ -149,6 +149,38 @@ def setup_logging(
     return logger
 
 
+def report_phase_event(
+    name: str,
+    event: str,
+    duration_s: float | None = None,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Publish a phase transition that was timed somewhere else.
+
+    :func:`log_phase` wraps code this project runs. A vendored package (the
+    IF-VAE diagnostic suite) times its own functions and can only *tell* the
+    pipeline when one starts or ends; this gives those reports the exact
+    treatment ``log_phase`` gives its own: a log line, a structured event in
+    ``run_events.jsonl`` and a notification to the phase observers (console
+    dashboard). ``event`` is ``"phase_started" | "phase_completed" |
+    "phase_failed"``; a failure is logged as a warning, not an error, because
+    the caller (e.g. ``main.py`` Phase 9c) owns whether it is an incident.
+    """
+    from src.utils import observability
+
+    log = logger or setup_logging()
+    if event == "phase_started":
+        log.info("Starting %s", name)
+        observability.phase_event(name, event)
+    elif event == "phase_completed":
+        log.info("Finished %s in %.2fs", name, duration_s or 0.0)
+        observability.phase_event(name, event, duration_s=round(duration_s or 0.0, 3))
+    else:
+        log.warning("Failed %s after %.2fs", name, duration_s or 0.0)
+        observability.phase_event(name, event, duration_s=round(duration_s or 0.0, 3))
+    _notify_phase(name, event, duration_s)
+
+
 @contextmanager
 def log_phase(
     name: str, logger: logging.Logger | None = None

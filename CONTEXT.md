@@ -25,7 +25,7 @@ whole generated state can be inspected — or deleted — in one place.
 
 ```
 Modelo-v0.1/
-├── main.py                 # orchestrator entry point (12 phases, argparse CLI)
+├── main.py                 # orchestrator entry point (Phases 2-11, argparse CLI)
 ├── setup_validator.py      # environment / dependency check
 ├── requirements.txt
 ├── README.md               # user-facing guide
@@ -36,10 +36,13 @@ Modelo-v0.1/
 │   ├── data/               # panel loader + synthetic generator
 │   ├── preprocessing/      # pipeline (transforms, panel features, ratios) + diagnostics + linear_scaling
 │   ├── models/              # Isolation Forest + VAE + stacking + trial early stopping
-│   ├── evaluation/         # OOT split, GT join, metrics, thresholds, OOT Excel export
+│   ├── evaluation/         # OOT split, GT join, metrics, thresholds, OOT Excel export,
+│   │                       # IF-VAE diagnostic bridge (ifvae_*), post-training sensitivity
 │   ├── interpretability/   # SHAP, path length, latent space, per-feature recon
-│   ├── reporting/          # HTML/MD report builder + flow visualization (no PDF)
-│   └── utils/              # paths, logging, observability, assumptions gate, atomic_io
+│   ├── reporting/          # HTML/MD report builder, analyst dashboard, flow visualization (no PDF)
+│   └── utils/              # paths, logging, observability, console dashboard, assumptions gate, atomic_io
+├── tests/                  # pytest suite for the diagnostic chapter, analyst dashboard,
+│                           # sensitivity, zero-row filter, report incidents, live progress
 ├── docs/                   # *.md sources + generated documentation.html
 ├── tools/                  # external/adjacent tooling -- NOT part of the
 │   │                       # pipeline import graph; see "IF-VAE Diagnostic
@@ -60,10 +63,11 @@ Modelo-v0.1/
 crash-resume. That is expected and transient — delete it once a study has
 finished; nothing downstream reads it.
 
-**`tests/` was removed (2026-08-22)** — not needed to run the project, so not
-shipped; `pytest`/`pytest.ini` went with it. Some `docs/*.md` files still name
-specific `Test*`/`test_*.py` files as the historical source of a claim; those
-names no longer resolve to anything on disk.
+**Tests.** The original suite was removed on 2026-08-22; a new, smaller one has
+been rebuilt under `tests/` alongside each feature added since (see
+"Conventions → Testing"). Some `docs/*.md` files still name `Test*`/`test_*.py`
+files from the *original* suite as the historical source of a claim; those
+particular names do not resolve to anything on disk.
 
 ## Paths — single source of truth
 
@@ -272,10 +276,12 @@ only the horizons it can actually support. `_warn_on_extreme_magnitudes` names
 any feature above `1e6` after transformation, so this class of bug cannot be
 silent again.
 
-**Panel depth matters.** The default is now **15 periods** (`--quick` uses 12)
-so a 10/2/3 chronological split leaves a training block deep enough for the
-`h=6` contrast. With fewer periods `PanelFeatureEngineer` silently drops the
-deep horizons — correct, but it means the feature is not being exercised.
+**Panel depth matters.** The default is **16 periods** (`--quick` uses 13,
+`--full` 16) so the chronological split — train 8 / validation 2 / test 3 / OOT
+3 by default (`--n-val-periods`, `--n-test-periods`, `--n-oot-periods`) — leaves
+a training block deep enough for the `h=6` contrast. With fewer periods
+`PanelFeatureEngineer` silently drops the deep horizons — correct, but it means
+the feature is not being exercised.
 
 **Numeric transform default is a cross-model compromise, not either model's
 optimum.** The Isolation Forest and VAE want opposite treatment of
@@ -569,6 +575,15 @@ P95 checkpoint, stacking, or the VAE deliverable.
   calls `observability.start_run()`) see zero behavior difference.
   `log_phase` emits `phase_started`/`phase_completed`/`phase_failed` for
   every phase across the codebase, not just `main.py`'s top-level ones.
+  Every record carries `ts` (whole seconds) **and** `t` (epoch seconds, ms
+  precision — what the live view uses to time a running function; files
+  written before `t` existed fall back to `ts`). Two more emitters feed the
+  same stream for code that is timed elsewhere: `logging_config.
+  report_phase_event` (a phase transition reported by a vendored package — the
+  diagnostic suite's steps) and `observability.progress_event` (one
+  progress-bar update: `desc`, `n`, `total`, `unit`, `state` =
+  `start|update|end`, `current`, `elapsed_s`). Phase, check and progress
+  observers are best-effort callback lists; a raising observer is dropped.
   `main.py` calls `start_run`/`end_run` around the whole pipeline, including
   the failure and cancellation paths (see below), so a crash still closes
   the run with a structured status instead of leaving the stream mid-phase.
@@ -684,12 +699,52 @@ P95 checkpoint, stacking, or the VAE deliverable.
   `PipelineConfig.live_view` (default `True`) / `--live-view`/`--no-live-view`.
 - During a run, `main.py` shows a live console dashboard (`rich`, disables
   itself when stdout is not a terminal or `rich` is missing; `--no-console-ui`
-  forces it off): a fixed 15-row phase checklist, an "Supuestos (IF/VAE)"
-  panel fed by genuine assumption/gate `observability.check(...)` calls, a
-  dedicated interpretability sub-step line under the current-phase readout
-  (see "Live view: interpretability's checkpoints..." above), and a
-  team-health line (RAM/CPU, always with the number visible, never color
-  alone).
+  forces it off): a fixed phase checklist (one row per `_PHASE_PLAN` entry,
+  19 today), an "Supuestos (IF/VAE)" panel fed by genuine assumption/gate
+  `observability.check(...)` calls, a dedicated interpretability sub-step line
+  under the current-phase readout (see "Live view: interpretability's
+  checkpoints..." above), a **"↳ función" line** (the nested functions
+  currently running, innermost highlighted, each with its own elapsed time),
+  **one tqdm-style bar per running loop-shaped test**, and a team-health line
+  (RAM/CPU, always with the number visible, never color alone). Keys: `v`
+  detail, `o` open the web view, `p` pause. "n/total fases" counts only
+  top-level `Phase N` entries — nested functions reported through the same
+  observer are detail, not progress through the plan.
+- **Progress in every phase (2026-09-23).** `src/utils/progress.py` (`Bar`,
+  `track`, `show_best_trial`) replaces every bare `tqdm` in `src/`: iterate it or
+  drive it with `update()` / `set_postfix()`, and it publishes `start|update|end`
+  `progress` events (throttled to one update per 0.5 s) besides drawing tqdm
+  only when `console_ui.is_live()` is false. Never call `tqdm` directly again --
+  a bare bar tears the dashboard and never reaches the flow pages. Bars now
+  cover: Phase 2 collective-anomaly groups; Phase 4 `transform_diagnostics[
+  features]` / `transform_plots[features]`; Phases 6/7 `optuna[<study>]` (best
+  value as postfix) and `vae[epochs]` (loss as postfix); Phase 8
+  `rank_stability[bootstraps]`; Phases 9/10 `explain_rows_vae[batches]`,
+  `vae_recon_by_feature[batches]`, `permutation_importance`; Phase 9d
+  `sensitivity[single-variable|variable-pairs|information-loss|pruning-path]`;
+  Phase 11 `build_report[formats]`. Slow calls without a loop are named
+  `log_phase` steps instead: `evaluation.silhouette_score`,
+  `evaluation.calinski_harabasz_score`, `evaluation.rank_stability`,
+  `evaluation.supervised_metrics`, `evaluation.reduce_2d[<method>]` (UMAP),
+  `interpretability.explain_rows_*`, `sensitivity.high_zero_analysis` /
+  `write_tables` / `write_workbook` / `write_html_report`, and
+  `reporting.build_markdown` / `build_html` / `build_model_documentation`.
+  In the flow pages **each phase's card carries the bars that ran inside it**
+  (`node["progress"]`, attributed by file order like nested functions): the
+  live page draws a mini bar per bar on the card, the static post-run HTML
+  lists them (n/total, time, last item) in the node's detail panel.
+- **Live progress of the diagnostic suite (2026-09-23).** Three consumers of
+  one event source, see "IF-VAE Diagnostic Suite integration → Live progress":
+  the console dashboard lines above, the live browser view (`/state` now
+  returns `live.running_functions`, `live.progress`, `live.recent_functions`
+  and `server_now`; the page's "Function running / Progress of running tests /
+  Last finished functions" panels tick every 250 ms from the last poll, so a
+  timer keeps growing while nothing moves — the stall signal), and real tqdm
+  bars on stderr **only when no live dashboard owns the terminal**
+  (`console_ui.is_live()`). `flow_visualization._build_nodes` stays a pure
+  function of the event file; the clock-dependent elapsed fields are added
+  only by `_annotate_live` for `/state`. Once the run has ended, leftover
+  running functions/bars are cleared instead of shown as still going.
 - **New phases need no registration to appear in either flow view** — both
   read `run_events.jsonl` directly and treat any `^Phase \d+[a-z]?` name as a
   node, so wrapping a block in `with log_phase("Phase 6d: ..."):` is
@@ -782,18 +837,23 @@ the minimum stable variable count plus the ≥90% record recommendation.
 
 ## IF-VAE Diagnostic Suite integration
 
-**What it is.** A vendored standalone package (`tools/
-if_vae_diagnostic_suite/`, v1.0.0, own `pyproject.toml`/CLI/tests/AGENTS.md)
-that diagnoses *why* Isolation Forest and IF+VAE disagree. Phase 9c validates
-that `ifvae_diag` is importable and, when needed, runs an editable install
-from this repository's own vendored path. It never resolves the package name
-from an index. After `pip install -e`, it adds the vendored `src/` directory
-to `sys.path` so the newly installed package is available in the **same
-process** (invalidating import caches alone does not reprocess `.pth` files).
-`--no-auto-install-suite` disables the side effect and reports the missing
-suite explicitly; no manual pip step is required in the default path.
+The dated story of how this integration was built (the two fixes to the vendored
+copy, the 2026-09-03 findings run, the 15-section → 9-section restructure)
+lives in `CHANGELOG.md`; this section holds only what is true now.
 
-**How to run it against this project:**
+**What it is.** A vendored standalone package (`tools/if_vae_diagnostic_suite/`,
+v1.0.0, own `pyproject.toml`/CLI/tests/`AGENTS.md`) that diagnoses *why*
+Isolation Forest and IF+VAE disagree. Phase 9c validates that `ifvae_diag` is
+importable and, when needed, runs an editable install from this repository's
+own vendored path — never resolving the name from an index — then adds the
+vendored `src/` to `sys.path` so the package is usable in the **same process**
+(invalidating import caches alone does not reprocess `.pth` files).
+`--no-auto-install-suite` disables the side effect and reports the missing
+suite explicitly. The suite is an optional dependency: outside tests, only
+`src/evaluation/ifvae_diagnostic.py` imports it, and it never imports anything
+from `src/`.
+
+**Standalone run against this project:**
 ```
 py tools/export_diagnostic_suite_inputs.py --out tools/if_vae_diagnostic_suite/build/modelo_run
 cd tools/if_vae_diagnostic_suite
@@ -801,307 +861,122 @@ PYTHONPATH=src py -m ifvae_diag run --reference build/modelo_run/reference.csv \
   --scored build/modelo_run/scored.csv --config build/modelo_run/modelo_config.yaml \
   --out build/modelo_run/report
 ```
-`export_diagnostic_suite_inputs.py` mirrors `main.py`'s own Phases 2→3a→4→6→
-6b→7 (same functions, same seed, stacking on) to fit a real, fresh IF+VAE
-pair and export the suite's exact contract: `reference.csv` = train block
-(no labels — not required there), `scored.csv` = the true OOT block
-(`n_oot_periods=3`), one row per **(entity, period)** — deliberately *not*
-deduplicated to one row per entity the way the OOT Excel is, since the
-suite has no concept of "each entity's best month" and more rows give its
-drift/family diagnostics more to work with. Ground truth
-(`load_ground_truth_labels`/`_types`) is attached to `scored.csv` for this
-integration only, from this project's own synthetic labels — see
-"Label-free mode" below for why a real production run cannot do this.
+`export_diagnostic_suite_inputs.py` mirrors `main.py`'s Phases 2→3a→4→6→6b→7 to
+fit a fresh IF+VAE pair and export the suite's contract: `reference.csv` = the
+train block, `scored.csv` = the true OOT block, one row per **(entity, period)**
+(not deduplicated to one row per entity like the OOT Excel). Ground truth is
+attached there for this manual validation only — a real run has none.
 
-**Two real, root-caused fixes made to the vendored copy** (both covered by
-new tests, full `make chore-lint` green — `31 passed`, `compile=True
-tests=True mutations=True`):
+**Phase 9c (in-process, ON by default).** `run_ifvae_diagnostic_suite` builds
+`reference`/`scored` straight from this run's already-fitted detectors (no
+refit for scoring, no CSV round-trip) and runs the suite **label-free**;
+`--no-run-diagnostic-suite` skips the phase. Its output feeds two separate
+report chapters — a reconciliation of "no interpretation in the ficha" with
+"give me a toolkit and a recommendation" that must not be collapsed:
 
-- **`scripts/mutation_probe.py` was silently broken on Windows.** It built
-  the mutated-copy `PYTHONPATH` with a hardcoded POSIX `:` separator
-  (`f"{source_root}:{ROOT}"`). On Windows, `os.pathsep` is `;`, and a
-  drive-letter path (`C:\Users\...`) already contains a colon, so the join
-  produced one unparseable string; Python silently fell back to importing
-  the real, pip-installed (unmutated) package for every mutant, and
-  `_mutant_is_killed` always returned `False` — a false "the gate is
-  broken" reading with nothing to do with test quality. Fixed with
-  `os.pathsep.join(...)`; all 4 mutants (`percentile_tie_direction`,
-  `if_quadrant_threshold_exclusive`, `vae_quadrant_threshold_exclusive`,
-  `lift_formula`) are now genuinely killed. Regression-tested
-  (`tests/test_mutation_probe.py`) by actually running one mutant end to
-  end and asserting it is caught — not a tautology.
-- **No label-free mode existed.** The data contract hard-required a binary
-  `label_col` in `scored.csv` (`contracts.py::_require_columns`), and every
-  supervised computation (`metrics.py`, autopsies, coverage,
-  orientation-risk warnings) read `config.label_col` unconditionally. This
-  project's **official, real-data runs are unsupervised and carry no
-  target at all** — a real production run could not produce a valid
-  `scored.csv` for this tool as shipped. Added `label_col: str | None`
-  (`config.py`); `contracts.py`/`pipeline.py` skip every label-dependent
-  computation (`metrics.csv`, `autopsies.csv`, `coverage.json`,
-  `metrics_by_group.csv`, the two orientation-risk warnings) when it is
-  `None`, while percentiles, quadrants, latent diagnostics, and drift —
-  the genuinely label-free half of the suite — still run and still write
-  `report.md`/`disagreement.png`. Covered by
-  `tests/test_pipeline_unsupervised.py` (asserts both the label-free
-  degrade *and* that supplying a real label column still enforces the
-  existing binary-label validation — the fix must not weaken the
-  supervised path). Verified against this project's own real export in
-  both modes: identical quadrant counts (77/115/132/1176) with and without
-  labels, proving quadrant assignment is genuinely label-independent.
+- **Factual ficha** (`ifvae_contract.build_diagnostic_contract`,
+  `CONTRACT_VERSION "2.0.0"`; renderers in `src/reporting/diagnostic_section.py`):
+  nine sections — alcance, configuración efectiva, concordancia y desacuerdo,
+  candidatos VAE, sensibilidad, latente, estabilidad, temporal/segmentación,
+  experimentos. Every visible value is traceable to a field with a status
+  (`EXECUTED`/`NOT_REQUESTED`/`NOT_APPLICABLE`/`UNAVAILABLE`) and a reason; no
+  silent fallbacks; the renderer computes nothing and uses no verdict language.
+  Counts are entity–period observations, never "individuos".
+- **Interpretation chapter** (`ifvae_interpretation.build_interpretation_contract`;
+  renderers in `interpretation_section.py`): `{toolkit, indicator_validation,
+  decision_flow, methodology_notes}`. Every claim carries a `basis` and a
+  `severity` (`info`/`attention`/`caution`, never a pass/fail verdict). Drift is
+  distilled with **Benjamini–Hochberg FDR** over every feature's KS p-value.
+  The decision flow has 5 nodes evaluated on this run's numbers; the
+  recommendation is assembled from whichever fragments the branches produced.
+  `METHODOLOGY_NOTES` documents every threshold used and the ones deliberately
+  *not* invented (see stability). This renderer may use interpretive language
+  but, like the factual one, computes nothing itself.
 
-**Report enhancement: per-layer performance chart.** `report.md` originally
-carried only `disagreement.png` (a percentile-agreement scatter — shows
-where IF and VAE *agree*, not which one *performs*). Added
-`metrics_bar_plot()` (`reporting.py`) — a precision@k bar chart grouped by
-alert budget (k=10/25/50), one bar per score candidate
-(`if_percentile`/`vae_percentile`/`ensemble_max`/`ensemble_mean`, fixed
-colors so a candidate is visually stable across runs) — as the visual
-counterpart to `metrics.csv`, so monitoring each detection layer's
-operational performance doesn't require reading a table. TDD: wrote
-`tests/test_reporting_metrics_plot.py` first (Red —
-`ImportError: cannot import name 'metrics_bar_plot'`), implemented, both
-tests green. Wired into `pipeline.py::_write_outputs`, which now also
-passes a `has_metrics_plot` flag into `write_markdown_report` so the
-markdown embeds `![...](metrics.png)` when the chart exists and a plain
-sentence explaining its absence when it does not — this chart is
-inherently label-dependent (precision/recall need known positives), so it
-is correctly skipped, not broken, on a real unsupervised run
-(`report_unsupervised/`: no `metrics.png` written, `report.md` reads "no
-label column (label-free mode)"). Verified against this project's real
-export in both modes: labeled run's `report/` has `metrics.png` embedded
-after "Operational metrics"; label-free run's `report_unsupervised/`
-correctly has neither the file nor a broken image reference.
+**What runs, and the knobs (all `PipelineConfig` / `main.py` flags):**
 
-**What still does NOT apply to an official (unsupervised, real-data) run,
-by design of the underlying method** — the label-free mode above makes
-these *not crash*, not makes them meaningful:
-- `metrics.csv`/`coverage.json`/`metrics_by_group.csv`
-  (Precision@K/Recall@K/Lift@K/AP, unique/shared coverage, segment/family
-  cohorts) — need known positives to mean anything.
-- `autopsies.csv` (known-positive feature autopsies) — selects rows by
-  `label_col == 1`; nothing to select without one.
-- The two `*_percentile_orientation` warnings — need both classes present.
-- `if_stability.json` — unrelated to labels, but unavailable whenever
-  `if_score_col` is set (diagnosing the *production* forest), regardless
-  of label mode; see "No cross-seed stability measurement" below.
+- *Stability* — IF **and** VAE are genuinely refit `--diagnostic-stability-refits`
+  times (default 3; `0` disables → `UNAVAILABLE` with a reason) with seeds
+  `config.seed + 1000·i`, same architecture read off the fitted instance's own
+  public attributes, and scored with the suite's own `top_k_stability`. VAE
+  refits are full training runs — the single most expensive part of Phase 9c.
+  **No universal "stable ≥ X" Jaccard cutoff is asserted**: published evidence
+  (arXiv:2402.11404) shows autoencoder embeddings are routinely far less stable
+  than tree ensembles, so only the degenerate case (mean Jaccard < 0.05) is
+  flagged and everything else is reported numerically, comparatively.
+- *Sensitivity grid* `(0.90, 0.95, 0.99)` and *entity view* — ON by default.
+- *Segmentation* — `--diagnostic-segment-column` (default `segment`; `""`
+  disables). A configured column absent from the panel logs a warning and makes
+  §8 `NOT_APPLICABLE`.
+- *§9 experiments* — ensembles (max/mean) and reconstruction variants reuse
+  computed scores; the IF contamination sweep really refits over
+  `--diagnostic-experiment-contamination-grid` (default `0.01 0.02 0.05`);
+  VAE capacity/beta sweeps are opt-in (`--diagnostic-experiment-capacity-grid`,
+  `--diagnostic-experiment-beta-grid`; each point retrains the VAE). Five
+  families that need model/preprocessing changes or several retained temporal
+  windows stay `NOT_REQUESTED`, each with its own reason.
 
-**What DOES apply and was validated against this project's real, freshly-
-fitted IF+VAE (2026-09-03, synthetic labels used only to prove the numbers
-line up, not as a production measurement):**
-- `scored_diagnostics.csv` (percentiles, `if_percentile`/`vae_percentile`,
-  `ensemble_max`/`ensemble_mean`, disagreement quadrant per row).
-- `drift.csv` (KS/Wasserstein/out-of-range population shift, reference vs.
-  scored).
-- Latent diagnostics (`summary.json::latent_diagnostics`) — active units,
-  collapsed fraction, per-unit KL.
-- `report.md` + `disagreement.png`.
+**Label-free mode (a change made to the vendored copy).** `label_col: str | None`;
+`contracts.py`/`pipeline.py` skip every label-dependent output when it is `None`.
+Percentiles, quadrants, latent diagnostics, drift, `report.md` and
+`disagreement.png` still run. By design these do **not** apply to an official
+(unsupervised) run: `metrics.csv`, `coverage.json`, `metrics_by_group.csv`,
+`autopsies.csv`, `metrics.png`, and the two `*_percentile_orientation` warnings.
+`if_stability.json` is unavailable whenever `if_score_col` is set (production
+forest); the host measures IF stability itself instead (above). Other vendored
+changes: `scripts/mutation_probe.py` uses `os.pathsep` (it was silently broken on
+Windows), and `reporting.metrics_bar_plot` adds a precision@k chart when labels
+exist. Read the drift table with calendar (`cyc__period_month_*`) and
+panel-lag features filtered out — a chronological split "drifts" on
+month-of-year by construction.
 
-**Findings from that run** (500 individuals × 13 months, `--quick`-scale,
-20 VAE epochs, stacking on — a smoke-scale run, not a production
-measurement; treat magnitudes as directional):
-- **VAE dominates IF on `global` anomalies** (AP 0.82 vs. 0.08, recall@10 ≈
-  89% vs. 11%) but **both are near-random on `local` and `contextual`**
-  (AP ≈ 0.01–0.02, recall@10 = 0% for almost every score/ensemble
-  combination) — see "Known open problems" below, now with an independent,
-  differently-coded confirmation.
-- **IF contributed zero unique hits to the top-10/25 queue that VAE did
-  not already find** (`coverage.json`: `a_only_positive_hits: 0` at every
-  budget tried) — on this run, a simple mean ensemble was *worse* than VAE
-  alone (AP 0.24 vs. 0.28), exactly the risk the suite's own README warns
-  about ("do not use `IF AND VAE` as the default... compare against
-  IF-only, VAE-only, max, mean").
-- **No posterior collapse** (`collapsed_fraction: 0.0`, 8/8 active units)
-  — an independent, external confirmation that the 2026-08-22/23
-  loss-scaling fix (see "Known open problems") is holding.
-- **The drift table's top entries are dominated by calendar/lag-feature
-  artifacts, not genuine concerning drift**: `cyc__period_month_sin/cos`
-  and every `*_lag3`/`*_diff3`/`*_ratio3` panel feature show KS ≈ 0.37–1.0
-  simply because `reference` (train months) and `scored` (strictly later
-  OOT months) cover different calendar months by construction — any
-  chronological split will "drift" on month-of-year. Read this table with
-  calendar-derived and panel-lag features filtered out, or expect them to
-  dominate meaninglessly.
-- **The `collective` anomaly family had zero known positives in this
-  particular 3-month OOT window** (`metrics_by_group.csv` only has
-  `local`/`contextual`/`global` rows) — with only ~33 total positives
-  spread over one 3-month slice, a family-level breakdown can miss an
-  entire family by chance. A longer or repeated OOT window would be needed
-  before reading "family X has 0 recall" as evidence rather than absence.
+**Live progress (2026-09-23).** A full Phase 9c can spend minutes inside one
+loop, so the suite reports what is running, for how long, and how far along.
 
-**In-process integration + report chapter (2026-09-04, superseded below).**
-Runs the suite itself, in-process, as an optional phase (`--run-diagnostic-
-suite`, then default off), building `reference`/`scored` directly from this
-run's own already-fitted detectors and indexing the result into
-`anomaly_report.{html,md}` as a 15-section, non-interpretive chapter. The
-architecture (contract → gathering → renderers, three modules) and the
-label-free/traceable-field/no-silent-fallback design all still stand; what
-changed on 2026-09-05 is the section count, two previously-permanent
-`UNAVAILABLE` diagnostics, and the addition of a second, explicitly
-interpretive chapter — see immediately below.
+- `ifvae_diag/progress.py` (suite-side, standalone) offers `step(name)` (one
+  named function: start, then completed/failed with its own measured duration,
+  nesting depth tracked), `track(iterable, desc=, unit=, label=)` (a tqdm bar
+  over a loop; an item counts as done only when the caller finishes it; closed
+  and reported even on early exit or exception) and `stages(desc, total=)` (a
+  bar over a fixed sequence of named tests, each also a `step`). It is
+  **instrumentation only** — no computed value changes. tqdm is optional (a
+  missing import degrades to events only). Events are plain dicts sent to
+  observers (`add_observer`); "update" events are throttled to
+  `DEFAULT_MIN_INTERVAL_S = 0.5` so a JSONL log does not grow per iteration,
+  while start/end always fire. One observer that raises is dropped, never
+  allowed to break a test.
+- What is instrumented: `run_diagnostic`'s 12 stages (each named after its
+  function: `validate_frames` … `write_outputs`) with inner bars
+  `isolation_forest[seeds]`, `compare_populations[features]` and
+  `write_outputs[files]`; and, host-side in `src/evaluation/ifvae_diagnostic.py`,
+  `_vae_forward[batches]`, the 11 `diagnose_frames` tests (`ifvae_diagnostic.
+  _build_agreement` … `build_interpretation_contract`, bar `ifvae_diagnostic`),
+  one step + bar tick per stability refit (`stability_refit[<Detector>]`,
+  step `ifvae_diagnostic.refit[<Detector> seed=N]`) and per experiment-grid
+  point (`experiment[<Detector>.<param>]`). Step names are `ifvae_diag.<stage>`
+  for the suite's and `ifvae_diagnostic.<function>` for the bridge's.
+- **The bridge** (`_suite_progress`, re-entrant, only the outermost block wires
+  and unwires) forwards suite events to `logging_config.report_phase_event`
+  (log line + `run_events.jsonl` + dashboard phase observers; a failed step is
+  logged as a *warning*, since Phase 9c owns whether it is an incident) and
+  `observability.progress_event`. **tqdm draws to the terminal only when
+  `console_ui.is_live()` is false**: a repainting `rich` dashboard and tqdm's
+  carriage-return redraws tear each other apart, so with the dashboard up the
+  same bars are rendered *inside* it via `tqdm.format_meter` (the exact tqdm
+  layout, no stderr writes). `--no-console-ui` (or a non-TTY) gives real tqdm
+  bars. The rest of the pipeline reports through the pipeline-side twin,
+  `src/utils/progress.py` (previous bullet).
 
-**Restructured into a leaner ficha + a separate interpretation chapter
-(2026-09-05).** Two requests arrived back to back and both stand: keep the
-factual ficha free of interpretation (2026-09-04's own explicit spec), *and*
-add a per-analysis interpretation toolkit, indicator validation, a dynamic
-decision-flow diagram, and an analyst recommendation (2026-09-05's request).
-The resolution is two contracts, not one weakened contract:
-
-- `--run-diagnostic-suite` is **ON by default**. `ensure_suite_installed`
-  removes the former manual-install prerequisite; `--no-auto-install-suite`
-  validates without installing and `--no-run-diagnostic-suite` skips the
-  whole phase. Stability refits still carry the runtime cost described below.
-- **Six sections removed from the factual ficha**, by explicit editorial
-  request, not because they could not run: disponibilidad de diagnósticos,
-  unidad de análisis (folded into a note on `§1 Alcance` and the agreement
-  table instead of its own section), reconstrucción/autopsias de alertas,
-  calidad/desplazamiento de datos (raw table), bloques condicionados a
-  verdad base, riesgos/limitaciones/procedencia. The surviving nine are
-  renumbered 1–9: alcance, configuración efectiva, concordancia y
-  desacuerdo, candidatos VAE, sensibilidad, latente, estabilidad,
-  temporal/segmentación, experimentos. `CONTRACT_VERSION` bumped to
-  `"2.0.0"` for the shape change. Drift and autopsy numbers were not thrown
-  away — they still feed the interpretation chapter as distilled signals
-  (see below), just not as raw per-row tables in the ficha.
-- **Two previously-permanent `UNAVAILABLE` diagnostics now actually run:**
-  - *Estabilidad IF* was always `UNAVAILABLE` because the "production" IF
-    score is precomputed (`if_score_col` set), so the suite's own
-    `top_k_stability` never had a fresh multi-seed fit to measure. Fixed by
-    refitting `IsolationForestDetector` (this project's own class, same
-    hyperparameters read off the fitted production detector's own public
-    attributes — `n_estimators`, `contamination`, etc., not off a possibly-
-    partial `best_params` dict) `diagnostic_stability_refits` times
-    (default 3) with different seeds and running the SAME
-    `ifvae_diag.stability.top_k_stability` the suite already uses for IF —
-    not a new metric, the identical one, applied to a detector the suite
-    itself does not refit in this integration.
-  - *Estabilidad VAE* did not exist at all (the suite has no VAE-refit
-    path). Implemented the same way: refit `VAEDetector` (this project's
-    class) `diagnostic_stability_refits` times, same architecture read off
-    the fitted instance's own attributes (`latent_dim`, `hidden_dim`, …),
-    `top_k_stability` over the refits' scores on the OOT population.
-    **Trade-off, stated rather than absorbed:** VAE refits are full
-    training runs, not just scoring — this is the single most expensive
-    part of Phase 9c (roughly `diagnostic_stability_refits` extra VAE
-    fits). `--diagnostic-stability-refits 0` disables it (`UNAVAILABLE`
-    with a stated reason) if that cost is not acceptable. Seeds are derived
-    from `base_seed` (`config.seed + 1000·i`), not hardcoded, so two
-    official runs never collide and the choice doesn't need defending as a
-    "random" magic number.
-  - **Methodological note, grounded before implementing (not asserted from
-    memory):** searched for prior evidence on cross-seed stability of
-    autoencoder-family scores before picking a pass/fail threshold, and
-    found none that would justify one — "Evaluating the Stability of Deep
-    Learning Latent Feature Spaces" (arXiv:2402.11404, 2024) reports
-    Jaccard dissimilarity commonly *exceeding* 0.6 (mode ≈0.86) between
-    independently-trained autoencoder embeddings, i.e. VAE-family models
-    are, in the published record, considerably less stable across seeds
-    than tree ensembles by default. **Deliberately did NOT invent a
-    universal "stable ≥ X" cutoff** for this reason — an expert asked to
-    defend an arbitrary Jaccard threshold for a VAE would reject it as
-    unsupported by the evidence. Only the genuinely degenerate case
-    (mean Jaccard < 0.05, essentially zero overlap regardless of
-    architecture) is flagged; everything else is reported numerically with
-    the citation, comparatively (IF vs. VAE), never as a verdict.
-- **Segmentation executes with a configurable source column.** The default is
-  `--diagnostic-segment-column segment`; point it at any raw categorical
-  column (for example `--diagnostic-segment-column region`). An empty string
-  disables the breakdown. A configured name that is absent logs a warning and
-  makes §8 `NOT_APPLICABLE`, never a silent no-op.
-- **Sensitivity grid and entity view are now ON by default** —
-  `diagnostic_sensitivity_grid` defaults to `(0.90, 0.95, 0.99)` (this
-  project's own P90/P95/P99 operating points, not an arbitrary choice) and
-  `diagnostic_entity_view` defaults to `True` — both previously sat at
-  `NOT_REQUESTED`/off purely because they were opt-in, not because they
-  couldn't run.
-- **`§9 Experimentos diagnósticos` executes what the current run can support.**
-  Ensembles máximo/promedio and reconstruction variants reuse scores already
-  computed, so they always execute. IF contamination sweeps real refits over
-  `0.01 0.02 0.05` by default and can be replaced with
-  `--diagnostic-experiment-contamination-grid`. Capacity and beta each require
-  a full VAE refit per point, so they are opt-in through
-  `--diagnostic-experiment-capacity-grid` and
-  `--diagnostic-experiment-beta-grid`. The five families that require model/
-  preprocessing code changes or multiple retained temporal windows remain
-  `NOT_REQUESTED`, each with its own reason rather than a generic placeholder.
-
-**New: a second, explicitly-labelled interpretation chapter.** Reconciles
-the standing "no interpretation in the ficha" rule with the new request for
-a toolkit, a decision flow, and a recommendation — by building them as a
-SEPARATE contract from the same numbers, not by softening the first one.
-
-- `src/evaluation/ifvae_interpretation.py` — `build_interpretation_contract(
-  ...)` returns `{toolkit, indicator_validation, decision_flow,
-  methodology_notes}`. Every claim carries a `basis` (what it was computed
-  from) and a `severity` (`info`/`attention`/`caution`, never a pass/fail
-  verdict on the run). `METHODOLOGY_NOTES` documents every threshold used —
-  including the ones deliberately NOT turned into a threshold (see
-  stability above) — so a reader can check no cutoff is asserted without a
-  citation or an existing project precedent behind it.
-- **Validación de indicadores**: sample-size adequacy for Spearman/Jaccard
-  (flags n < 30), refit-count adequacy for stability, sensitivity-grid
-  range validity, and — the concrete statistical upgrade this pass made —
-  **Benjamini-Hochberg FDR correction** (Benjamini & Hochberg, 1995) across
-  every feature's KS p-value for the drift signal, replacing the earlier,
-  explicitly-flagged gap ("no se declaró una regla de severidad") with a
-  principled one: testing dozens of features simultaneously at an
-  uncorrected α=0.05 produces several false "drifted" features by
-  construction.
-- **Flujo de decisión**: 5 nodes evaluated against THIS run's real numbers
-  (¿hay observaciones en BOTH? ¿espacio latente activo (≥⅓, Burda et al.
-  2016 — the SAME threshold this project's own
-  `src.models.vae.collapse_verdict` already uses, reused not reinvented)?
-  ¿drift FDR-significativo en variables de negocio (calendario/panel
-  excluidos por el motivo estructural ya documentado)? ¿sensibilidad al
-  umbral ≥3× entre el mínimo y el máximo de la malla?), each producing a
-  fragment; the **recommendation is assembled from whichever fragments this
-  run's branches actually produced**, sorted attention-first — never a
-  fixed string per scenario.
-- `src/reporting/interpretation_section.py` — HTML/Markdown renderers,
-  mirroring `diagnostic_section.py`'s split exactly, with one deliberate
-  difference asserted by its own test: this renderer IS allowed
-  interpretive language (that is its entire purpose), but like the factual
-  renderer it still computes nothing itself — every fragment, check, and
-  node arrives pre-built.
-
-**Unit of analysis is stated everywhere** (moved from its own section into
-a note on `§1`/the agreement table): counts are entity–period observations,
-never "individuos"/"clientes". The chapter's `BOTH` count differs from the
-in-house "Concordancia entre detectores" chart (`report_content.py`), which
-deduplicates to one row per entity and ranks against the OOT population
-itself, while this chapter keeps one row per (entity, month) and ranks
-against the training distribution — the interpretation chapter's own
-methodology notes make this explicit where it matters.
-
-**Tests.** `tests/test_diagnostic_section.py` plus the focused dashboard
-contract tests drive the real contract path via
-`diagnose_frames`/`build_interpretation_contract` — HTML/Markdown parity for
-BOTH contracts, traceability, no silent fallbacks, response to
-threshold/candidate/aggregation changes, architecture modes, label states,
-quadrant arithmetic, absent/empty artifacts, degenerate cases (zero alerts,
-ties, missing `logvar`, duplicate ids, infinities, missing values, temporal
-overlap, segmentation), decision-flow branch selection under constructed
-scenarios (zero-BOTH, collapsed-latent, business-vs-calendar drift), and —
-the part that used to be untestable — **real seeded stability refits**,
-fitting actual (tiny) `IsolationForestDetector`/`VAEDetector` instances and
-asserting a valid Jaccard in `[0, 1]`. Renderer-purity tests assert the
-factual renderer still has no verdict language/run-specific constants and
-that neither renderer computes over the run's numbers.
-
-**Verified end to end**, `python main.py --quick --no-tune` (diagnostic
-suite on by default now), both `--stack-iforest-into-vae` and
-`--no-stack-iforest-into-vae`: zero failed health checks in either mode
-(the total count itself is not a fixed invariant — it varies a little
-run to run with how many distinct checks a given `--quick` synthetic
-sample happens to exercise; 0 failures is the thing that must always
-hold), real stability Jaccard values computed (IF ≈0.80, VAE =1.00 on this
-`--quick`-scale run —
-a real number, not asserted as "good" or "bad" anywhere in the ficha), real
-segment table populated, sensitivity grid swept by default, decision flow
-and recommendation rendered with this run's own numbers in both formats,
-zero unclosed HTML tags. `tools/render_diagnostic_example.py` still renders
-both chapters from the same synthetic fixture for review without a pipeline
-run.
+**Tests.** `tests/test_diagnostic_section.py` drives the real contract path via
+`diagnose_frames`/`build_interpretation_contract` (HTML/Markdown parity for both
+contracts, traceability, no silent fallbacks, degenerate cases, decision-flow
+branches, and **real seeded refits** with tiny `IsolationForestDetector`/
+`VAEDetector`). `tests/test_live_progress.py` covers the progress path end to
+end (bridge wiring, real refit steps, `/state` over a real local server, the
+flow-state edge cases, dashboard rendering). The suite's own
+`tests/test_progress.py` pins the primitives, and its quality gate must stay
+green. `tools/render_diagnostic_example.py` renders both chapters from a
+synthetic fixture without a pipeline run.
 
 ## Known open problems
 
@@ -1138,17 +1013,15 @@ run.
   `TrialPatienceStopper` essentially never fires (see above) — treat a
   `--quick` VAE result as a smoke test, not a measurement, until this is
   revisited (`docs/diagnostico_del_proyecto.md` A-10).
-- **No cross-seed stability measurement exists yet** for either detector — a
-  single fixed seed (`PipelineConfig.seed = 42`) runs today;
-  `unsupervised_metrics`'s `rank_stability` is a bootstrap-jitter proxy for
-  score sensitivity to noise, not a re-fit-under-a-different-seed measurement.
-  See `docs/validacion_no_supervisada.md` §6 for the proposed design. Partial
-  external option for the Isolation Forest specifically: the IF-VAE
-  Diagnostic Suite's own seed-refit top-K Jaccard/selection-probability
-  diagnostic (`if_stability.json`) does exactly this — but only when
-  `if_score_col` is left unset (a fresh in-suite refit across
-  `random_seeds`), which then diagnoses a *different* forest than the
-  production one. No equivalent exists for the VAE either way.
+- **Cross-seed stability is measured only inside Phase 9c, and only for the
+  alert set.** The pipeline itself trains with one fixed seed
+  (`PipelineConfig.seed = 42`) and `unsupervised_metrics`'s `rank_stability` is
+  a bootstrap-jitter proxy, not a refit-under-another-seed measurement (see
+  `docs/validacion_no_supervisada.md` §6). What does exist: Phase 9c refits
+  **both** IF and VAE `--diagnostic-stability-refits` times (default 3) and
+  reports top-K Jaccard across those refits (see "IF-VAE Diagnostic Suite
+  integration"). Three refits give a coarse reading, and no pass/fail cutoff is
+  defined for it — there is no published one to lean on.
 - **The Isolation Forest permanently runs a sub-optimal numeric transform**
   for its own objective (`yeo-johnson`, not `robust`) because the VAE cannot
   survive `robust` — see "Leakage-free pipeline" above. Worth re-measuring
@@ -1193,6 +1066,17 @@ Measured on the synthetic generator (`generate_synthetic_panel`):
   anything else in a new environment; it checks Python version and
   dependencies and attempts to auto-install anything missing. `pyarrow`
   (parquet engine for ground truth) is in `requirements.txt` and validated too.
-- **Testing**: there is no test suite in this project (removed 2026-08-22,
-  see `CHANGELOG.md`) — verify changes by running the pipeline directly
-  (`python main.py --quick`) and reading its log/health checks.
+- **Testing**: `python -m pytest tests -q` (host project: diagnostic chapter,
+  analyst dashboard, sensitivity, zero-row filter, report incidents, live
+  progress) plus the vendored suite's own gate, run **from its directory** —
+  `cd tools/if_vae_diagnostic_suite && PYTHONPATH=src python scripts/quality_gate.py`
+  (unit + adversarial tests, no tautologies, cyclomatic complexity ≤ 10,
+  compile, mutation probe; the two suites cannot be collected in one pytest
+  invocation because both have a top-level `scripts` package). **Known
+  hazard:** tests that fit a real `VAEDetector` (`tests/test_diagnostic_section.py`)
+  do not pass `checkpoint_dir`, so they use the default `artifacts/models/vae/`
+  and, on a machine with no compatible checkpoint, would write one there; they
+  also append to `artifacts/logs/execution.log`. A new test that fits a VAE
+  should pass `checkpoint_dir=<tmpdir>`. Beyond tests, verify a change by
+  running the pipeline (`python main.py --quick`) — but that rewrites
+  `artifacts/`, so do it deliberately, not as a side effect.

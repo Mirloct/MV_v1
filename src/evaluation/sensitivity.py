@@ -28,7 +28,8 @@ from scipy.stats import ks_2samp, spearmanr
 
 from src.data.loader import PanelSchema
 from src.utils import paths
-from src.utils.logging_config import setup_logging
+from src.utils.logging_config import log_phase, setup_logging
+from src.utils.progress import Bar, track
 
 __all__ = ["run_post_training_sensitivity"]
 
@@ -552,7 +553,11 @@ def run_post_training_sensitivity(
 
     # Individual stress: neutral ablation, explicit null, and zero where the
     # raw dtype makes zero a meaningful representable value.
-    for col in input_columns:
+    # Each block below is its own bar: the whole study is hundreds to thousands
+    # of scorings of the fitted models, and a phase-level timer cannot say
+    # which block it is in or how far along it is.
+    for col in track(input_columns, desc="sensitivity[single-variable]",
+                     unit="variable", label=str):
         evaluate(f"ablate::{col}", "ablation", [col], 1 / len(input_columns))
         evaluate(f"null::{col}", "null_replacement", [col], 1 / len(input_columns))
         if pd.api.types.is_numeric_dtype(df[col]) or pd.api.types.is_bool_dtype(df[col]):
@@ -562,24 +567,34 @@ def run_post_training_sensitivity(
     initial_ranking = _variable_ranking(initial)
     leverage = initial_ranking.groupby("variable")["leverage_score"].max().sort_values(ascending=False)
     top = leverage.head(max(2, min(combination_top_k, len(leverage)))).index.tolist()
-    for i, left in enumerate(top):
-        for right in top[i + 1:]:
-            evaluate(f"pair::{left}+{right}", "ablation", [left, right], 2 / len(input_columns))
+    pairs = [(left, right) for i, left in enumerate(top) for right in top[i + 1:]]
+    for left, right in track(pairs, desc="sensitivity[variable-pairs]", unit="pair",
+                             label=lambda pair: " + ".join(pair)):
+        evaluate(f"pair::{left}+{right}", "ablation", [left, right], 2 / len(input_columns))
 
     # Random information-loss levels provide a distribution, not one lucky or
     # unlucky subset, which is what the fan chart needs.
     rng = np.random.default_rng(random_state)
-    for level in missing_levels:
-        k = max(1, min(len(input_columns), int(round(float(level) * len(input_columns)))))
-        for rep in range(max(1, int(random_subsets_per_level))):
-            cols = sorted(rng.choice(input_columns, size=k, replace=False).tolist())
-            evaluate(f"loss::{int(100*level):02d}::{rep+1}", "information_loss", cols,
-                     k / len(input_columns), capture=(rep == 0))
+    reps_per_level = max(1, int(random_subsets_per_level))
+    loss_bar = Bar(desc="sensitivity[information-loss]", unit="scenario",
+                   total=len(missing_levels) * reps_per_level)
+    try:
+        for level in missing_levels:
+            k = max(1, min(len(input_columns), int(round(float(level) * len(input_columns)))))
+            for rep in range(reps_per_level):
+                loss_bar.set_postfix_str(f"{int(100 * level)}% de variables, réplica {rep + 1}")
+                cols = sorted(rng.choice(input_columns, size=k, replace=False).tolist())
+                evaluate(f"loss::{int(100*level):02d}::{rep+1}", "information_loss", cols,
+                         k / len(input_columns), capture=(rep == 0))
+                loss_bar.update(1)
+    finally:
+        loss_bar.close()
 
     # Cumulative removal from least to most influential estimates the smallest
     # stable scope under explicit operational thresholds.
     least_first = leverage.sort_values(ascending=True).index.tolist()
-    for k in range(1, len(least_first) + 1):
+    for k in track(range(1, len(least_first) + 1), desc="sensitivity[pruning-path]",
+                   unit="step", label=lambda step: f"{step} variables retiradas"):
         cols = least_first[:k]
         evaluate(f"prune::{k:03d}", "pruning_path", cols, k / len(input_columns))
 
@@ -615,10 +630,11 @@ def run_post_training_sensitivity(
 
     zero_matrix = np.column_stack([_zero_or_missing_mask(df[c]) for c in input_columns])
     zero_ratio = zero_matrix.mean(axis=1)
-    high_zero_records, high_zero_summary = _high_zero_analysis(
-        df, schema, input_columns, zero_ratio, test_mask, train_mask, labels,
-        runtimes, ranking, high_zero_cutoff,
-    )
+    with log_phase("sensitivity.high_zero_analysis"):
+        high_zero_records, high_zero_summary = _high_zero_analysis(
+            df, schema, input_columns, zero_ratio, test_mask, train_mask, labels,
+            runtimes, ranking, high_zero_cutoff,
+        )
     summary = {
         "method": "post_training_no_refit",
         "evaluated_input_variables": input_columns,
@@ -640,11 +656,12 @@ def run_post_training_sensitivity(
     workbook = _in_output(paths.SENSITIVITY_WORKBOOK_DEFAULT)
     summary_json = _in_output(paths.SENSITIVITY_SUMMARY_JSON)
     html_path = _in_output(paths.SENSITIVITY_HTML_DEFAULT)
-    scenarios.to_csv(scenario_csv, index=False)
-    ranking.to_csv(ranking_csv, index=False)
-    sensitivity_matrix.to_csv(matrix_csv, index=False)
-    high_zero_records.to_csv(high_zero_csv, index=False)
-    with pd.ExcelWriter(workbook, engine="openpyxl") as writer:
+    with log_phase("sensitivity.write_tables"):
+        scenarios.to_csv(scenario_csv, index=False)
+        ranking.to_csv(ranking_csv, index=False)
+        sensitivity_matrix.to_csv(matrix_csv, index=False)
+        high_zero_records.to_csv(high_zero_csv, index=False)
+    with log_phase("sensitivity.write_workbook"), pd.ExcelWriter(workbook, engine="openpyxl") as writer:
         ranking.to_excel(writer, sheet_name="variables", index=False)
         sensitivity_matrix.to_excel(writer, sheet_name="matriz_sensibilidad", index=False)
         scenarios.to_excel(writer, sheet_name="escenarios", index=False)
@@ -655,7 +672,8 @@ def run_post_training_sensitivity(
         ]).to_excel(writer, sheet_name="alcance_variables", index=False)
     with open(summary_json, "w", encoding="utf-8") as fh:
         json.dump(_json_safe(summary), fh, ensure_ascii=False, indent=2)
-    _write_html_report(html_path, scenarios, ranking, high_zero_records, summary, score_samples)
+    with log_phase("sensitivity.write_html_report"):
+        _write_html_report(html_path, scenarios, ranking, high_zero_records, summary, score_samples)
 
     artifacts = {
         "html": os.path.abspath(html_path),

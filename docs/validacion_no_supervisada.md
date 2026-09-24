@@ -131,12 +131,16 @@ huella del dataset, eventos de fase con duración, y health checks tipados.
 Estados `PENDING`/`RUNNING`/`COMPLETED`/`FAILED` con progreso incremental: **ya
 existe en dos formas**.
 
-* **Terminal** — `src/utils/console_ui.py`: checklist fijo de las 15 fases
-  (cajas que se encienden en su sitio), panel de supuestos IF/VAE en vivo, KPIs
-  por modelo, salud del equipo (RAM/CPU) y cola de log.
+* **Terminal** — `src/utils/console_ui.py`: checklist fijo de las 19 fases
+  (cajas que se encienden en su sitio), línea `↳ función` con las funciones en
+  ejecución y su tiempo, una barra estilo tqdm por cada prueba en curso (p. ej.
+  las de la suite diagnóstica), panel de supuestos IF/VAE en vivo, KPIs por
+  modelo, salud del equipo (RAM/CPU) y cola de log.
 * **Navegador** — `src/reporting/flow_visualization.py::start_live_view`:
   servidor HTTP local (127.0.0.1) que sirve el flujo en vivo durante la
-  corrida, alimentado por el mismo stream de eventos.
+  corrida, alimentado por el mismo stream de eventos; muestra la función en
+  ejecución con su cronómetro, el avance de cada prueba (n/total, ETA) y las
+  últimas funciones terminadas.
 
 **Diferencia con la especificación**: el progreso se organiza por **fase del
 pipeline**, no por *experimento de validación*. Si se implementan las pruebas

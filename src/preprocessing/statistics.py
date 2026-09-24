@@ -47,6 +47,7 @@ from src.data.loader import PanelSchema  # noqa: E402
 from src.preprocessing.pipeline import NUMERIC_TRANSFORMS, make_numeric_transformer  # noqa: E402
 from src.utils import paths  # noqa: E402
 from src.utils.logging_config import log_phase, setup_logging  # noqa: E402
+from src.utils.progress import track  # noqa: E402
 
 __all__ = [
     "DEFAULT_FIGURE_DIR",
@@ -192,7 +193,8 @@ def compute_transform_diagnostics(
             "Diagnosing %d numeric feature(s) x %d transform(s) on up to %d sampled rows",
             len(numeric_cols), len(transforms), sample_size,
         )
-        for col in numeric_cols:
+        for col in track(numeric_cols, desc="transform_diagnostics[features]",
+                         unit="feature", label=str):
             base = df[col].to_numpy(dtype=np.float64)
             base = base[np.isfinite(base)]
             base = _subsample(base, sample_size, rng)
@@ -287,7 +289,7 @@ def plot_transform_diagnostics(
 
     saved: list[str] = []
     with log_phase("preprocessing.plot_transform_diagnostics", log):
-        for col in features:
+        for col in track(features, desc="transform_plots[features]", unit="figure", label=str):
             base = df[col].to_numpy(dtype=np.float64)
             base = base[np.isfinite(base)]
             base = _subsample(base, sample_size, rng)

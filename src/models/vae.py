@@ -61,6 +61,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from src.utils import paths
 from src.utils.atomic_io import atomic_replace
 from src.utils.logging_config import log_phase, setup_logging
+from src.utils.progress import Bar, show_best_trial as _show_best_trial
 
 __all__ = [
     "VAEModel",
@@ -676,8 +677,6 @@ class VAEDetector:
             self._restore_best(best_path, log)
             return self
 
-        from tqdm.auto import tqdm
-
         with log_phase("vae.fit", log):
             log.info(
                 "Training VAE on %d samples x %d features "
@@ -691,7 +690,7 @@ class VAEDetector:
                 self.kl_anneal_epochs, self.early_stopping_patience,
             )
             epochs_without_improvement = 0
-            progress = tqdm(
+            progress = Bar(
                 range(start_epoch, self.epochs),
                 total=self.epochs,
                 initial=start_epoch,
@@ -1243,7 +1242,6 @@ def tune_vae(
         The Optuna :class:`~optuna.study.Study` (completed + resumed trials).
     """
     import optuna
-    from tqdm.auto import tqdm
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -1407,10 +1405,11 @@ def tune_vae(
         study_name, storage, mode, resolved_direction, n_trials, len(study.trials),
     )
 
-    progress = tqdm(total=n_trials, desc=f"optuna[{study_name}]", unit="trial")
+    progress = Bar(desc=f"optuna[{study_name}]", total=n_trials, unit="trial")
 
     def _progress_callback(study_, trial) -> None:
         progress.update(1)
+        _show_best_trial(progress, study_)
 
     def _persist_best_callback(study_, trial) -> None:
         """Checkpoint the current best hyperparameters to YAML after each trial."""

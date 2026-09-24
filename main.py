@@ -339,8 +339,9 @@ def _model_metrics(supervised, labels, scores, oot_mask, X, label_types=None) ->
 
     metrics: dict = {}
     if supervised:
-        oot = supervised_metrics(labels[oot_mask], scores[oot_mask])
-        overall = supervised_metrics(labels, scores)
+        with log_phase("evaluation.supervised_metrics"):
+            oot = supervised_metrics(labels[oot_mask], scores[oot_mask])
+            overall = supervised_metrics(labels, scores)
         for k in (
             "roc_auc", "pr_auc", "best_f1", "mcc",
             "precision_at_10pct", "recall_at_10pct", "lift_at_10pct",
@@ -349,11 +350,13 @@ def _model_metrics(supervised, labels, scores, oot_mask, X, label_types=None) ->
         metrics["overall_pr_auc"] = overall.get("pr_auc")
         metrics["overall_roc_auc"] = overall.get("roc_auc")
         if label_types is not None:
-            metrics["by_type"] = metrics_by_anomaly_type(labels, label_types, scores)
-            metrics["oot_by_type"] = metrics_by_anomaly_type(
-                labels[oot_mask], np.asarray(label_types)[oot_mask], scores[oot_mask]
-            )
-    unsup = unsupervised_metrics(X, scores)
+            with log_phase("evaluation.metrics_by_anomaly_type"):
+                metrics["by_type"] = metrics_by_anomaly_type(labels, label_types, scores)
+                metrics["oot_by_type"] = metrics_by_anomaly_type(
+                    labels[oot_mask], np.asarray(label_types)[oot_mask], scores[oot_mask]
+                )
+    with log_phase("evaluation.unsupervised_metrics"):
+        unsup = unsupervised_metrics(X, scores)
     for k in ("silhouette", "calinski_harabasz", "rank_stability", "n_flagged"):
         metrics[f"unsup_{k}"] = unsup.get(k)
     return metrics
@@ -1305,18 +1308,20 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     if oot_row_mask.any():
                         if name == "iforest":
                             from src.interpretability import explain_rows_iforest
-                            top_vars = explain_rows_iforest(
-                                detector, X_model[oot_row_mask], feature_names=names_model,
-                            )
+                            with log_phase("interpretability.explain_rows_iforest"):
+                                top_vars = explain_rows_iforest(
+                                    detector, X_model[oot_row_mask], feature_names=names_model,
+                                )
                         else:
                             from src.interpretability import explain_rows_vae
                             categorical_columns = df.select_dtypes(
                                 include=["object", "category"]
                             ).columns.tolist()
-                            top_vars = explain_rows_vae(
-                                detector, X_model[oot_row_mask], feature_names=names_model,
-                                categorical_columns=categorical_columns,
-                            )
+                            with log_phase("interpretability.explain_rows_vae"):
+                                top_vars = explain_rows_vae(
+                                    detector, X_model[oot_row_mask], feature_names=names_model,
+                                    categorical_columns=categorical_columns,
+                                )
                         scored_df.loc[oot_row_mask, "top_5_variables"] = top_vars
                         dashboard_explanation_tables[name] = (
                             scored_df.loc[oot_row_mask]
@@ -2003,7 +2008,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-individuals", type=int, default=None,
                         help="Number of individuals in the synthetic panel (default 2000).")
     parser.add_argument("--n-periods", type=int, default=None,
-                        help="Number of monthly periods (default 8).")
+                        help="Number of monthly periods (default 16).")
     parser.add_argument("--seed", type=int, default=42,
                         help="Master seed for reproducibility (default 42).")
     parser.add_argument("--numeric-transform", default="yeo-johnson",

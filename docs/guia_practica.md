@@ -91,6 +91,36 @@ python main.py --quick --no-tune --no-auto-install-suite
 En ese modo la fase diagnóstica informa claramente que la suite no está
 disponible; no intenta descargar un paquete por nombre desde internet.
 
+## Seguir la suite diagnóstica mientras corre
+
+La Fase 9c es la parte más lenta del diagnóstico porque reajusta los detectores
+con otras semillas. Para saber qué hace y cuánto lleva, hay tres lugares
+(todos muestran lo mismo):
+
+- **Dashboard de consola** (por defecto en una terminal): bajo la fase actual,
+  la línea `↳ función` lista las funciones en ejecución con su tiempo, y debajo
+  hay una barra por cada prueba en curso, por ejemplo:
+
+  ```
+  ↳ función  ifvae_diagnostic._build_stability 03:12 › ifvae_diagnostic.refit[VAEDetector seed=2042] 01:05
+  ▸ ifvae_diagnostic:  45%|████▌     | 5/11 [03:12<03:52, 38.4s/prueba, ifvae_diagnostic._build_stability]
+  ▸ stability_refit[VAEDetector]:  33%|███▎      | 1/3 [01:05<02:10, 65.2s/refit, seed=2042]
+  ```
+
+  Un cronómetro que sigue creciendo con las barras quietas indica que esa función
+  está trabajando mucho tiempo o atascada; si avanza, el ritmo y la ETA lo dicen.
+- **Vista web local** (se abre sola; `--no-live-view` la desactiva): paneles
+  *Function running*, *Progress of running tests* y *Last finished functions*.
+- **Terminal sin dashboard** (`--no-console-ui`, o salida redirigida): barras
+  tqdm reales en la terminal, más las líneas `Starting/Finished <función> in Ns`
+  en `artifacts/logs/execution.log`.
+
+Cada prueba de la suite es una barra: los 12 pasos de `run_diagnostic`, las 11
+pruebas del puente, y bucles internos como `isolation_forest[seeds]`,
+`compare_populations[features]`, `stability_refit[...]` o
+`experiment[...]`. Para acortar la espera, baja `--diagnostic-stability-refits`
+o deja vacías las mallas opt-in del apartado 9.
+
 ## Activar la segmentación del apartado 8
 
 El valor por defecto es una columna llamada `segment`. Para usar una columna

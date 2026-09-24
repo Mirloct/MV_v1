@@ -39,6 +39,7 @@ import scipy.sparse as sp
 
 from src.utils import observability, paths
 from src.utils.logging_config import log_phase, setup_logging
+from src.utils.progress import track
 
 __all__ = ["shap_summary_iforest", "path_length_analysis", "explain_rows_iforest"]
 
@@ -343,8 +344,6 @@ def _permutation_importance(
     for a stable ranking), and ``n_repeats`` is reduced so total calls never
     exceed ``call_budget``.
     """
-    from tqdm.auto import tqdm
-
     log = setup_logging()
     X, _ = _subsample(X, max_samples, random_state)
     rng = np.random.default_rng(random_state)
@@ -371,7 +370,7 @@ def _permutation_importance(
     # the console) so a stall shows up in run_events.jsonl within ~1/4 of the
     # loop's total budgeted time instead of only at the very end.
     checkpoint_every = max(1, d // 4)
-    for j in tqdm(range(d), desc="permutation_importance", unit="feature"):
+    for j in track(range(d), desc="permutation_importance", unit="feature"):
         acc = 0.0
         col = X[:, j].copy()
         for _ in range(n_repeats_eff):

@@ -12,8 +12,9 @@ un archivo de ground truth **separado**, de modo que los detectores nunca las ve
 al entrenar.
 
 El pipeline es **ejecutable de punta a punta**: `python main.py` va desde la
-generación de datos hasta un Excel de los 50 individuos más riesgosos y un
-reporte HTML/MD. Está construido sobre un diseño estrictamente cronológico y
+generación de datos hasta la cola de revisión priorizada por riesgo (Excel OOT),
+un dashboard para el analista, un diagnóstico cruzado IF–VAE y un reporte
+HTML/MD. Está construido sobre un diseño estrictamente cronológico y
 libre de fugas — ver [`docs/leakage_free_pipeline.md`](docs/leakage_free_pipeline.md)
 para la derivación de 7 fases y el checklist anti-fugas.
 
@@ -341,20 +342,36 @@ construcción metodológica propia, no un método publicado con ese nombre.
 
 ### Dashboard de consola
 
-Durante la corrida, `main.py` muestra un panel en vivo (barra de progreso
-ponderada, fase actual con cronómetro, tabla de fases completadas, KPIs de la
-corrida y cola del log) en lugar de líneas de log desplazándose. Teclas: `v`
-detalle, `d` todas las fases, `o` abrir la vista web, `p` pausa.
+Durante la corrida, `main.py` muestra un panel en vivo en lugar de líneas de log
+desplazándose:
+
+- barra de progreso ponderada y **fase actual con cronómetro** -- el seguimiento
+  cubre **todas las fases** (preprocesamiento, tuneo Optuna, épocas del VAE,
+  evaluación, sensibilidad, interpretabilidad, reporte), no solo la suite;
+- **`↳ función`**: las funciones que se están ejecutando dentro de la fase (la más
+  interna resaltada), cada una con **su propio tiempo transcurrido** — un
+  cronómetro que sigue creciendo mientras nada avanza es la señal de que algo
+  está atascado;
+- **una barra estilo tqdm por cada prueba en curso** (p. ej. las pruebas de la
+  suite diagnóstica, los reajustes de estabilidad, los puntos de las mallas de
+  experimentos) con `n/total`, porcentaje, tiempo, ETA y el elemento en proceso;
+- checklist fijo de las 19 fases, panel de supuestos IF/VAE, KPIs de la corrida,
+  salud del equipo (RAM/CPU) y cola del log.
+
+Teclas: `v` detalle del log, `o` abrir la vista web, `p` pausa.
 
 Se desactiva solo si la salida no es un terminal (redirigida, CI) o si falta
-`rich`, para no corromper un log capturado. `--no-console-ui` lo fuerza off.
+`rich`, para no corromper un log capturado. `--no-console-ui` lo fuerza off; en
+ese modo (y en CI) las barras **tqdm reales** se dibujan directamente en la
+terminal. Con el dashboard activo, las mismas barras se muestran dentro del panel
+(con el formato exacto de tqdm) porque ambas salidas se pisarían entre sí.
 
 ### Ejecutar `main.py` — el pipeline completo
 
 ```bash
-python main.py                   # 2000 individuos x 15 periodos, con tuneo
-python main.py --quick           # 500 x 12, 5 trials cada uno — corrida de humo
-python main.py --full            # 100_000 x 15, 50/30 trials
+python main.py                   # 2000 individuos x 16 periodos, con tuneo
+python main.py --quick           # 500 x 13, 5 trials cada uno — corrida de humo
+python main.py --full            # 100_000 x 16, 50/30 trials
 python main.py --top-n 100       # exporta los 100 individuos más riesgosos
 python main.py --panel-features  # reactiva lag/diff/ratio/own-z + estacionalidad
 python main.py --supervised      # usa ground truth para tuneo/métricas (default: no supervisado)
@@ -397,7 +414,14 @@ reporte tampoco muestra métricas supervisadas cuando la corrida no las calculó
 **Vista de progreso en vivo.** Por defecto, al iniciar el pipeline se abre una
 página local (`http://127.0.0.1:<puerto>/`, nunca accesible fuera de esta
 máquina) que se actualiza cada segundo: porcentaje de avance, barra, fase actual
-con spinner y el diagrama de flujo creciendo conforme las fases completan. Si el
+con spinner y el diagrama de flujo creciendo conforme las fases completan. Debajo
+de la fase actual muestra en vivo **qué función se está ejecutando y cuánto lleva**
+(la pila de funciones anidadas, cada una con su cronómetro, que sigue corriendo
+entre una actualización y otra), **el avance de cada prueba con
+barra** (`n/total`, %, tiempo, ETA y el elemento en proceso, p. ej.
+`seed=2042`) y las últimas funciones terminadas con su duración; además **cada
+tarjeta de fase muestra las barras que corrieron dentro de ella**, y el HTML
+estático `flow_visualization.html` las lista en el detalle de cada nodo. Si el
 proceso se cancela o muere, la página lo detecta y marca la fase interrumpida en
 vez de quedarse congelada en "running". `--no-live-view` la desactiva (por
 ejemplo en CI). El mismo flujo, reproducible tras la corrida, queda en
@@ -405,8 +429,9 @@ ejemplo en CI). El mismo flujo, reproducible tras la corrida, queda en
 
 El orquestador corre datos → validación de supuestos → preprocesamiento →
 Isolation Forest + VAE (tuneo/ajuste) → evaluación → **calibración de umbral** →
-Excel top-N → interpretabilidad → reporte HTML/MD, sobre el diseño
-cronológico libre de fugas documentado en
+Excel OOT → dashboard del analista → diagnóstico cruzado IF–VAE (Fase 9c) →
+sensibilidad post-entrenamiento (Fase 9d) → interpretabilidad → reporte HTML/MD,
+sobre el diseño cronológico libre de fugas documentado en
 [`docs/leakage_free_pipeline.md`](docs/leakage_free_pipeline.md).
 
 **Orden de la interpretabilidad.** La Fase 10 (SHAP, UMAP) corre **después** de
@@ -421,11 +446,12 @@ calcula en un flujo aguas arriba. Enciéndelas para el flujo con datos sintétic
 Ver `CONTEXT.md` para el sustento completo y su consecuencia sobre el recall de
 anomalías `local`/`contextual`.
 
-**Partición.** Los periodos se dividen entrenamiento / validación / prueba en
-orden temporal (10 / 2 / 3 por defecto, `--n-val-periods` / `--n-test-periods`).
-Entrenamiento ajusta el preprocesamiento y los modelos, validación selecciona
-hiperparámetros *y* calibra el umbral de alerta, prueba se lee exactamente una
-vez al final.
+**Partición.** Los periodos se dividen entrenamiento / validación / prueba / OOT en
+orden temporal (8 / 2 / 3 / 3 por defecto con 16 periodos; `--n-val-periods`,
+`--n-test-periods`, `--n-oot-periods`). Entrenamiento ajusta el preprocesamiento y
+los modelos, validación selecciona hiperparámetros *y* calibra el umbral de
+alerta, prueba se lee exactamente una vez al final, y OOT se reserva después de
+prueba exclusivamente para la cola de revisión del negocio.
 
 **Entregable principal — la cola priorizada por riesgo.** Cada detector escribe
 
@@ -479,13 +505,30 @@ Modelo-v0.1/
 │   ├── data/               # cargador de panel + generador sintético
 │   ├── preprocessing/      # pipeline (transformaciones, features de panel) + diagnósticos
 │   ├── models/             # Isolation Forest + VAE + stacking + early stopping de trials
-│   ├── evaluation/         # partición OOT, cruce con GT, métricas, umbrales, exports Excel
+│   ├── evaluation/         # partición OOT, cruce con GT, métricas, umbrales, exports Excel,
+│   │                       # puente a la suite IF–VAE, sensibilidad post-entrenamiento
 │   ├── interpretability/   # SHAP, largo de camino, espacio latente, reconstrucción por feature
-│   ├── reporting/          # constructor de reportes + visualización de flujo
-│   └── utils/              # rutas, logging, observabilidad, supuestos, escritura atómica
+│   ├── reporting/          # reportes, dashboard del analista, visualización de flujo
+│   └── utils/              # rutas, logging, observabilidad, dashboard de consola, supuestos
+├── tests/                  # pruebas del proyecto (pytest)
+├── tools/                  # herramientas adyacentes; if_vae_diagnostic_suite/ es un paquete
+│                           # vendorizado con sus propias pruebas y su propio quality gate
 ├── docs/                   # fuentes *.md + documentation.html generado
 └── artifacts/              # TODO lo que el pipeline escribe (fuera de control de versiones)
 ```
+
+## Pruebas
+
+```bash
+python -m pytest tests -q                        # pruebas del proyecto
+cd tools/if_vae_diagnostic_suite
+PYTHONPATH=src python scripts/quality_gate.py    # pruebas + complejidad + mutantes de la suite
+```
+
+Se ejecutan por separado: ambos árboles tienen un paquete `scripts` de primer
+nivel y un solo `pytest` no puede recolectarlos juntos. Las pruebas que ajustan un
+VAE real usan el directorio de checkpoints por defecto (`artifacts/models/vae/`);
+ver `CONTEXT.md` → *Testing*.
 
 ## Documentación
 

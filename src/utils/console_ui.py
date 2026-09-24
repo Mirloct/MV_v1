@@ -78,13 +78,42 @@ from src.utils.logging_config import (
     add_phase_observer,
     remove_phase_observer,
 )
-from src.utils.observability import add_check_observer, remove_check_observer
+from src.utils.observability import (
+    add_check_observer,
+    add_progress_observer,
+    remove_check_observer,
+    remove_progress_observer,
+)
 from src.utils import resource_monitor
 
 __all__ = [
     "ConsoleUI", "console_dashboard", "supports_dashboard",
-    "start_dashboard", "stop_dashboard", "set_stat", "active",
+    "start_dashboard", "stop_dashboard", "set_stat", "active", "is_live",
 ]
+
+#: Progress bars shown at once under the phase line (most recently started
+#: last). A bar is a loop-shaped test -- e.g. the diagnostic suite's stability
+#: refits -- and only running ones are drawn; finished ones drop off.
+_MAX_BARS = 4
+#: Nested functions shown in the "↳ función" breadcrumb (outermost dropped first).
+_MAX_FUNCTIONS = 3
+
+
+def _format_bar(bar: dict, elapsed_s: float, width: int) -> str:
+    """One bar as tqdm itself would draw it (``desc: 33%|███ | 2/6 [00:41<01:22,
+    20.5s/refit, seed=2001]``), via ``tqdm.format_meter`` -- the same renderer,
+    without tqdm writing to the terminal the dashboard owns. Falls back to a
+    plain ``desc n/total`` when tqdm is unavailable."""
+    try:
+        from tqdm import tqdm
+
+        return tqdm.format_meter(
+            bar["n"], bar["total"], elapsed_s, ncols=width, prefix=bar["desc"],
+            unit=bar["unit"], postfix=(bar["current"] or None),
+        )
+    except Exception:  # noqa: BLE001 - a bar is decoration
+        total = f"/{bar['total']}" if bar["total"] is not None else ""
+        return f"{bar['desc']} {bar['n']}{total} {bar['current']}".strip()
 
 #: The phases `main.py` runs, in order, with a short human label and a rough
 #: relative cost. Weights only shape the progress bar's pacing -- a run whose
@@ -255,6 +284,12 @@ class ConsoleUI:
         # "hace Ns", not just an unmoving progress bar.
         self._interp_checks: deque = deque(maxlen=3)
         self._interp_total = 0
+        # Live progress bars (`observability.progress_event`), keyed by bar
+        # description, insertion-ordered = start order. Each holds the latest
+        # event plus when it arrived: the bar's own elapsed time is that
+        # event's `elapsed_s` plus the time since, so the timer keeps ticking
+        # between the (throttled) events instead of freezing on the last one.
+        self._bars: dict[str, dict] = {}
         # Sampled roughly once a second (see `_loop`), not on every ~100ms
         # repaint -- a psutil call per frame would be needless overhead for a
         # number that does not change that fast.
@@ -290,6 +325,12 @@ class ConsoleUI:
                     rec["status"] = "done" if event == "phase_completed" else "failed"
                     rec["duration"] = duration_s
                     return
+
+    # -- progress-bar observer ---------------------------------------------- #
+    def _on_progress(self, fields: dict) -> None:
+        """Record the latest state of one progress bar (see ``self._bars``)."""
+        with self._lock:
+            self._bars[fields["desc"]] = {**fields, "received": time.perf_counter()}
 
     # -- assumption/training-check observer --------------------------------- #
     @staticmethod
@@ -356,16 +397,20 @@ class ConsoleUI:
 
     def _progress_fraction(self) -> tuple[float, int, int]:
         """``(fraction, completed, total)`` weighted by the plan's cost model."""
+        # Only top-level "Phase N" entries count: nested functions reported
+        # through the same observer (iforest.fit, the diagnostic suite's
+        # dozens of steps, ...) are detail, not progress through the plan, and
+        # would push "n/total fases" past the real phase count.
+        top = [p for p in self._phases if p["name"].startswith("Phase")]
         done_codes = {
-            p["name"].split(":", 1)[0].strip()
-            for p in self._phases if p["status"] == "done"
+            p["name"].split(":", 1)[0].strip() for p in top if p["status"] == "done"
         }
         planned_total = sum(w for _, _, w in _PHASE_PLAN)
         done_weight = sum(
             w for code, _, w in _PHASE_PLAN if code in done_codes
         )
-        n_done = sum(1 for p in self._phases if p["status"] == "done")
-        n_total = max(len(_PHASE_PLAN), len(self._phases))
+        n_done = sum(1 for p in top if p["status"] == "done")
+        n_total = max(len(_PHASE_PLAN), len(top))
         frac = min(done_weight / planned_total, 1.0) if planned_total else 0.0
         return frac, n_done, n_total
 
@@ -385,6 +430,7 @@ class ConsoleUI:
             resource = self._resource
             interp_checks = list(self._interp_checks)
             interp_total = self._interp_total
+            bars = [b for b in self._bars.values() if b["state"] != "end"]
 
         elapsed = time.perf_counter() - self._start
         frac, n_done, n_total = self._progress_fraction()
@@ -411,8 +457,12 @@ class ConsoleUI:
         bar.append(f"{n_done}/{n_total} fases", style="dim")
 
         running = [p for p in phases if p["status"] == "running"]
+        # The "now" line names the plan phase; the functions nested inside it
+        # (below) get their own line, so neither hides the other.
+        nested = [p for p in running if not p["name"].startswith("Phase")]
+        top_running = [p for p in running if p["name"].startswith("Phase")]
         if running:
-            cur = running[-1]
+            cur = (top_running or running)[-1]
             # ASCII spinner on purpose: simple and portable across terminals,
             # unlike a braille-dot spinner which some fonts render poorly.
             spin = "|/-\\"[int(time.perf_counter() * 8) % 4]
@@ -424,6 +474,31 @@ class ConsoleUI:
             )
         else:
             now = Text("· en espera", style="dim")
+
+        # -- running functions + live progress bars ------------------------- #
+        # Which function is executing and for how long, innermost last, each
+        # with its OWN elapsed time (a stall shows as one timer that keeps
+        # growing while the bars beneath it stand still), then one tqdm-style
+        # bar per loop-shaped test in flight.
+        func_line = None
+        if top_running and nested:
+            func_line = Text("  ↳ función  ", style="dim")
+            shown = nested[-_MAX_FUNCTIONS:]
+            for i, p in enumerate(shown):
+                if i:
+                    func_line.append(" › ", style="dim")
+                func_line.append(p["name"], style="bold cyan" if i == len(shown) - 1 else "dim")
+                func_line.append(
+                    f" {self._fmt_elapsed(time.perf_counter() - p['t0'])}", style="dim"
+                )
+        bar_lines = []
+        bar_width = max(40, min(self._console.width, 130) - 8)
+        for b in bars[-_MAX_BARS:]:
+            bar_elapsed = b["elapsed_s"] + (time.perf_counter() - b["received"])
+            bar_lines.append(Text(
+                "  ▸ " + _format_bar(b, bar_elapsed, bar_width), style="cyan", no_wrap=True,
+                overflow="ellipsis",
+            ))
 
         # -- interpretability sub-step: one level of detail below "now" ----- #
         # Phase-level progress says "Phase 10 is running"; this says exactly
@@ -553,6 +628,9 @@ class ConsoleUI:
             hint.append(f"  {self.live_url}", style="dim underline")
 
         info_rows = [head, Text(""), bar, now]
+        if func_line is not None:
+            info_rows.append(func_line)
+        info_rows.extend(bar_lines)
         if interp_sub is not None:
             info_rows.append(interp_sub)
         if health is not None:
@@ -634,6 +712,7 @@ class ConsoleUI:
         self._silence_console_logging()
         add_phase_observer(self._on_phase)
         add_check_observer(self._on_check)
+        add_progress_observer(self._on_progress)
         self._live = Live(self._render(), console=self._console,
                           refresh_per_second=10, transient=False)
         self._live.start()
@@ -648,6 +727,7 @@ class ConsoleUI:
             self._thread.join(timeout=1.0)
         remove_phase_observer(self._on_phase)
         remove_check_observer(self._on_check)
+        remove_progress_observer(self._on_progress)
         if self._live is not None:
             try:
                 self._live.update(self._render())
@@ -724,6 +804,13 @@ _ACTIVE = None
 def active():
     """The running dashboard, or ``None``."""
     return _ACTIVE
+
+
+def is_live() -> bool:
+    """True only while a real repainting dashboard owns the terminal (not the
+    silent stand-in). Code that would otherwise draw its own terminal output,
+    such as tqdm bars, checks this to avoid tearing the display."""
+    return isinstance(_ACTIVE, ConsoleUI)
 
 
 def start_dashboard(enabled: bool = True, run_id: str = "", live_url: str = ""):

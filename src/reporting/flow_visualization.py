@@ -47,6 +47,7 @@ import json
 import os
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
@@ -89,6 +90,58 @@ def _model_tag(phase_name: str) -> tuple[str, Optional[str]]:
     return phase_name[: m.start()].rstrip(), m.group(1)
 
 
+#: Completed nested functions kept for the live view's "recent" list.
+_RECENT_FUNCTIONS = 10
+
+
+def _event_epoch(ev: dict) -> Optional[float]:
+    """When ``ev`` happened, as epoch seconds: the millisecond ``t`` field when
+    present, else the whole-second ``ts`` (older event files have only that)."""
+    if ev.get("t") is not None:
+        return float(ev["t"])
+    try:
+        return time.mktime(time.strptime(ev["ts"], "%Y-%m-%dT%H:%M:%S"))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _track_function(ev: dict, kind: Optional[str], live: dict) -> None:
+    """Keep the stack of currently-open nested functions and the recent ones.
+
+    A nested function is any non-``Phase N`` phase (``iforest.fit``, the
+    diagnostic suite's own steps, ...). Started -> pushed; completed/failed ->
+    popped (last matching, so a repeated name closes the right one) and
+    remembered with its real duration.
+    """
+    name = ev["phase"]
+    if kind == "phase_started":
+        live["running_functions"].append(
+            {"name": name, "started_at": ev.get("ts"), "started_epoch": _event_epoch(ev)}
+        )
+        return
+    if kind not in ("phase_completed", "phase_failed"):
+        return
+    for i in range(len(live["running_functions"]) - 1, -1, -1):
+        if live["running_functions"][i]["name"] == name:
+            del live["running_functions"][i]
+            break
+    live["recent_functions"].append({
+        "name": name, "duration_s": ev.get("duration_s"),
+        "status": "completed" if kind == "phase_completed" else "failed",
+    })
+    del live["recent_functions"][:-_RECENT_FUNCTIONS]
+
+
+def _track_progress(ev: dict, live: dict) -> None:
+    """Latest state of each progress bar, keyed by its description."""
+    live["progress"][ev.get("desc", "?")] = {
+        "desc": ev.get("desc", "?"), "n": ev.get("n", 0), "total": ev.get("total"),
+        "unit": ev.get("unit", "it"), "state": ev.get("state", "update"),
+        "current": ev.get("current", ""), "elapsed_s": ev.get("elapsed_s", 0.0),
+        "updated_epoch": _event_epoch(ev),
+    }
+
+
 def _build_nodes(events: list[dict]) -> dict:
     """Single linear scan over `events` (already in true emission order)."""
     nodes: list[dict] = []
@@ -97,6 +150,7 @@ def _build_nodes(events: list[dict]) -> dict:
     run_meta: dict[str, Any] = {}
     all_health_checks: list[dict] = []
     dataset_fp: Optional[dict] = None
+    live: dict[str, Any] = {"running_functions": [], "recent_functions": [], "progress": {}}
 
     for ev in events:
         kind = ev.get("event")
@@ -122,6 +176,14 @@ def _build_nodes(events: list[dict]) -> dict:
         if kind == "health_check":
             all_health_checks.append(ev)
             continue
+        if kind == "progress":
+            _track_progress(ev, live)
+            if current is not None:
+                # Same file-order attribution as nested functions: the bar
+                # belongs to whichever top-level phase was open when it fired,
+                # so every phase's card can say what ran inside it and how far.
+                current["progress"][ev.get("desc", "?")] = dict(live["progress"][ev.get("desc", "?")])
+            continue
         if kind == "tuning_trial":
             # Attributed to whichever top-level node was open when it fired
             # (Phase 6/7 for this project's `tune_iforest`/`tune_vae`), the
@@ -142,7 +204,9 @@ def _build_nodes(events: list[dict]) -> dict:
                 node = {
                     "name": phase, "display_name": display_name, "model": model,
                     "status": "running", "started_at": ev.get("ts"),
+                    "started_epoch": _event_epoch(ev),
                     "duration_s": None, "sub_events": [], "tuning_trials": [],
+                    "progress": {},
                     "order": len(nodes),
                 }
                 nodes.append(node)
@@ -156,6 +220,7 @@ def _build_nodes(events: list[dict]) -> dict:
                 if current is node:
                     current = None
         else:
+            _track_function(ev, kind, live)
             target = current
             if target is not None:
                 target["sub_events"].append({
@@ -173,12 +238,57 @@ def _build_nodes(events: list[dict]) -> dict:
             if node["status"] == "running":
                 node["status"] = "interrupted"
 
+    # Once the run has ended nothing is executing any more: functions still
+    # open and bars not yet closed are leftovers of an interrupted run, and
+    # must not be shown (or timed) as if they were still going.
+    if run_meta.get("status") not in (None, "running"):
+        live["running_functions"] = []
+        for bar in live["progress"].values():
+            bar["state"] = "end"
+        for node in nodes:
+            for bar in node["progress"].values():
+                bar["state"] = "end"
+
+    # JSON payloads carry each node's bars as an ordered list.
+    for node in nodes:
+        node["progress"] = list(node["progress"].values())
+
     return {
         "run": run_meta,
         "dataset": dataset_fp,
         "nodes": nodes,
         "health_checks": all_health_checks,
+        "live": {**live, "progress": list(live["progress"].values())},
     }
+
+
+def _annotate_live(data: dict, now: float) -> dict:
+    """Add wall-clock-dependent fields for the live view: how long each
+    running function / phase / bar has been going *as of ``now``*.
+
+    Kept out of :func:`_build_nodes` so that stays a pure function of the
+    event file (the static replay and its tests never depend on the clock).
+    """
+    live = data["live"]
+    for fn in live["running_functions"]:
+        started = fn.get("started_epoch")
+        fn["elapsed_s"] = round(now - started, 3) if started else None
+    for bar in live["progress"]:
+        updated = bar.get("updated_epoch")
+        running = bar["state"] != "end" and updated
+        bar["elapsed_now_s"] = round(bar["elapsed_s"] + now - updated, 3) if running else bar["elapsed_s"]
+    for node in data["nodes"]:
+        started = node.get("started_epoch")
+        if node["status"] == "running" and started:
+            node["elapsed_s"] = round(now - started, 3)
+        for bar in node.get("progress", []):
+            updated = bar.get("updated_epoch")
+            running = bar["state"] != "end" and updated
+            bar["elapsed_now_s"] = (
+                round(bar["elapsed_s"] + now - updated, 3) if running else bar["elapsed_s"]
+            )
+    data["server_now"] = now
+    return data
 
 
 def _render_html(data: dict) -> str:
@@ -375,7 +485,11 @@ function renderFlow() {{
       '<div class="node-title">' + esc(n.display_name) +
       (n.model ? '<span class="node-model">' + esc(n.model) + '</span>' : '') + '</div>' +
       '<div class="node-status">' + statusDot(displayStatus) + displayStatus +
-      (n.duration_s !== null && i < revealCount ? ' &middot; ' + fmtDur(n.duration_s) : '') + '</div>';
+      (n.duration_s !== null && i < revealCount ? ' &middot; ' + fmtDur(n.duration_s) : '') + '</div>' +
+      (i < revealCount && (n.progress || []).length
+        ? '<div class="node-status">' + n.progress.length + ' progress bar(s) &middot; ' +
+          (n.sub_events || []).filter(e => e.event !== "phase_started").length + ' function(s)</div>'
+        : '');
     el.addEventListener("click", () => showDetail(n, displayStatus));
     el.addEventListener("keydown", (e) => {{
       if (e.key === "Enter" || e.key === " ") {{ e.preventDefault(); showDetail(n, displayStatus); }}
@@ -398,6 +512,13 @@ function showDetail(node, displayStatus) {{
   let rows = node.sub_events.map(se =>
     '<tr><td class="mono">' + esc(se.phase) + '</td><td>' + esc(se.event) + '</td><td class="mono">' + fmtDur(se.duration_s) + '</td></tr>'
   ).join("");
+  let bars = "";
+  const pb = node.progress || [];
+  if (pb.length) {{
+    bars = "<h3>Progress bars run during this phase (" + pb.length + ")</h3><div class=\\"table-wrap\\"><table><tr><th>bar</th><th>done</th><th>time</th><th>last item</th></tr>" +
+      pb.map(b => '<tr><td class="mono">' + esc(b.desc) + '</td><td class="mono">' + b.n + (b.total !== null && b.total !== undefined ? "/" + b.total : "") + " " + esc(b.unit) + '</td><td class="mono">' + fmtDur(b.elapsed_s) + '</td><td class="mono">' + esc(b.current || "") + '</td></tr>').join("") +
+      "</table></div>";
+  }}
   let trials = "";
   const t = node.tuning_trials || [];
   if (t.length) {{
@@ -409,7 +530,7 @@ function showDetail(node, displayStatus) {{
     "<h3>" + esc(node.display_name) + (node.model ? '<span class="node-model">' + esc(node.model) + '</span>' : "") + "</h3>" +
     "<p class=\\"meta\\">" + statusBadge + " &middot; duration=" + fmtDur(node.duration_s) + " &middot; started_at=<span class=\\"mono\\">" + esc(node.started_at) + "</span></p>" +
     (rows ? '<div class="table-wrap"><table><tr><th>nested phase</th><th>event</th><th>duration</th></tr>' + rows + "</table></div>" : "<p class=\\"meta\\">No nested phases logged under this node.</p>") +
-    trials;
+    bars + trials;
 }}
 
 function renderSummary() {{
@@ -592,6 +713,11 @@ h1 { font-size: 19px; margin: 0 0 4px; font-weight: 650; display: flex; align-it
 .badge.ok { background: var(--ok-bg); color: var(--ok); }
 .badge.bad { background: var(--bad-bg); color: var(--bad); }
 .empty { color: var(--muted); font-style: italic; padding: 8px 0; }
+.node-bars { margin-top: 6px; display: grid; gap: 4px; }
+.mini { font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; line-height: 1.25; overflow-wrap: anywhere; }
+.mini .mini-track { height: 4px; background: var(--border); border-radius: 3px; overflow: hidden; margin-top: 2px; }
+.mini .mini-fill { height: 100%; background: var(--accent); }
+.mini.done .mini-fill { background: var(--ok); }
 
 /* -- progress header ------------------------------------------------------ */
 .progress-row { display: flex; align-items: center; gap: 14px; margin-bottom: 16px; flex-wrap: wrap; }
@@ -624,6 +750,35 @@ h1 { font-size: 19px; margin: 0 0 4px; font-weight: 650; display: flex; align-it
 .now-label { color: var(--muted); font-size: 11px; text-transform: uppercase;
   letter-spacing: .05em; font-weight: 650; }
 .elapsed { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 12px; }
+
+/* -- live detail: running functions, tqdm-style bars, recent functions ----- */
+.live-detail { display: grid; gap: 14px; margin-bottom: 16px; }
+.live-detail h4 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .05em; color: var(--muted); font-weight: 650; }
+.fn-row { display: flex; align-items: baseline; gap: 10px; padding: 3px 0;
+  font-variant-numeric: tabular-nums; }
+.fn-name { font-family: ui-monospace, "SF Mono", "Cascadia Code", "Consolas", monospace;
+  font-size: 12.5px; overflow-wrap: anywhere; }
+.fn-row.inner .fn-name { color: var(--accent); font-weight: 650; }
+.fn-row.outer .fn-name { color: var(--muted); }
+.fn-time { margin-left: auto; font-size: 13px; font-weight: 650; white-space: nowrap; }
+.fn-indent { color: var(--muted); flex: none; }
+.bar-row { padding: 6px 0; }
+.bar-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap;
+  font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.bar-desc { font-family: ui-monospace, "SF Mono", "Cascadia Code", "Consolas", monospace; font-weight: 650; }
+.bar-track { height: 9px; background: var(--border); border-radius: 5px; overflow: hidden; margin: 5px 0 3px; }
+.bar-fill { height: 100%; background: var(--accent); transition: width .4s ease; }
+.bar-fill.indeterminate { width: 40% !important; opacity: .55; animation: slide 1.4s ease-in-out infinite alternate; }
+@keyframes slide { from { margin-left: 0; } to { margin-left: 60%; } }
+@media (prefers-reduced-motion: reduce) { .bar-fill.indeterminate { animation: none; } .bar-fill { transition: none; } }
+.bar-meta { color: var(--muted); font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.recent-row { display: flex; gap: 10px; font-size: 12px; padding: 1px 0; color: var(--muted);
+  font-variant-numeric: tabular-nums; }
+.recent-row .fn-name { font-size: 11.5px; }
+.recent-row .fn-time { font-size: 12px; font-weight: 500; }
+.recent-row.failed .fn-name, .recent-row.failed .fn-time { color: var(--bad); }
+.live-empty { color: var(--muted); font-style: italic; font-size: 12.5px; }
 </style>
 </head>
 <body>
@@ -639,6 +794,11 @@ h1 { font-size: 19px; margin: 0 0 4px; font-weight: 650; display: flex; align-it
   <div class="now-running" id="now-running">
     <span class="spinner"></span>
     <span><span class="now-label">Current phase</span><br><span id="now-phase">waiting…</span></span>
+  </div>
+  <div class="live-detail">
+    <div><h4>Function running <span class="meta" id="fn-note"></span></h4><div id="live-functions"><div class="live-empty">none</div></div></div>
+    <div><h4>Progress of running tests</h4><div id="live-bars"><div class="live-empty">no test with a progress bar is running</div></div></div>
+    <div><h4>Last finished functions</h4><div id="live-recent"><div class="live-empty">none yet</div></div></div>
   </div>
   <h3>Phase timeline (auto-refreshing)</h3>
   <div class="flow" id="flow"><div class="empty">Waiting for the first event...</div></div>
@@ -668,13 +828,102 @@ function fmtElapsedMinutes(totalSeconds) {
   return h + "h " + m + "m";
 }
 function statusDot(status) { return '<span class="dot dot-' + status + '"></span>'; }
+/* The bars that ran inside one phase, on that phase's own card: running ones
+   first (they are what you are waiting on), then a few finished ones. */
+function miniBars(n) {
+  const bars = (n.progress || []).slice().sort((a, b) => (a.state === "end") - (b.state === "end")).slice(0, 3);
+  if (!bars.length) return "";
+  return '<div class="node-bars">' + bars.map(b => {
+    const known = b.total !== null && b.total !== undefined && b.total > 0;
+    const pct = known ? Math.min(100, 100 * b.n / b.total) : (b.state === "end" ? 100 : 0);
+    return '<div class="mini' + (b.state === "end" ? " done" : "") + '">' + esc(b.desc) + " " + b.n + (known ? "/" + b.total : "") +
+      '<div class="mini-track"><div class="mini-fill" style="width:' + pct + '%"></div></div></div>';
+  }).join("") + "</div>";
+}
+/* mm:ss, or h:mm:ss past an hour -- the clock of ONE function or bar, where
+   seconds matter (a stall is a timer that keeps growing while nothing moves). */
+function fmtClock(totalSeconds) {
+  if (totalSeconds === null || totalSeconds === undefined || !isFinite(totalSeconds)) return "--:--";
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const mm = String(m).padStart(2, "0"), ss = String(sec).padStart(2, "0");
+  return h ? h + ":" + mm + ":" + ss : mm + ":" + ss;
+}
 
+/* The last /state payload and when it arrived. Elapsed times in it are "as of
+   the server's clock at request time"; adding the time since arrival keeps
+   every timer ticking smoothly between the 1s polls. */
+let liveState = null;
+let liveFetchedAt = 0;
 let stopped = false;
+
+function sinceFetch() {
+  return (stopped || !liveState) ? 0 : (performance.now() - liveFetchedAt) / 1000;
+}
+
+function paintLive() {
+  if (!liveState) return;
+  const live = liveState.live || {};
+  const drift = sinceFetch();
+
+  /* Running functions: the phase, then the nested functions inside it. */
+  const fnEl = document.getElementById("live-functions");
+  const running = live.running_functions || [];
+  const topRunning = (liveState.nodes || []).filter(n => n.status === "running");
+  const rows = [];
+  topRunning.forEach(n => rows.push({name: n.display_name + (n.model ? " [" + n.model + "]" : ""),
+    elapsed: n.elapsed_s, kind: "outer"}));
+  running.forEach((f, i) => rows.push({name: f.name, elapsed: f.elapsed_s,
+    kind: i === running.length - 1 ? "inner" : "outer", nested: true}));
+  if (!rows.length) {
+    fnEl.innerHTML = '<div class="live-empty">none</div>';
+  } else {
+    if (rows.length && !rows.some(r => r.kind === "inner")) rows[rows.length - 1].kind = "inner";
+    fnEl.innerHTML = rows.map(r =>
+      '<div class="fn-row ' + r.kind + '">' + (r.nested ? '<span class="fn-indent">&#8627;</span>' : "") +
+      '<span class="fn-name">' + esc(r.name) + '</span>' +
+      '<span class="fn-time">' + fmtClock(r.elapsed === null || r.elapsed === undefined ? null : r.elapsed + drift) + '</span></div>'
+    ).join("");
+  }
+  document.getElementById("fn-note").textContent = running.length
+    ? "(" + running.length + " nested, innermost highlighted)" : "";
+
+  /* tqdm-style bars: n/total, %, elapsed, ETA, and the item in flight. */
+  const barEl = document.getElementById("live-bars");
+  const bars = (live.progress || []).filter(b => b.state !== "end");
+  if (!bars.length) {
+    barEl.innerHTML = '<div class="live-empty">no test with a progress bar is running</div>';
+  } else {
+    barEl.innerHTML = bars.map(b => {
+      const elapsed = (b.elapsed_now_s || 0) + drift;
+      const known = b.total !== null && b.total !== undefined && b.total > 0;
+      const pct = known ? Math.min(100, 100 * b.n / b.total) : 0;
+      const eta = known && b.n > 0 ? elapsed * (b.total - b.n) / b.n : null;
+      return '<div class="bar-row"><div class="bar-head"><span class="bar-desc">' + esc(b.desc) + '</span>' +
+        '<span>' + b.n + (known ? "/" + b.total : "") + " " + esc(b.unit) + '</span>' +
+        (known ? '<span>' + pct.toFixed(0) + '%</span>' : "") +
+        (b.current ? '<span class="meta">' + esc(b.current) + '</span>' : "") + '</div>' +
+        '<div class="bar-track"><div class="bar-fill' + (known ? "" : " indeterminate") + '" style="width:' + pct + '%"></div></div>' +
+        '<div class="bar-meta">elapsed ' + fmtClock(elapsed) + (eta !== null ? " &middot; ETA " + fmtClock(eta) : "") + '</div></div>';
+    }).join("");
+  }
+
+  /* Most recent finished functions, newest first, with real durations. */
+  const recentEl = document.getElementById("live-recent");
+  const recent = (live.recent_functions || []).slice().reverse().slice(0, 6);
+  recentEl.innerHTML = recent.length ? recent.map(f =>
+    '<div class="recent-row ' + f.status + '"><span class="fn-name">' + esc(f.name) + '</span>' +
+    '<span class="fn-time">' + fmtDur(f.duration_s) + (f.status === "failed" ? " failed" : "") + '</span></div>'
+  ).join("") : '<div class="live-empty">none yet</div>';
+}
+setInterval(paintLive, 250);
 let sawTerminalStatus = false;
 let failedPolls = 0;
 const TERMINAL = ["success", "failed", "cancelled"];
 
 function render(data) {
+  liveState = data;
+  liveFetchedAt = performance.now();
   const nodes = data.nodes || [];
   const flowEl = document.getElementById("flow");
   if (!nodes.length) {
@@ -696,7 +945,7 @@ function render(data) {
         '<div class="node-title">' + esc(n.display_name) +
         (n.model ? '<span class="node-model">' + esc(n.model) + '</span>' : '') + '</div>' +
         '<div class="node-status">' + statusDot(n.status) + n.status +
-        (n.duration_s !== null ? ' &middot; ' + fmtDur(n.duration_s) : '') + '</div>';
+        (n.duration_s !== null ? ' &middot; ' + fmtDur(n.duration_s) : '') + '</div>' + miniBars(n);
       wrap.appendChild(el);
       flowEl.appendChild(wrap);
     });
@@ -824,7 +1073,9 @@ class _LiveFlowHandler(BaseHTTPRequestHandler):
             events = _select_run(_read_events(self.events_path), self.run_id)
             data = _build_nodes(events) if events else {
                 "run": {}, "dataset": None, "nodes": [], "health_checks": [],
+                "live": {"running_functions": [], "recent_functions": [], "progress": []},
             }
+            data = _annotate_live(data, time.time())
             self._send(200, "application/json", json.dumps(data, default=str).encode("utf-8"))
         else:
             self._send(404, "text/plain; charset=utf-8", b"not found")

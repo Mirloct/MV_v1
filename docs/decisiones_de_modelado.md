@@ -378,8 +378,8 @@ un número que no cambia esa rápido.
 
 **Rediseño:** el panel de fases pasó de una tabla que solo mostraba las
 últimas completadas (creciendo/desplazándose a medida que avanzaba la corrida)
-a una **lista fija de las 15 fases planeadas, visible completa desde el primer
-cuadro**: cada fila empieza en `□` (pendiente, atenuada) y cambia en el mismo
+a una **lista fija de las fases planeadas (15 en esa ronda; hoy 19, ver
+`_PHASE_PLAN`), visible completa desde el primer cuadro**: cada fila empieza en `□` (pendiente, atenuada) y cambia en el mismo
 lugar a `▣` (en curso, cian) o `■` (completada, verde / roja si falló) -- nada
 se agrega ni se desplaza, solo cambia de estado.
 
@@ -392,6 +392,26 @@ cada `.fit()`. Y una línea **"Equipo"** con RAM del proceso, RAM del sistema
 número visible -- nunca solo color) y CPU, más útil durante las fases pesadas
 (entrenamiento del VAE, ajuste del Isolation Forest, interpretabilidad) pero
 visible en todo momento en vez de activarse/desactivarse por fase.
+
+**Actualización (2026-09-23): seguimiento de la suite diagnóstica.** La Fase 9c
+puede pasar minutos dentro de un solo bucle (reajustes de estabilidad, mallas de
+experimentos), y un indicador por *fase* no distingue "trabajando" de "colgada".
+Se añadió la línea `↳ función` (funciones anidadas en ejecución, cada una con su
+cronómetro) y una barra por prueba en curso, alimentadas por eventos que emite la
+propia suite (`ifvae_diag/progress.py`) y que el puente reenvía. Decisiones y
+costo:
+
+* **tqdm dentro del panel, no debajo.** Un dashboard `rich` que se repinta y las
+  redibujadas con `\r` de tqdm sobre stderr se destruyen mutuamente; por eso, con
+  el dashboard activo, las barras se dibujan dentro del panel con
+  `tqdm.format_meter` (mismo formato, sin escribir en la terminal) y los tqdm
+  reales sólo se dibujan sin dashboard (`--no-console-ui`, CI).
+* **Costo:** despreciable. Las actualizaciones de una barra se emiten como máximo
+  cada 0.5 s (inicio y fin siempre), así que el JSONL no crece por iteración; el
+  cronómetro entre eventos lo calcula el cliente/el repintado, no el pipeline.
+* **La suite sigue desacoplada:** no importa nada de `src/`; solo publica
+  eventos a observadores. El único punto que conoce ambos lados es
+  `_suite_progress` en `src/evaluation/ifvae_diagnostic.py`.
 
 ### 4.4 Tiempos por fase (corrida de referencia)
 

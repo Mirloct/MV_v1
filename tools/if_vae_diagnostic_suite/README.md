@@ -21,6 +21,8 @@ contamination determine what its scores mean.
 - segment metrics and valid anomaly-family cohorts (family positives vs all negatives);
 - drift, missingness, out-of-reference-range, timestamp-overlap, and leakage-name checks;
 - deterministic reports, data fingerprints, tie-stable rankings, and local plots;
+- live progress: named steps with their own elapsed time and a tqdm bar for every
+  loop-shaped test (see "Live progress");
 - non-tautological unit/adversarial tests, four killed source mutants, compilation,
   and a cyclomatic-complexity ceiling of 10.
 
@@ -71,6 +73,33 @@ PYTHONPATH=src python -m ifvae_diag simulate --out build/demo --seed 7
 The synthetic run contains deliberately engineered point/extrapolation,
 relationship-break, and shared anomalies. It proves that the diagnostics identify
 known failure modes; it does not estimate live precision or recall.
+
+## Live progress
+
+A run can spend minutes in one loop, so `ifvae_diag.progress` reports *which
+function is running, for how long, and how far along each test is*. On the
+command line this is a tqdm bar per test (`run_diagnostic` over its 12 stages,
+`isolation_forest[seeds]`, `compare_populations[features]`,
+`write_outputs[files]`) with the item in flight shown after the bar. tqdm is
+optional (`pip install tqdm`); without it the same information is still emitted
+as events. The bars are instrumentation only and never change a computed value.
+
+To mirror the progress into another UI, register an observer (a plain callable
+receiving dicts) and, if that UI owns the terminal, turn tqdm off:
+
+```python
+from ifvae_diag import progress
+
+progress.add_observer(print)               # step_started / step_completed /
+                                           # step_failed / progress events
+progress.configure(tqdm_enabled=False)     # do not draw bars on stderr
+progress.configure(min_interval_s=0.5)     # throttle for "update" events
+```
+
+To instrument your own loop: `progress.step("name")` (context manager),
+`progress.track(iterable, desc="...", unit="...", label=fn)` (tqdm bar) and
+`progress.stages("desc", total=N)` (a bar over N named tests). Event shapes are
+documented in the module docstring.
 
 ## Outputs
 

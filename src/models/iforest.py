@@ -57,6 +57,7 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 from src.utils import paths
 from src.utils.atomic_io import atomic_replace
 from src.utils.logging_config import log_phase, setup_logging
+from src.utils.progress import Bar, show_best_trial as _show_best_trial
 
 __all__ = [
     "IsolationForestDetector",
@@ -615,7 +616,6 @@ def tune_iforest(
         The Optuna :class:`~optuna.study.Study` (completed + resumed trials).
     """
     import optuna
-    from tqdm.auto import tqdm
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -793,10 +793,11 @@ def tune_iforest(
         n_trials, len(study.trials),
     )
 
-    progress = tqdm(total=n_trials, desc=f"optuna[{study_name}]", unit="trial")
+    progress = Bar(desc=f"optuna[{study_name}]", total=n_trials, unit="trial")
 
     def _progress_callback(study_: "optuna.study.Study", trial: "optuna.trial.FrozenTrial") -> None:
         progress.update(1)
+        _show_best_trial(progress, study_)
 
     def _persist_best_callback(study_: "optuna.study.Study", trial: "optuna.trial.FrozenTrial") -> None:
         """Checkpoint the current best hyperparameters to YAML after each trial."""

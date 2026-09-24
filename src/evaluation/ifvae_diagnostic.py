@@ -43,7 +43,8 @@ caller's to catch (see ``main.py`` "Phase 9c").
 from __future__ import annotations
 
 import os
-from typing import Any, Optional, Sequence
+from contextlib import contextmanager
+from typing import Any, Iterator, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -195,6 +196,76 @@ _VAE_REFIT_PARAMS = (
 )
 
 
+#: Tests ``diagnose_frames`` runs, one bar tick each -- keep in step with the
+#: ``stages.stage(...)`` blocks in it.
+_N_DIAGNOSTIC_TESTS = 11
+
+#: Prefix of every step this module reports about ITS OWN functions, so the
+#: dashboard / flow view show ``ifvae_diagnostic._build_stability`` next to the
+#: suite's own ``ifvae_diag.<stage>`` steps and it is always clear which side a
+#: running function belongs to.
+_NS = "ifvae_diagnostic."
+
+_STEP_TO_PHASE_EVENT = {
+    "step_started": "phase_started",
+    "step_completed": "phase_completed",
+    "step_failed": "phase_failed",
+}
+_BRIDGE_DEPTH = 0
+
+
+def _forward_suite_event(event: dict) -> None:
+    """Mirror one ``ifvae_diag.progress`` event into this pipeline.
+
+    Steps become phase events (log line + ``run_events.jsonl`` + dashboard
+    phase observers); progress-bar updates become ``progress`` events. The
+    suite stays ignorant of all three -- this is the only place that knows
+    both sides.
+    """
+    from src.utils import observability
+    from src.utils.logging_config import report_phase_event
+
+    kind = event["event"]
+    if kind == "progress":
+        observability.progress_event(
+            event["desc"], event["n"], event["total"], unit=event["unit"],
+            state=event["state"], current=event["current"], elapsed_s=event["elapsed_s"],
+        )
+        return
+    name = event["name"] if "." in event["name"] else f"ifvae_diag.{event['name']}"
+    report_phase_event(name, _STEP_TO_PHASE_EVENT[kind], event.get("duration_s"))
+
+
+@contextmanager
+def _suite_progress() -> Iterator[Any]:
+    """Wire the suite's live progress into this pipeline for the duration of
+    the block and yield the ``ifvae_diag.progress`` module.
+
+    tqdm bars are drawn on the terminal only when no live dashboard owns it: a
+    repainting ``rich`` dashboard and tqdm's own carriage-return redraws on
+    stderr tear each other apart. With the dashboard up, the same bars are
+    rendered *inside* it from the forwarded events instead. Re-entrant (the
+    public entry point calls the frame-level one), so only the outermost
+    block installs and removes the wiring.
+    """
+    global _BRIDGE_DEPTH
+    from ifvae_diag import progress
+    from src.utils import console_ui
+
+    outermost = _BRIDGE_DEPTH == 0
+    _BRIDGE_DEPTH += 1
+    if outermost:
+        progress.add_observer(_forward_suite_event)
+        progress.configure(tqdm_enabled=not console_ui.is_live())
+    try:
+        yield progress
+    finally:
+        _BRIDGE_DEPTH -= 1
+        if outermost:
+            progress.remove_observer(_forward_suite_event)
+            progress.configure(tqdm_enabled=True)
+
+
 def _densify(x, dtype=np.float64) -> np.ndarray:
     return np.asarray(x.toarray() if sp.issparse(x) else x, dtype=dtype)
 
@@ -209,6 +280,7 @@ def _vae_forward(detector: Any, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
     holds the fitted detector and its input matrix in memory.
     """
     import torch
+    from ifvae_diag import progress
 
     model = detector._check_fitted()
     xd = _densify(x, dtype=np.float32)
@@ -218,7 +290,11 @@ def _vae_forward(detector: Any, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
     logvars = np.empty((n, model.latent_dim), dtype=np.float64)
     recon = np.empty_like(xd)
     with torch.no_grad():
-        for start in range(0, n, bs):
+        batches = progress.track(
+            range(0, n, bs), desc="vae_forward[batches]", unit="batch",
+            label=lambda start: f"filas {start:,}-{min(start + bs, n):,} de {n:,}",
+        )
+        for start in batches:
             chunk = xd[start:start + bs]
             xb = torch.from_numpy(chunk).to(detector.device)
             mu, logvar = model.encode(xb)
@@ -479,14 +555,21 @@ def _seeded_refit_stability(
     fits its own throwaway forest, just applied here to a class/detector the
     suite does not refit on its own.
     """
+    from ifvae_diag import progress
     from ifvae_diag.stability import top_k_stability
 
     params = {name: getattr(base_detector, name) for name in param_names}
     runs = []
-    for seed in seeds:
-        detector = detector_cls(random_state=seed, **params)
-        detector.fit(fit_x, **(fit_kwargs or {}))
-        runs.append(np.asarray(detector.score_samples(score_x), dtype=float))
+    refits = progress.track(
+        seeds, desc=f"stability_refit[{detector_cls.__name__}]", unit="refit",
+        label=lambda seed: f"seed={seed}",
+    )
+    for seed in refits:
+        with progress.step(f"{_NS}refit[{detector_cls.__name__} seed={seed}]",
+                           label="Reajuste completo con otra semilla"):
+            detector = detector_cls(random_state=seed, **params)
+            detector.fit(fit_x, **(fit_kwargs or {}))
+            runs.append(np.asarray(detector.score_samples(score_x), dtype=float))
     return top_k_stability(np.vstack(runs), k)
 
 
@@ -601,26 +684,33 @@ def _swept_refit_experiment(
     PRODUCTION detector's alert set at the same threshold) via Jaccard -- a
     real, executed comparison, never a placeholder.
     """
+    from ifvae_diag import progress
     from ifvae_diag.scoring import anomaly_percentile
 
     base_params = {name: getattr(base_detector, name) for name in param_names}
     rows = []
-    for value in sweep_grid:
+    points = progress.track(
+        sweep_grid, desc=f"experiment[{detector_cls.__name__}.{sweep_param}]",
+        unit="punto", label=lambda value: f"{sweep_param}={value}",
+    )
+    for value in points:
+        step_name = f"{_NS}refit[{detector_cls.__name__} {sweep_param}={value}]"
         try:
-            detector = detector_cls(random_state=base_seed,
-                                    **{**base_params, sweep_param: value})
-            detector.fit(fit_x, **(fit_kwargs or {}))
-            fit_scores = np.asarray(detector.score_samples(fit_x), dtype=float)
-            variant_scores = np.asarray(detector.score_samples(score_x), dtype=float)
-            variant_pct = anomaly_percentile(fit_scores, variant_scores)
-            variant_high = variant_pct >= percentile_threshold
-            counts = _quadrant_counts(reference_high, variant_high)
-            relations = _set_relations(counts)
-            rows.append({
-                "value": value, "status": STATUS_EXECUTED,
-                "alerts": int(variant_high.sum()), "total": int(len(variant_high)),
-                "jaccard_vs_production": relations["jaccard"],
-            })
+            with progress.step(step_name, label="Reajuste de la malla de experimentos"):
+                detector = detector_cls(random_state=base_seed,
+                                        **{**base_params, sweep_param: value})
+                detector.fit(fit_x, **(fit_kwargs or {}))
+                fit_scores = np.asarray(detector.score_samples(fit_x), dtype=float)
+                variant_scores = np.asarray(detector.score_samples(score_x), dtype=float)
+                variant_pct = anomaly_percentile(fit_scores, variant_scores)
+                variant_high = variant_pct >= percentile_threshold
+                counts = _quadrant_counts(reference_high, variant_high)
+                relations = _set_relations(counts)
+                rows.append({
+                    "value": value, "status": STATUS_EXECUTED,
+                    "alerts": int(variant_high.sum()), "total": int(len(variant_high)),
+                    "jaccard_vs_production": relations["jaccard"],
+                })
         except Exception as exc:  # noqa: BLE001 - one bad grid point must not kill the sweep
             rows.append({"value": value, "status": STATUS_FAILED, "reason": str(exc)})
     return rows
@@ -876,20 +966,25 @@ def run_ifvae_diagnostic_suite(
     entity_col = schema.entity_col or "entity_id"
     time_col = schema.time_col or "period"
 
-    mu, logvar, recon = _vae_forward(vae_detector, x_vae)
-    x_vae_dense = _densify(x_vae)
-    entity_ids = keys[entity_col].to_numpy()
-    periods = keys[time_col].astype(str).to_numpy()
+    with _suite_progress() as progress, progress.stages(
+        "ifvae_diagnostic[prep]", total=2, unit="paso"
+    ) as prep:
+        with prep.stage(f"{_NS}_vae_forward", label="Pasada del VAE ajustado (mu, logvar, recon)"):
+            mu, logvar, recon = _vae_forward(vae_detector, x_vae)
+        with prep.stage(f"{_NS}_build_frame", label="Poblaciones de referencia y evaluada"):
+            x_vae_dense = _densify(x_vae)
+            entity_ids = keys[entity_col].to_numpy()
+            periods = keys[time_col].astype(str).to_numpy()
 
-    def _slice(mask: np.ndarray) -> pd.DataFrame:
-        return _build_frame(
-            entity_ids[mask], periods[mask], x_vae_dense[mask], vae_feature_names,
-            recon[mask], mu[mask], logvar[mask], if_scores[mask],
-            segment=(segment[mask] if segment is not None else None),
-        )
+            def _slice(mask: np.ndarray) -> pd.DataFrame:
+                return _build_frame(
+                    entity_ids[mask], periods[mask], x_vae_dense[mask], vae_feature_names,
+                    recon[mask], mu[mask], logvar[mask], if_scores[mask],
+                    segment=(segment[mask] if segment is not None else None),
+                )
 
-    reference = _slice(train_mask)
-    scored = _slice(oot_mask)
+            reference = _slice(train_mask)
+            scored = _slice(oot_mask)
 
     return diagnose_frames(
         reference, scored, list(vae_feature_names), out_dir,
@@ -969,125 +1064,139 @@ def diagnose_frames(
         top_k_residuals=top_k_residuals,
         percentile_threshold=percentile_threshold,
     )
-    result = run_diagnostic(reference, scored, config, out_dir)
+    with _suite_progress() as progress, progress.stages(
+        "ifvae_diagnostic", total=_N_DIAGNOSTIC_TESTS, unit="prueba"
+    ) as stages:
+        with stages.stage("ifvae_diag.run_diagnostic", label="Suite: puntajes, deriva y reporte"):
+            result = run_diagnostic(reference, scored, config, out_dir)
 
-    out_dir_abs = os.path.abspath(str(out_dir))
-    artifacts = {name: _artifact_entry(out_dir_abs, name) for name in SUITE_ARTIFACTS}
-    for entry in artifacts.values():
-        if entry["path"]:
-            entry["relative_path"] = os.path.join(
-                os.path.basename(out_dir_abs), entry["name"]
-            ).replace(os.sep, "/")
+        out_dir_abs = os.path.abspath(str(out_dir))
+        artifacts = {name: _artifact_entry(out_dir_abs, name) for name in SUITE_ARTIFACTS}
+        for entry in artifacts.values():
+            if entry["path"]:
+                entry["relative_path"] = os.path.join(
+                    os.path.basename(out_dir_abs), entry["name"]
+                ).replace(os.sep, "/")
 
-    config_dict = config.to_dict()
-    threshold = float(config.percentile_threshold)
-    scored_diag = result.scored
-    derived_features = list(run_meta.get("derived_features") or [])
+        config_dict = config.to_dict()
+        threshold = float(config.percentile_threshold)
+        scored_diag = result.scored
+        derived_features = list(run_meta.get("derived_features") or [])
 
-    agreement = _build_agreement(scored_diag, threshold)
-    candidates = _build_candidates(scored_diag, threshold, config_dict, artifacts)
-    sensitivity = _build_sensitivity(
-        scored_diag, sensitivity_grid, config_dict, config_dict.get("alert_budgets")
-    )
-    latent = _build_latent(result.summary, config_dict, reference)
+        with stages.stage(f"{_NS}_build_agreement", label="Acuerdo IF/VAE y cuadrantes"):
+            agreement = _build_agreement(scored_diag, threshold)
+        with stages.stage(f"{_NS}_build_candidates", label="Candidatos de puntaje VAE"):
+            candidates = _build_candidates(scored_diag, threshold, config_dict, artifacts)
+        with stages.stage(f"{_NS}_build_sensitivity", label="Sensibilidad al umbral"):
+            sensitivity = _build_sensitivity(
+                scored_diag, sensitivity_grid, config_dict, config_dict.get("alert_budgets")
+            )
+        with stages.stage(f"{_NS}_build_latent", label="Diagnóstico del espacio latente"):
+            latent = _build_latent(result.summary, config_dict, reference)
 
-    if stability:
-        stability_result = _build_stability(config_dict=config_dict, **stability)
-    else:
-        empty = {"status": STATUS_NOT_REQUESTED,
-                 "reason": "No se proporcionaron detectores ajustados para el "
-                           "reajuste de estabilidad en esta llamada.",
-                 "source": "src/evaluation/ifvae_diagnostic.py"}
-        stability_result = {"iforest": empty, "vae": dict(empty)}
+        with stages.stage(f"{_NS}_build_stability", label="Estabilidad por reajuste multisemilla"):
+            if stability:
+                stability_result = _build_stability(config_dict=config_dict, **stability)
+            else:
+                empty = {"status": STATUS_NOT_REQUESTED,
+                         "reason": "No se proporcionaron detectores ajustados para el "
+                                   "reajuste de estabilidad en esta llamada.",
+                         "source": "src/evaluation/ifvae_diagnostic.py"}
+                stability_result = {"iforest": empty, "vae": dict(empty)}
 
-    period_rows = _group_quadrants(scored_diag, "scoring_timestamp")
-    temporal = {
-        "status": STATUS_EXECUTED if period_rows else STATUS_UNAVAILABLE,
-        "reason": None if period_rows else "La población evaluada no expone periodos.",
-        "source": "ifvae_diagnostics/scored_diagnostics.csv",
-        "rows": period_rows,
-        "caption": (
-            f"Los grupos con menos de {SMALL_GROUP_WARNING_THRESHOLD} "
-            "observaciones se marcan en la última columna."
-        ),
-    }
-    if segment_col and segment_col in scored.columns:
-        segment_rows = _group_quadrants(
-            scored_diag.assign(**{segment_col: scored[segment_col].to_numpy()}),
-            segment_col,
-        )
-        segmentation = {"status": STATUS_EXECUTED, "reason": None,
-                        "source": "ifvae_diagnostics/scored_diagnostics.csv",
-                        "rows": segment_rows}
-    else:
-        segmentation = {"status": STATUS_NOT_APPLICABLE, "reason": REASON_NO_SEGMENT,
-                        "source": "ifvae_diag.config::segment_col", "rows": []}
+        with stages.stage(f"{_NS}_group_quadrants", label="Cuadrantes por periodo y segmento"):
+            period_rows = _group_quadrants(scored_diag, "scoring_timestamp")
+            temporal = {
+                "status": STATUS_EXECUTED if period_rows else STATUS_UNAVAILABLE,
+                "reason": None if period_rows else "La población evaluada no expone periodos.",
+                "source": "ifvae_diagnostics/scored_diagnostics.csv",
+                "rows": period_rows,
+                "caption": (
+                    f"Los grupos con menos de {SMALL_GROUP_WARNING_THRESHOLD} "
+                    "observaciones se marcan en la última columna."
+                ),
+            }
+            if segment_col and segment_col in scored.columns:
+                segment_rows = _group_quadrants(
+                    scored_diag.assign(**{segment_col: scored[segment_col].to_numpy()}),
+                    segment_col,
+                )
+                segmentation = {"status": STATUS_EXECUTED, "reason": None,
+                                "source": "ifvae_diagnostics/scored_diagnostics.csv",
+                                "rows": segment_rows}
+            else:
+                segmentation = {"status": STATUS_NOT_APPLICABLE, "reason": REASON_NO_SEGMENT,
+                                "source": "ifvae_diag.config::segment_col", "rows": []}
 
-    populations = {
-        "reference": _population_meta(
-            reference, "Bloque de entrenamiento",
-            "main.py::chronological_split (train_mask)"),
-        "scored": _population_meta(
-            scored, "Ventana fuera de tiempo (OOT)",
-            "main.py::chronological_split (oot_mask)"),
-        "observation_unit": "Observación entidad–periodo",
-    }
+            populations = {
+                "reference": _population_meta(
+                    reference, "Bloque de entrenamiento",
+                    "main.py::chronological_split (train_mask)"),
+                "scored": _population_meta(
+                    scored, "Ventana fuera de tiempo (OOT)",
+                    "main.py::chronological_split (oot_mask)"),
+                "observation_unit": "Observación entidad–periodo",
+            }
 
-    if entity_view:
-        rule = run_meta.get("entity_aggregation_rule")
-        if rule:
-            aggregated = scored_diag.assign(
-                entity_id=scored["entity_id"].to_numpy()
-            ).groupby("entity_id")[["if_percentile", "vae_percentile"]].max()
-            run_meta = {**run_meta, "_entity_count": int(len(aggregated))}
+            if entity_view:
+                rule = run_meta.get("entity_aggregation_rule")
+                if rule:
+                    aggregated = scored_diag.assign(
+                        entity_id=scored["entity_id"].to_numpy()
+                    ).groupby("entity_id")[["if_percentile", "vae_percentile"]].max()
+                    run_meta = {**run_meta, "_entity_count": int(len(aggregated))}
 
-    drift_signal = _drift_signal(result.drift, derived_features)
+        with stages.stage(f"{_NS}_drift_signal", label="Señal de deriva (FDR)"):
+            drift_signal = _drift_signal(result.drift, derived_features)
 
-    experiments = _build_experiments(
-        scored_diag=scored_diag, threshold=threshold,
-        if_detector=(stability or {}).get("if_detector"),
-        x_if_fit=(stability or {}).get("x_if_fit"),
-        x_if_score=(stability or {}).get("x_if_score"),
-        vae_detector=(stability or {}).get("vae_detector"),
-        x_vae_fit=(stability or {}).get("x_vae_fit"),
-        x_vae_score=(stability or {}).get("x_vae_score"),
-        valid_mask=(stability or {}).get("valid_mask"),
-        contamination_grid=experiment_contamination_grid,
-        capacity_grid=experiment_capacity_grid,
-        beta_grid=experiment_beta_grid,
-        base_seed=(stability or {}).get("base_seed", 42),
-    )
+        with stages.stage(f"{_NS}_build_experiments", label="Experimentos de mallas"):
+            experiments = _build_experiments(
+                scored_diag=scored_diag, threshold=threshold,
+                if_detector=(stability or {}).get("if_detector"),
+                x_if_fit=(stability or {}).get("x_if_fit"),
+                x_if_score=(stability or {}).get("x_if_score"),
+                vae_detector=(stability or {}).get("vae_detector"),
+                x_vae_fit=(stability or {}).get("x_vae_fit"),
+                x_vae_score=(stability or {}).get("x_vae_score"),
+                valid_mask=(stability or {}).get("valid_mask"),
+                contamination_grid=experiment_contamination_grid,
+                capacity_grid=experiment_capacity_grid,
+                beta_grid=experiment_beta_grid,
+                base_seed=(stability or {}).get("base_seed", 42),
+            )
 
-    contract = build_diagnostic_contract(
-        populations=populations,
-        config=config_dict,
-        run_meta={**run_meta,
-                 "suite_version": _suite_version(),
-                 "stability_refits": (stability or {}).get("stability_refits")},
-        agreement=agreement,
-        candidates=candidates,
-        sensitivity=sensitivity,
-        latent=latent,
-        stability=stability_result,
-        temporal=temporal,
-        segmentation=segmentation,
-        experiments=experiments,
-    )
+        with stages.stage(f"{_NS}build_diagnostic_contract", label="Ficha factual"):
+            contract = build_diagnostic_contract(
+                populations=populations,
+                config=config_dict,
+                run_meta={**run_meta,
+                         "suite_version": _suite_version(),
+                         "stability_refits": (stability or {}).get("stability_refits")},
+                agreement=agreement,
+                candidates=candidates,
+                sensitivity=sensitivity,
+                latent=latent,
+                stability=stability_result,
+                temporal=temporal,
+                segmentation=segmentation,
+                experiments=experiments,
+            )
 
-    interpretation = build_interpretation_contract(
-        agreement=agreement,
-        candidates=candidates,
-        sensitivity=sensitivity,
-        latent=latent,
-        stability=stability_result,
-        temporal=temporal,
-        segmentation=segmentation,
-        drift_signal=drift_signal,
-        warnings=list(result.warnings),
-        config=config_dict,
-        run_meta=run_meta,
-        populations=populations,
-    )
+        with stages.stage(f"{_NS}build_interpretation_contract", label="Capa de interpretación"):
+            interpretation = build_interpretation_contract(
+                agreement=agreement,
+                candidates=candidates,
+                sensitivity=sensitivity,
+                latent=latent,
+                stability=stability_result,
+                temporal=temporal,
+                segmentation=segmentation,
+                drift_signal=drift_signal,
+                warnings=list(result.warnings),
+                config=config_dict,
+                run_meta=run_meta,
+                populations=populations,
+            )
 
     return {
         "contract": contract,

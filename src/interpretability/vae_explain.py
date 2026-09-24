@@ -37,6 +37,7 @@ from src.preprocessing.pipeline import (
 )
 from src.utils import observability, paths
 from src.utils.logging_config import log_phase, setup_logging
+from src.utils.progress import track
 
 __all__ = [
     "latent_space_plot",
@@ -304,7 +305,9 @@ def reconstruction_error_by_feature(
         sq_err_sum = np.zeros(n_features, dtype=np.float64)
         model.eval()
         with torch.no_grad():
-            for start in range(0, n_rows, batch_size):
+            batches = track(range(0, n_rows, batch_size), desc="vae_recon_by_feature[batches]",
+                            unit="batch")
+            for start in batches:
                 chunk = Xd[start:start + batch_size]
                 xb = torch.from_numpy(chunk).to(device)
                 mu, _ = model.encode(xb)
@@ -470,7 +473,8 @@ def explain_rows_vae(
     checkpoint_every = max(1, n_batches // 4)
     model.eval()
     with torch.no_grad():
-        for b, start in enumerate(range(0, n_rows, bs)):
+        batches = track(range(0, n_rows, bs), desc="explain_rows_vae[batches]", unit="batch")
+        for b, start in enumerate(batches):
             chunk = Xd[start:start + bs]
             xb = torch.from_numpy(chunk).to(device)
             mu, _ = model.encode(xb)

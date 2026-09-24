@@ -15,7 +15,7 @@ import numpy as np
 import scipy.sparse as sp
 
 from src.utils import paths
-from src.utils.logging_config import setup_logging
+from src.utils.logging_config import log_phase, setup_logging
 
 __all__ = ["plot_embedding", "plot_roc_pr", "plot_score_comparison"]
 
@@ -118,7 +118,10 @@ def plot_embedding(
     c = c[idx]
     y_arr = None if y is None else np.asarray(y).ravel()[idx]
 
-    coords, used = _reduce_2d(Xd, method, random_state, log)
+    # The reducer (UMAP above all) is the slow part of this plot; name it so a
+    # long wait is attributable instead of looking like the phase is hung.
+    with log_phase(f"evaluation.reduce_2d[{method}]", log):
+        coords, used = _reduce_2d(Xd, method, random_state, log)
 
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, filename or f"embedding_{used}.png")

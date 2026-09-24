@@ -16,6 +16,11 @@ dependencies = [
   "PyYAML>=6.0",
 ]
 
+[project.optional-dependencies]
+# Progress bars in `ifvae_diag.progress`; without it the same events are still
+# emitted, only the terminal bars are missing.
+progress = ["tqdm>=4.66"]
+
 [project.scripts]
 ifvae-diagnose = "ifvae_diag.cli:main"
 

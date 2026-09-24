@@ -11,5 +11,9 @@
 | No automatic threshold/weight optimization | Protects the final test and flagship case from overfitting | Users must maintain a validation period and lock choices themselves |
 | No i.i.d. bootstrap confidence intervals | Avoids false certainty under account/network/time dependence | The organization must define grouped or temporal blocks before adding intervals |
 | CSV/JSON/Markdown outputs | Auditable and tool-agnostic | Output files inherit source sensitivity and require access controls |
+| tqdm is an optional dependency of `progress.py` | The suite stays installable with its six original dependencies; a missing tqdm degrades to events only | A bare install shows no bars unless `tqdm` is added (`pip install if-vae-diagnostic-suite[progress]`) |
+| Progress "update" events throttled to one per 0.5 s per bar (start/end always sent) | A host that persists every event (a JSONL log) does not grow per iteration of a fast loop | A very short loop reports only its start and end; an observer needing every iteration must lower `min_interval_s` |
+| Observers are best-effort: one that raises is dropped | A UI bug can never break a diagnostic | A broken observer goes silent instead of failing loudly; the host should test its own observer |
+| Progress state (open-step stack, observers, settings) is module-global | No plumbing through every function signature | Not thread-safe; the suite is single-threaded. Concurrent runs in one process would interleave step depths |
 | Custom narrow mutation probe | Zero extra dependency, verifies critical formulas | It is not exhaustive mutation analysis; use Mutmut/Cosmic Ray in a fuller CI environment |
 

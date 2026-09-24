@@ -6,6 +6,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import ks_2samp, wasserstein_distance
 
+from . import progress
+
 
 LEAKAGE_PATTERNS = (
     r"confirmed[_-]?fraud",
@@ -38,7 +40,10 @@ def _population_row(
 def compare_populations(
     reference: pd.DataFrame, scored: pd.DataFrame, features: list[str]
 ) -> pd.DataFrame:
-    rows = [_population_row(reference[f], scored[f], f) for f in features]
+    tracked = progress.track(
+        features, desc="compare_populations[features]", unit="feature", label=str
+    )
+    rows = [_population_row(reference[f], scored[f], f) for f in tracked]
     return pd.DataFrame(rows).sort_values("ks_statistic", ascending=False)
 
 

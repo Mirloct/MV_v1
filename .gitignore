@@ -16,9 +16,10 @@ venv/
 .mypy_cache/
 .ipynb_checkpoints/
 
-# Generated documentation. Regenerate with `python docs/build_docs.py`;
-# never hand-edit.
-docs/documentation.html
+# NOTE: docs/documentation.html is generated (`python docs/build_docs.py`, never
+# hand-edited) but IS versioned on purpose: it is the offline, navigable copy of
+# all the documentation and must ship with the project. Regenerate it whenever a
+# .md source changes and commit it with that change.
 
 # Diagnostic-suite run outputs (CSVs/reports it writes when run against this
 # project's data) -- reproducible from

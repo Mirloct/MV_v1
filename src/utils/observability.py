@@ -73,6 +73,35 @@ def _notify_check(hc: "HealthCheck") -> None:
         except Exception:  # noqa: BLE001 - an observer must never break a check
             _CHECK_OBSERVERS.remove(callback)
 
+
+#: Callables notified on every progress-bar update, as ``callback(fields:
+#: dict)`` with the same keys `progress_event` writes to the event stream
+#: (``desc``, ``n``, ``total``, ``unit``, ``state``, ``current``,
+#: ``elapsed_s``). Same shape and rules as the check/phase observer hooks: it
+#: lets the console dashboard draw a live bar for a loop-shaped test without
+#: that loop knowing a dashboard exists; a raising observer is dropped.
+_PROGRESS_OBSERVERS: list = []
+
+
+def add_progress_observer(callback) -> None:
+    """Register ``callback(fields)`` to be called on every progress update."""
+    if callback not in _PROGRESS_OBSERVERS:
+        _PROGRESS_OBSERVERS.append(callback)
+
+
+def remove_progress_observer(callback) -> None:
+    """Unregister a previously added progress observer; silent if absent."""
+    if callback in _PROGRESS_OBSERVERS:
+        _PROGRESS_OBSERVERS.remove(callback)
+
+
+def _notify_progress(fields: dict) -> None:
+    for callback in list(_PROGRESS_OBSERVERS):
+        try:
+            callback(fields)
+        except Exception:  # noqa: BLE001 - an observer must never break the work
+            _PROGRESS_OBSERVERS.remove(callback)
+
 SEVERITIES = ("info", "warning", "critical")
 
 # The 8 categories requested for the run-health schema. Not all are populated
@@ -286,7 +315,12 @@ def emit(ctx: Optional[RunContext], event: str, **fields: Any) -> None:
     """
     if ctx is None:
         return
-    record = {"ts": _now(), "run_id": ctx.run_id, "event": event, **fields}
+    # `ts` is whole seconds (kept: it is what humans and older readers see);
+    # `t` is the same instant as epoch seconds to the millisecond, so a live
+    # view can show how long something has been running to sub-second
+    # accuracy instead of being off by up to a second at each end.
+    record = {"ts": _now(), "t": round(time.time(), 3), "run_id": ctx.run_id,
+              "event": event, **fields}
     try:
         with open(ctx.events_path, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, default=str) + "\n")
@@ -322,6 +356,30 @@ def check(
     if ctx is None:
         return None
     return ctx.record_health(hc)
+
+
+def progress_event(
+    desc: str,
+    n: int,
+    total: Optional[int],
+    *,
+    unit: str = "it",
+    state: str = "update",
+    current: str = "",
+    elapsed_s: float = 0.0,
+) -> None:
+    """Record one progress-bar update: ``n`` of ``total`` items of ``desc`` done.
+
+    ``state`` is ``"start"``, ``"update"`` or ``"end"``; ``current`` names the
+    item in flight; ``elapsed_s`` is the bar's own running time. Written to the
+    event stream (when a run is active) and pushed to progress observers (the
+    console dashboard) either way. Callers throttle -- this writes every call.
+    """
+    fields = {"desc": desc, "n": int(n), "total": (None if total is None else int(total)),
+              "unit": unit, "state": state, "current": current,
+              "elapsed_s": round(float(elapsed_s), 3)}
+    _notify_progress(fields)
+    emit(current_run(), "progress", **fields)
 
 
 def phase_event(name: str, event: str, **fields: Any) -> None:

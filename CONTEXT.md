@@ -1272,6 +1272,17 @@ mixed-type VAE (`src/models/mixed_vae.py`, `architecture = mixed_v1`). Contract:
   scaling and should be treated as stale**, including the stacking
   measurement above and the numeric-transform table's VAE column — both
   predate the fix and have not been re-run against it.
+- **The tuner itself could select a collapsed trial (fixed 2026-09-27).**
+  Detection at the *final* fit (above) was not enough: ELBO, reconstruction
+  loss and PR-AUC/ROC-AUC all stay finite and plausible on a decoder that has
+  learned to ignore the latent code, so Optuna could rank a collapsed trial
+  as "best" — observed twice in one session, with both `onehot` and
+  `embedding`. `tune_vae`'s `objective` (`src/models/vae.py`) now runs
+  `collapse_verdict` on every trial right after fitting and forces a
+  collapsed one to the worst possible objective value, so it can only win a
+  study where every trial collapsed (reported via `trial.user_attrs
+  ["posterior_collapse"]` and the study's best value, not hidden). Tests:
+  `TestAntiCollapseGuard` in `tests/test_tuning_vae.py`.
 - **`--quick`'s VAE epoch budget may be too small to avoid collapse even with
   the scaling fix**, and its Optuna trial budget is small enough that
   `TrialPatienceStopper` essentially never fires (see above) — treat a

@@ -1614,6 +1614,15 @@ def tune_vae(
     reconstruction error (minimised) even when labels exist -- the label-free
     proxy for "the normal mass reconstructs well".
 
+    Anti-collapse guard (2026-09-27): every trial's latent space is checked with
+    :func:`collapse_verdict` (active-units test, Burda et al. 2016) right after fitting.
+    A collapsed trial is forced to the worst possible objective value regardless of what
+    its ELBO/reconstruction/PR-AUC says -- those metrics stay plausible on a decoder that
+    has learned to ignore the latent code, so without this guard the tuner could (and, on
+    2026-09-27, did -- with either architecture, not only ``embedding``) select a collapsed
+    model. It can still win if every sampled trial collapses; that is reported, not hidden.
+    Each trial's verdict is recorded as ``trial.user_attrs["posterior_collapse"]``.
+
     Trial-level early stopping (distinct from the *per-epoch* early stopping
     inside each trial's own fit, controlled separately by
     ``VAEDetector.early_stopping_patience``): ``early_stopping_patience`` stops
@@ -1720,6 +1729,27 @@ def tune_vae(
         detector.fit(
             X, checkpoint_dir=trial_ckpt, resume=True, val_fraction=0.1, valid_mask=vm,
         )
+
+        # Anti-collapse guard: a collapsed VAE (see `collapse_verdict`) still returns a
+        # finite, plausible-looking objective value under EVERY metric above -- ELBO,
+        # reconstruction loss and PR-AUC/ROC-AUC alike can all look fine on a decoder that
+        # has learned to ignore `z`, because none of them look at the latent code itself.
+        # The 2026-09-27 verification run found the tuner select exactly such a trial (a
+        # high `beta` bought a low KL at the cost of the latent structure the score
+        # depends on) for BOTH architectures, not only `embedding` as first suspected.
+        # Forcing a collapsed trial to the worst possible value (using this project's own
+        # "no result yet" sentinel, `float("inf")`/`float("-inf")` -- see
+        # `best_val_loss_`/`best_val_elbo_` above) means it can win only when every
+        # sampled trial collapsed, which is itself the honest outcome to report rather
+        # than silently deploying whichever collapsed trial happened to score best.
+        collapse_diag = detector.latent_diagnostics(X[vm] if vm is not None else X)
+        collapse = collapse_verdict(collapse_diag)
+        trial.set_user_attr("posterior_collapse", collapse["collapsed"])
+        trial.set_user_attr("active_fraction", collapse_diag["active_fraction"])
+        if collapse["collapsed"]:
+            log.warning("Trial %d: %s Excluded from selection unless every trial collapses.",
+                       trial.number, collapse["reason"])
+            return float("-inf") if resolved_direction == "maximize" else float("inf")
 
         if custom_objective is not None:
             return float(custom_objective(detector, X))

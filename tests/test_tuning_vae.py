@@ -217,5 +217,58 @@ class TestTuneVaeReliability(Base):
             self._tune(X, valid, name="empty", n_trials=0)
 
 
+class TestAntiCollapseGuard(Base):
+    """A trial whose latent space collapsed must never win the study, even though ELBO,
+    reconstruction loss and PR-AUC/ROC-AUC all stay finite and plausible on a decoder that
+    has learned to ignore the latent code -- see `tune_vae`'s "Anti-collapse guard" docstring.
+    """
+
+    def _tune(self, X, valid, name="run", **kw):
+        kw.setdefault("n_trials", 2)
+        kw.setdefault("max_epochs", 2)
+        kw.setdefault("early_stopping_patience", None)
+        study = tune_vae(
+            X, valid_mask=valid, random_state=0,
+            storage="sqlite:///" + os.path.join(self.d, f"{name}.db").replace("\\", "/"),
+            best_params_path=os.path.join(self.d, f"{name}.yaml"),
+            model_out=os.path.join(self.d, f"{name}.pt"),
+            checkpoint_dir=os.path.join(self.d, "ckpts"), **kw,
+        )
+        return study, yaml.safe_load(open(os.path.join(self.d, f"{name}.yaml"), encoding="utf-8"))
+
+    _COLLAPSED = {"latent_dim": 8, "active_units": 0, "inactive_units": 8,
+                 "active_fraction": 0.0, "delta": 0.01, "mean_kl": 0.0002}
+    _HEALTHY = {"latent_dim": 8, "active_units": 6, "inactive_units": 2,
+               "active_fraction": 0.75, "delta": 0.01, "mean_kl": 0.6}
+
+    def test_a_collapsed_trial_loses_to_a_healthy_one_regardless_of_its_own_metric(self):
+        from unittest.mock import patch
+
+        X, valid = _data(n=180)
+        # Trial 0 "collapses" (per the mocked diagnostics); trial 1 does not. The guard must
+        # force trial 0 to the worst possible value BEFORE its real (finite, otherwise
+        # ordinary) ELBO is even looked at -- so trial 1 wins on every unsupervised run
+        # regardless of which trial's real metric would have been numerically better.
+        with patch.object(VAEDetector, "latent_diagnostics",
+                          side_effect=[self._COLLAPSED, self._HEALTHY]):
+            study, payload = self._tune(X, valid, name="guard")
+        self.assertEqual([t.user_attrs["posterior_collapse"] for t in study.trials], [True, False])
+        self.assertEqual(study.direction.name, "MINIMIZE")           # default unsupervised objective
+        self.assertTrue(np.isinf(study.trials[0].value) and study.trials[0].value > 0)
+        self.assertTrue(np.isfinite(study.trials[1].value))
+        self.assertEqual(study.best_trial.number, 1)
+        self.assertEqual(payload["best_trial_number"], 1)
+
+    def test_every_trial_collapsing_is_reported_not_hidden(self):
+        from unittest.mock import patch
+
+        X, valid = _data(n=180)
+        with patch.object(VAEDetector, "latent_diagnostics", return_value=self._COLLAPSED):
+            study, payload = self._tune(X, valid, name="all-collapsed")
+        self.assertTrue(all(t.user_attrs["posterior_collapse"] for t in study.trials))
+        self.assertTrue(np.isinf(study.best_value) and study.best_value > 0)
+        self.assertTrue(payload["best_value"] > 0 and payload["best_value"] == float("inf"))
+
+
 if __name__ == "__main__":
     unittest.main()

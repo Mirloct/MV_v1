@@ -1,0 +1,115 @@
+# configs/pipeline.yaml -- EL ÚNICO archivo que se edita para el diagnóstico.
+#
+# Precedencia (de mayor a menor):
+#   flag de línea de comandos  >  valor fijado en código (distinto del default)
+#   >  este archivo  >  default incorporado.
+# Una clave desconocida o un valor inválido detiene la corrida y lista las claves
+# válidas (un error de tipeo nunca se convierte en una opción ignorada).
+# Otro archivo: python main.py --config ruta\otro.yaml
+#
+# Cada corrida registra en execution.log de dónde salió cada valor
+# ("Configuration file: ... | sources: {...}": cli / code / file / default).
+
+data:
+  # Columnas del panel que solo sirven para IDENTIFICAR un registro (puesto, nombre,
+  # área, un número de referencia interno, ...): nunca entran al modelo, EN NINGUNA
+  # fase (ni como feature de IF/VAE, ni en el filtro de fila en cero, ni en el
+  # diagnóstico de transformaciones numéricas, ni en la sensibilidad post-entrenamiento).
+  # Siguen apareciendo donde identificar es justo el punto: el dashboard del analista, el
+  # Excel de OOT, el perfil crudo del panel.
+  # `dashboard.identity_column` de abajo se agrega automáticamente a esta lista: no hace
+  # falta repetirla aquí. Un nombre que no existe en el panel solo avisa (no detiene la
+  # corrida): el mismo archivo puede correr contra paneles que no traen todas las mismas
+  # columnas opcionales.
+  # identification_columns: [puesto, nombre_empleado, area]
+
+diagnostic:
+  # Columna del panel por la que se desglosa la sección 8 "Por segmento".
+  # Sin esta línea se usa el default 'segment' (y si el panel no lo tiene solo avisa).
+  # Al ACTIVARLA (quita el '#') pasa a ser un pedido explícito: debe existir en el panel; si no existe, la corrida se detiene AL
+  # INICIO (antes de ajustar nada) y te dice la columna más parecida y todas las
+  # disponibles. Usa '' para desactivar el desglose.
+  # segment_column: region
+
+  # Vista agregada por entidad en el alcance del capítulo.
+  # entity_view: true
+
+  # Reajustes con otra semilla para la estabilidad (0 = desactivar).
+  # stability_refits: 3
+
+  # Umbrales de percentil de la malla de sensibilidad (valores en (0, 1)).
+  # sensitivity_grid: [0.90, 0.95, 0.99]
+
+dashboard:
+  # Columna que se muestra bajo el ID de la entidad en el perfil del analista.
+  identity_column: puesto
+
+# ---------------------------------------------------------------------------
+# Apartado 9 del capítulo diagnóstico: experimentos ACTIVOS por defecto.
+# Todo es descriptivo (no hay umbral de pasa/no pasa) y sobre los datos de esta corrida.
+# ---------------------------------------------------------------------------
+experiments:
+  # Familias a ejecutar (todas por defecto). Quita una para apagarla:
+  #   capacity          Capacidad y dimensión latente (reentrena el VAE)
+  #   beta_kl           Beta y programación KL (reentrena el VAE)
+  #   loss_by_type      Pérdidas por tipo de feature (sin reentrenar)
+  #   ablation          Ablación de familias de features (IF barato; VAE: cat, derivada, panel_hist)
+  #   backtest          Backtests temporales (orígenes móviles, reprocesa y reajusta)
+  #   window_stability  Estabilidad entre ventanas (reutiliza los scores del backtest)
+  families: [capacity, beta_kl, loss_by_type, ablation, backtest, window_stability]
+
+  # Costo. TODOS los reentrenos del VAE (capacidad, beta/KL, ablación, backtest) comparten
+  # este presupuesto: 1 control de ruido + 5 capacidad + 4 beta/KL + 3 ablación + 2 backtest + 1 control one-hot
+  # (solo con vae.categorical_representation: embedding) (0 = ninguno; esos puntos quedan NOT_REQUESTED con el motivo).
+  vae_fit_budget: 16
+  # Tope de épocas por reentreno (lo recortado se anota en la fila) y de filas de ajuste.
+  epoch_cap: 15
+  max_fit_rows: 300000
+
+  # Mallas de los barridos. Sin la clave (o null) = puntos automáticos alrededor de la
+  # configuración de producción; [] = apagar ese barrido; valores = puntos explícitos.
+  # capacity_grid: [4, 8, 16]      # latent_dim
+  # beta_grid: [0.25, 1.0, 4.0]
+  # kl_anneal_grid: [0, 10]
+  # contamination_grid: [0.02, 0.01, 0.005]   # puntos de operación del score IF
+
+  # Backtest de orígenes móviles: cada origen reprocesa y reajusta con TODOS los
+  # periodos anteriores y evalúa solo ese periodo (un paso adelante, sin gap).
+  backtest_origins: 6            # últimos N periodos como orígenes
+  backtest_vae_origins: 2        # de ellos, cuántos también reentrenan el VAE
+  backtest_min_fit_periods: 4    # periodos mínimos de ajuste
+
+# ---------------------------------------------------------------------------
+# VAE: cómo ve las variables categóricas (src/models/mixed_vae.py).
+# El Isolation Forest NO cambia (sigue sin ver las categóricas).
+# ---------------------------------------------------------------------------
+vae:
+  # onehot    : el VAE original sobre la matriz one-hot (cada nivel = una columna = un término de pérdida).
+  #             Es el DEFAULT actual: solo pasa a `embedding` cuando se cumplen TODOS los criterios de
+  #             aceptación (ver docs/validation/2026-09-25_vae_representations/). Hoy fallan tres: la
+  #             tail_separation del score de producción (Excel) es menor con embeddings (su AP es mayor) y la
+  #             estabilidad entre ventanas medida literalmente contra el one-hot completo.
+  # embedding : numéricas + binarias + UN índice entero por categórica (tokens MISSING/UNKNOWN explícitos),
+  #             embedding aprendido por variable, una cabeza softmax por variable y UNA contribución al score
+  #             por variable original. Para probarlo: categorical_representation: embedding
+  #             (o `--vae-categorical-representation embedding`).
+  categorical_representation: onehot
+
+  # Solo se usan con `embedding`.
+  categorical_embedding:
+    dimension_strategy: auto     # auto: round(1.6 * cardinalidad^0.56) acotado a [min, max]; fixed: usa `dimension`
+    # dimension: 8               # solo con dimension_strategy: fixed
+    min_dimension: 2
+    max_dimension: 32
+  reconstruction_loss:
+    numeric: huber               # huber | mse
+    boolean: binary_cross_entropy
+    categorical: cross_entropy
+    aggregate_by_original_feature: true   # una contribución por variable original (no se admite false)
+  # Pesos por familia (default 1.0: no dependen del número de categorías ni de las columnas one-hot).
+  loss_weights:
+    numeric: 1.0
+    boolean: 1.0
+    categorical: 1.0
+  unknown_category_policy: explicit_token   # nivel no visto en el ajuste (o más raro que rare_min_frequency) -> token UNKNOWN
+  missing_category_policy: explicit_token   # nulo -> token MISSING

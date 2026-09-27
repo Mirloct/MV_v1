@@ -160,22 +160,56 @@ pruebas del puente, y bucles internos como `isolation_forest[seeds]`,
 `experiment[...]`. Para acortar la espera, baja `--diagnostic-stability-refits`
 o deja vacías las mallas opt-in del apartado 9.
 
-## Activar la segmentación del apartado 8
+## Activar la segmentación del apartado 8 (un solo archivo)
 
-El valor por defecto es una columna llamada `segment`. Para usar una columna
-propia —por ejemplo `region`—:
+El segmento se declara **una sola vez**, en `configs/pipeline.yaml`:
 
-```powershell
-python main.py --diagnostic-segment-column region
+```yaml
+diagnostic:
+  segment_column: region     # columna del panel; '' desactiva el desglose
+dashboard:
+  identity_column: puesto    # columna bajo el ID en el perfil del analista
 ```
 
-La columna debe existir en el panel original. Si no existe, el pipeline emite
-un warning y la tabla queda `NOT_APPLICABLE`. Para desactivar deliberadamente
-la segmentación, pasa una cadena vacía (en PowerShell):
+Precedencia: flag de línea de comandos > valor fijado en código > este archivo >
+default incorporado. `python main.py --config otra.yaml` usa otro archivo. Una
+clave desconocida detiene la corrida y lista las válidas (un error de tipeo ya no
+es una opción ignorada).
 
-```powershell
-python main.py --diagnostic-segment-column ""
+Antes había tres sitios que decían "segment" (el default del código, un flag y el
+default de la suite vendorizada); editar el equivocado no hacía nada y solo dejaba
+un warning al final. Ahora:
+
+- Si la columna que pediste **no existe en el panel**, la corrida se detiene **al
+  inicio** (antes de ajustar nada) y te muestra la columna más parecida ("¿Quisiste
+  decir 'Region'?") y todas las disponibles. Solo el default incorporado degrada a
+  `NOT_APPLICABLE` con un aviso.
+- El reporte nombra tu columna real: "Por segmento (region)".
+- El exportador manual (`tools/export_diagnostic_suite_inputs.py`) lee el mismo valor.
+- `execution.log` dice de dónde salió cada valor (`cli` / `code` / `file` / `default`).
+
+El flag `--diagnostic-segment-column region` sigue funcionando y gana al archivo.
+
+### Columnas que solo identifican, no modelan
+
+Si tu panel trae columnas que solo sirven para identificar un registro (puesto, nombre,
+área, un número de referencia interno, ...), decláralas para que **nunca** entren al
+modelo, en ninguna fase:
+
+```yaml
+data:
+  identification_columns: [puesto, nombre_empleado]
 ```
+
+`dashboard.identity_column` se agrega automáticamente a esa lista — no hace falta
+repetirla. Quedan fuera de la matriz de features (IF y VAE), del filtro de fila en cero
+exacto, del diagnóstico de transformaciones numéricas y de la sensibilidad
+post-entrenamiento; siguen apareciendo donde identificar es el punto (dashboard del
+analista, Excel de OOT). Un nombre que no existe en el panel solo avisa, no detiene la
+corrida — el mismo archivo puede correr contra paneles que no traen todas las mismas
+columnas opcionales. Igual que el segmento, un solo lugar decide esto
+(`src/data/loader.py::key_columns`): declarar la columna aquí es la única edición
+necesaria.
 
 Ejemplo: si `region` contiene Norte, Centro y Sur, el apartado 8 compara las
 tasas de alertas IF, IF+VAE y su intersección en esos tres grupos. Una diferencia
@@ -183,37 +217,86 @@ describe el resultado observado; no prueba por sí sola sesgo o peor calidad.
 
 ## Qué experimentos ejecuta el apartado 9
 
+Todas las familias corren **por defecto** (antes cuatro quedaban `NOT_REQUESTED`):
+
 ```mermaid
 flowchart LR
-    A[§9 Experimentos] --> B[Ensembles max/promedio]
-    A --> C[Variantes de reconstrucción]
-    A --> D[Malla contaminación IF]
-    A --> E[Malla capacidad VAE]
-    A --> F[Malla beta VAE]
-    B --> G[Siempre: reutiliza scores]
-    C --> G
-    D --> H[Por defecto: refits IF baratos]
-    E --> I[Opt-in: reentrena VAE por punto]
-    F --> I
+    A[§9 Experimentos] --> B[Ensembles y variantes de reconstrucción]
+    A --> C[Punto de operación IF]
+    A --> D[Capacidad y dimensión latente]
+    A --> E[Beta y programación KL]
+    A --> F[Pérdidas por tipo de feature]
+    A --> G[Ablación de familias]
+    A --> H[Backtests temporales]
+    A --> I[Estabilidad entre ventanas]
+    B --> J[Reutilizan scores ya calculados]
+    C --> J
+    F --> J
+    D --> K[Reentrenan el VAE: presupuesto compartido]
+    E --> K
+    G --> L[IF barato; VAE solo sin cat, derivada y panel_hist]
+    H --> M[Reprocesa y reajusta en cada origen]
+    I --> N[Reutiliza los scores del backtest]
 ```
 
-La malla IF predeterminada es `0.01 0.02 0.05`. Puede reemplazarse o
-desactivarse pasando el flag sin valores:
+| Familia | Qué hace | Costo |
+|---|---|---|
+| Control de ruido | La configuración de producción reentrenada con otra semilla | 1 reentreno VAE (+ 1 IF) |
+| Capacidad y dimensión latente | `latent_dim` ×½, ×2, ×4 y ancho oculto ×½, ×2 | 5 reentrenos VAE |
+| Beta y programación KL | β ×0.25 y ×4; `kl_anneal_epochs` = 0 y = épocas | 4 reentrenos VAE |
+| Pérdidas por tipo de feature | Reparto del error cuadrático y de los lugares top-K de `recon_topk` por familia (cat, num_base, ratios_negocio, panel_hist, bool, missing, cyc, derivada) y Jaccard de las alertas quitando/agregando el bloque one-hot | ninguno |
+| Ablación de familias | IF sin cada familia; VAE sin `cat`, `derivada` y `panel_hist` | IF barato + hasta 3 VAE |
+| Backtests temporales | Últimos 6 periodos como orígenes: cada uno **reprocesa y reajusta con todos los periodos anteriores** y evalúa solo ese periodo (IF en todos; VAE en los 2 últimos) | 6 preprocesos + 6 IF + 2 VAE |
+| Estabilidad entre ventanas | Spearman y Jaccard top-K de los scores por entidad entre orígenes consecutivos, y entre dos ventanas agregadas | ninguno |
+
+**Cómo leerlo.** Es descriptivo: no hay umbral de pasa/no pasa. Cada variante trae un
+**control**: la configuración de producción reentrenada con otra semilla y los mismos topes,
+comparada con producción con el mismo Jaccard de conjuntos de alerta (fila "Control de ruido
+del VAE" y, en el IF, el valor entre paréntesis). Una variante con Jaccard cercano al control
+está dentro del ruido de reentrenamiento; una claramente más baja cambió de verdad las alertas.
+Los conjuntos de alerta se construyen igual que en producción (VAE: percentil de `recon_topk`
+contra el bloque de entrenamiento; IF: percentil del score), por lo que los Jaccard son
+comparables. (El "piso" de la sección de estabilidad mide otra cosa —top-k de scores crudos—
+y no se usa aquí.) `-ELBO(β=1)` solo se muestra donde la entrada es la misma (capacidad y beta);
+en la ablación cambia la dimensión de entrada y no es comparable. Lo recortado por costo (épocas, filas) se anota en
+`detalle`. En datos sintéticos y con pocas ventanas es exploratorio, no concluyente.
+
+**Costo y control.** Todos los reentrenos del VAE comparten un presupuesto (`vae_fit_budget`,
+16 por defecto: 1 control + 5 + 4 + 3 + 2 + 1 control one-hot con embeddings). Al agotarse, los puntos restantes quedan `NOT_REQUESTED`
+con ese motivo. Sobre 1 M de filas conviene bajar el presupuesto o `max_fit_rows`.
+
+Todo se ajusta en el bloque `experiments:` de `configs/pipeline.yaml` (familias, presupuesto,
+tope de épocas y filas, mallas, orígenes del backtest). Sin clave = puntos automáticos;
+`[]` = apagar ese barrido. Por línea de comandos siguen valiendo, y ganan al archivo:
 
 ```powershell
-python main.py --diagnostic-experiment-contamination-grid 0.005 0.01 0.03
-python main.py --diagnostic-experiment-contamination-grid
+python main.py --diagnostic-experiment-capacity-grid 4 8 16     # puntos explícitos
+python main.py --diagnostic-experiment-capacity-grid            # sin valores = apagar
+python main.py --diagnostic-experiment-beta-grid 0.25 1 4
+python main.py --diagnostic-experiment-vae-fit-budget 6         # 0 = sin reentrenos
+python main.py --diagnostic-experiment-families loss_by_type ablation
+python main.py --diagnostic-experiment-contamination-grid 0.005 0.01 0.03   # punto de operación IF
 ```
 
-Capacidad latente y beta son opt-in porque cada punto reentrena un VAE completo:
+Limitaciones que conviene conocer: (a) `panel_hist` y `cyc` solo existen con
+`--panel-features` (sin él la ablación de esas familias es `NOT_APPLICABLE`); (b) el backtest
+del VAE usa la matriz base sin la columna apilada del IF (el apilado se entrenó con datos
+posteriores a los orígenes anteriores), así que no es comparable con producción; (c) el sesgo
+de las alertas del VAE hacia las columnas one-hot se **expone** (pérdidas por tipo) pero no se
+corrige: eso exige cambiar la pérdida del modelo. `Preprocesamiento` sigue `NOT_REQUESTED`.
 
-```powershell
-python main.py --diagnostic-experiment-capacity-grid 4 8 16 `
-               --diagnostic-experiment-beta-grid 0.1 0.5 1.0
+## Probar el VAE con embeddings
+
+Para que el VAE deje de tratar cada nivel de una categórica como una variable independiente, cambia en `configs/pipeline.yaml`:
+
+```yaml
+vae:
+  categorical_representation: embedding
 ```
 
-Las familias que requieren cambiar el modelo, el preprocesamiento o conservar
-múltiples ventanas históricas quedan `NOT_REQUESTED` con un motivo específico.
+(o `python main.py --vae-categorical-representation embedding`). Verás menos columnas de entrada, una contribución por variable original en
+"Pérdidas por tipo de feature" (con filas MISSING/UNKNOWN y un control one-hot) y explicaciones como `segment=retail (p=0.031)`. Un modelo
+guardado con la otra representación se **rechaza** al cargarlo; se reentrena. Por ahora el default es `onehot` (ver `docs/models_vae.md` §2c).
 
 ## Cómo leer los tres entregables
 

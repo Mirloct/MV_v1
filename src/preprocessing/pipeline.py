@@ -52,7 +52,7 @@ from sklearn.preprocessing import (
 from sklearn.utils import check_array
 from sklearn.utils.validation import _check_feature_names_in, check_is_fitted
 
-from src.data.loader import PanelSchema
+from src.data.loader import PanelSchema, key_columns
 from src.utils.logging_config import log_phase, setup_logging
 
 __all__ = [
@@ -353,8 +353,11 @@ class MissingnessIndicator(BaseEstimator, TransformerMixin):
 class PanelFeatureEngineer(BaseEstimator, TransformerMixin):
     """Clean keys/dtypes and (optionally) add within-entity panel features.
 
-    Always: drops the ``entity_col`` / ``time_col`` keys and any stray datetime
-    columns, and casts nullable-integer columns to ``float64`` so downstream
+    Always: drops the ``entity_col`` / ``time_col`` keys, ``excluded_columns``
+    (the target, if inline, and any ``PanelSchema.identification_columns`` --
+    see :func:`src.data.loader.key_columns`, the single place that set is
+    assembled) and any stray datetime columns, and casts nullable-integer
+    columns to ``float64`` so downstream
     scikit-learn steps accept them. Booleans are kept as ``bool`` and object
     columns as ``object`` so the ColumnTransformer's dtype selectors can route
     them.
@@ -396,6 +399,7 @@ class PanelFeatureEngineer(BaseEstimator, TransformerMixin):
         ratio_features: Optional[Sequence[tuple[str, str, str]]] = None,
         lag_horizons: Optional[Sequence[int]] = None,
         fit_window_mask: Optional[np.ndarray] = None,
+        excluded_columns: Optional[Sequence[str]] = None,
     ):
         self.entity_col = entity_col
         self.time_col = time_col
@@ -404,12 +408,13 @@ class PanelFeatureEngineer(BaseEstimator, TransformerMixin):
         self.ratio_features = ratio_features
         self.lag_horizons = lag_horizons
         self.fit_window_mask = fit_window_mask
+        self.excluded_columns = excluded_columns
 
     # -- fit --------------------------------------------------------------- #
     def fit(self, X: pd.DataFrame, y=None):
         if not isinstance(X, pd.DataFrame):
             raise TypeError("PanelFeatureEngineer requires a pandas DataFrame")
-        keys = {self.entity_col, self.time_col} - {None}
+        keys = {self.entity_col, self.time_col, *(self.excluded_columns or ())} - {None}
         kept, panel_cols = [], []
         for col in X.columns:
             if col in keys:
@@ -906,6 +911,9 @@ def build_preprocessing_pipeline(
     Args:
         schema: Panel schema; ``entity_col``/``time_col`` are treated as keys
             (dropped from the feature matrix, used for panel features).
+            ``target_col`` (if inline) and ``identification_columns`` are also
+            dropped from the feature matrix -- see
+            :func:`src.data.loader.key_columns`.
         numeric_transform: One of :data:`NUMERIC_TRANSFORMS`. Selectable by
             name so an Optuna study can tune it as a categorical.
         categorical_encoding: One of :data:`CATEGORICAL_ENCODINGS`.
@@ -945,6 +953,7 @@ def build_preprocessing_pipeline(
         ratio_features=ratio_features,
         lag_horizons=lag_horizons,
         fit_window_mask=fit_window_mask,
+        excluded_columns=key_columns(schema) - {schema.entity_col, schema.time_col},
     )
 
     cat_selector = make_column_selector(dtype_include=["object", "category"])

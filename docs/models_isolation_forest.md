@@ -110,22 +110,22 @@ in different releases), so a number quoted from a different installed
 version would be wrong here. Two defaults differ: **sklearn's own default**
 (what `IsolationForest()` alone would use) vs. **this project's default**
 (what `IsolationForestDetector()` actually uses, `src/models/iforest.py:78`)
-— the project overrides `n_estimators` and `contamination` deliberately; the
-rest pass through unchanged.
+— the project overrides `n_estimators`, `max_samples` and `contamination`
+deliberately (see `PipelineConfig.iforest_params`); the rest pass through unchanged.
 
 | Parameter | sklearn default | Project default | Meaning | Alternatives and what they change | Trade-off |
 | --- | --- | --- | --- | --- | --- |
-| `n_estimators` | `100` | **`200`** | Number of isolation trees averaged into one score. | Any positive int. Optuna search space: `[100, 600]` step 50 (`tune_iforest`). | More trees → lower score variance across random seeds, linear cost increase (fit and score both scale ~linearly). 200 was chosen as a floor above sklearn's 100 because score-stability tests in this project's own docs (§3) showed rank agreement among the top anomalies is still seed-sensitive at 100. Diminishing returns past a few hundred; the real ceiling is wall-clock budget, not accuracy. |
-| `max_samples` | `"auto"` (= `min(256, n_samples)`) | `"auto"` (unchanged) | Rows drawn (with replacement iff `bootstrap=True`) to build *each* tree. | `"auto"`, an int (exact row count), or a float in `(0, 1]` (fraction of rows). Optuna search space: categorical `{"auto", float in [0.3, 1.0]}`. | **Smaller, not larger, is the "more power" direction** for this algorithm — the original Isolation Forest paper's central result is that small sub-samples isolate anomalies in *fewer* splits because the normal bulk swamps large samples ("swamping"/"masking"). `"auto"`'s 256-row cap is deliberately small regardless of dataset size; raising it moves splits toward normal-region boundaries and typically *degrades* anomaly separation, it does not just cost more compute. |
-| `contamination` | `"auto"` (sets an offset via an internal heuristic, not a literal rate) | **fixed by `tune_iforest(contamination=...)`, default `0.02`** | Only feeds `predict()`'s and `decision_function()`'s 0-centering; **does not affect `score_samples()`, the value this project ranks and thresholds on.** | Any float in `(0, 0.5]`, or `"auto"`. `IsolationForestAssumptionError` (this project's assumption gate, `src/utils/assumptions.py::validate_iforest_config`) blocks anything outside `(0, 0.5]`. | This is *not* searched by Optuna in this project, and the reason is load-bearing, not an oversight: `score_samples` doesn't consult it, and every rank-based tuning objective (`_rank_agreement`, `_tail_separation`) is invariant to it too, so a search over `contamination` would optimize nothing about the forest — see §3 "contamination is not searched" below and the retired `_separation_margin` postmortem in `CONTEXT.md`. **Do not read `contamination` as "the model's estimate of the true anomaly rate"** — it is an operating-point choice for `predict()`/`decision_function()` only, not a fitted or validated quantity. |
-| `max_features` | `1.0` (all features per split) | `1.0` (unchanged) | Fraction of *columns* (not rows) considered when picking each split's random feature. | Float in `(0, 1]`. Optuna search space: `[0.3, 1.0]`. | Lower values add a second, independent source of tree diversity beyond row sub-sampling (closer to a Random-Forest-style feature bagging). Interacts with `max_samples`: both control how much of the data any one tree actually sees. |
-| `bootstrap` | `False` | `False` (unchanged) | Whether the per-tree row sample is drawn *with* replacement. | `True`/`False`. Optuna search space: both. | `False` (sampling without replacement) is what the original algorithm describes and is the more common choice in practice; `True` changes the effective sample-diversity statistics slightly and is offered only because the tuning search costs nothing to include it. |
+| `n_estimators` | `100` | **`300`, fixed** (never searched) | Number of isolation trees averaged into one score. | Any positive int. `tune_iforest(n_estimators=...)` fixes it for every trial and the refit. | More trees → lower score variance across seeds, linear cost. It is **fixed, not tuned**: the previous label-free objective (`rank_agreement`) rose mechanically with the tree count (Spearman 0.87 with `n_estimators`), so a searched `n_estimators` just pushed the search to its upper bound at ~5× the cost with no gain in true detection quality (measured, §3 "Measured"). 300 sits past the point where seed-to-seed score variance stops mattering for the top of the ranking. |
+| `max_samples` | `"auto"` (= `min(256, n_samples)`) | **absolute integer** (untuned fallback `4096`, capped to the fit rows; tuner range `1 024–32 768`) | Rows drawn to build *each* tree (ψ). | An int (exact row count). **Never a fraction in this project**: a fraction is a different absolute ψ in the trial (share of the fit block), the refit (all in-time rows) and the stacking forest (train rows) — a 2.5× mismatch measured before the redesign, so what was validated was not what was deployed. `tune_iforest(max_samples_range=(lo, hi))`, log-uniform, capped to the rows each trial fits on. | The paper's argument for a small ψ (256: swamping/masking) holds when anomalies are extreme and rare. **It is regime-dependent, not a law**: on this project's synthetic panel (weak signal, `yeo-johnson`) true average precision *rose* with ψ up to a few thousand rows per tree, and the direction reverses under `robust` scaling. So the tuner searches ψ on an absolute log scale and always re-evaluates the paper default (ψ=256) as its reference; if nothing beats it by more than the measured noise, the default is kept (§3 selection rule). |
+| `contamination` | `"auto"` (sets an offset via an internal heuristic, not a literal rate) | **`0.02`, an operating point — not tuned** (`tune_iforest(contamination=...)`) | Only feeds `predict()`'s and `decision_function()`'s 0-centering; **does not affect `score_samples()`, the value this project ranks and thresholds on.** | Any float in `(0, 0.5]`, or `"auto"`. `IsolationForestAssumptionError` (`src/utils/assumptions.py::validate_iforest_config`) blocks anything outside `(0, 0.5]`. | Not searched, and not "tuned to start at 0.02 then 0.01, 0.005": every score and every rank-based objective is invariant to it, so a search would optimise nothing about the forest. What *can* be examined is how the **alert set** changes when the cut-off moves over the same score: the diagnostic's §9 *Sensibilidad del punto de operación* compares the top-2 %, 1 % and 0.5 % of the IF score with the production alert set (no refits; the old refit sweep returned the identical forest three times). **Do not read `contamination` as the model's estimate of the true anomaly rate.** |
+| `max_features` | `1.0` (all features per split) | `1.0` (unchanged) | Fraction of *columns* (not rows) considered when picking each split's random feature. | Float in `[0.5, 1.0]` in the tuner. | Lower values add a second source of tree diversity beyond row sub-sampling. Interacts with `max_samples`: both control how much of the data any one tree sees. Searched jointly with ψ. |
+| `bootstrap` | `False` | `False`, fixed | Whether the per-tree row sample is drawn *with* replacement. | `True`/`False` via `tune_iforest(bootstrap=...)`; not searched. | `False` (sampling without replacement) is what the original algorithm describes; searching it added a dimension with no measurable effect on the objective. |
 | `random_state` | `None` (non-reproducible) | **`42`**, threaded from `PipelineConfig.seed` | Seeds sklearn's internal `RandomState` for the split-feature/split-value draws. | Any int, or `None`. | `None` means **every fit produces a different forest and different scores** — for a project whose CONTEXT.md explicitly tracks measured metrics as evidence (e.g. "OOT ROC-AUC 0.71"), an unfixed seed would make those numbers non-reproducible from one run to the next. Fixed unconditionally here; there is no code path in this project that leaves it as sklearn's `None` default. |
 | `n_jobs` | `None` (single-threaded) | **`-1`** (all cores) | Parallelism across trees during fit/score. | Any int, `-1`, or `None`. | Pure wall-clock knob — does not change the fitted forest or its scores (tree construction is embarrassingly parallel and each tree's random draws are independent of core count). `-1` is a safe default precisely because it cannot change results, only fit time. |
 
 **Not exposed by this project's wrapper** (sklearn defaults apply, unmodified): `verbose` (`0`, no progress printing — this project's own `tqdm` bar in `tune_iforest` covers that need at the trial level instead) and `warm_start` (`False` — this project always fits from scratch; incremental forest growth is never used).
 
-**Sensitivity analysis actually run vs. still open.** §3 below covers: score finiteness/orientation under malformed input, resume/crash-recovery correctness, and rank agreement between two seeds at the tuned configuration. **Not yet measured on this project's data**: a systematic sweep of `n_estimators` alone (holding everything else fixed) to find where score-variance-across-seeds actually plateaus, and a `max_samples` sensitivity curve. Treat "200 trees is enough" as this project's working assumption, justified by the reasoning above, not as a measured optimum.
+**Sensitivity analysis actually run.** The redesign is grounded in a 156-configuration grid on two labelled synthetic panels plus 15-trial study replays (§3 "Measured: the tuner redesign"). Everything measured is on **synthetic** data; the *direction* of the ψ effect must be re-checked on real data with `--tune` before anything is claimed about it.
 
 ---
 
@@ -149,31 +149,60 @@ run is interrupted before it finishes.
 
 To resume after an interruption, simply call `tune_iforest` again with the same
 `study_name` and `storage` (both default, so a plain re-run resumes by default).
-`n_trials` is the number of *new* trials to add on top of what already exists.
+`n_trials` is the **total** trial budget of the study: a resumed study runs only
+the missing `n_trials − completed` (repeating a run does not silently grow it),
+and trials a crash left `RUNNING` are closed as failed first.
 
 ### Search space
 
-- `n_estimators` — int in `[100, 600]`, step 50
-- `max_samples` — categorical mode `{"auto", "float"}`; when `"float"`, a
-  fraction in `[0.3, 1.0]`
-- `max_features` — float in `[0.3, 1.0]`
-- `bootstrap` — `{True, False}`
+Two dimensions, nothing else:
+
+- `max_samples` (ψ) — **absolute integer**, log-uniform in
+  `max_samples_range` (default `1 024–32 768`, CLI `--iforest-max-samples-range`),
+  capped to the rows each trial fits on.
+- `max_features` — float in `max_features_range` (default `0.5–1.0`).
+
+Fixed for every trial **and** the refit: `n_estimators=300`, `bootstrap=False`.
 
 **`contamination` is not searched.** It is an explicit `tune_iforest` argument
-(default `0.10`, the alert budget the OOT deliverable reports on).
+(the deployed detector's `predict()` operating point; `contamination_tuned: false`
+is written to the YAML).
 
 > **Why.** sklearn's `score_samples` does not consult `offset_`; contamination
 > only shifts the threshold used by `decision_function` / `predict`. Every
-> objective here ranks rows by `score_samples`, and PR-AUC, ROC-AUC and Spearman
-> agreement are all rank statistics — so contamination is *mathematically
-> incapable* of changing an objective value. Searching it burned TPE budget on a
-> flat dimension and persisted an arbitrary "best".
+> objective here ranks rows by `score_samples`, and PR-AUC, ROC-AUC, Spearman
+> agreement and the tail statistics are all rank/quantile statistics — so
+> contamination is *mathematically incapable* of changing an objective value.
+
+**Sampler.** A low-discrepancy Sobol sweep (`QMCSampler`), not TPE: with 15
+noisy trials on an almost one-dimensional response, a model-based sampler has
+nothing to model. On a fresh study the first trials are **anchors** at
+ψ ∈ {1 024, 4 096, 16 384, 32 768} (clipped to the fit rows, all features), so
+even a `--quick` run covers the axis that matters.
+
+### Selection rule (why "argmax" is not enough)
+
+The objective is noisy and the argmax of noisy values is biased upward. After the
+trials the tuner re-evaluates the **paper default** (ψ=256, all features) with
+`noise_seeds` (3) different seeds; their spread is the noise floor `sd`. Then:
+
+1. **1-standard-error rule** — among trials within one `sd` of the best value,
+   take the *cheapest* (smallest ψ × `max_features`).
+2. **Margin rule** — keep that pick only if it beats the reference mean by more
+   than `margin_sd` (1.0) `sd`; otherwise the reference default is deployed.
+
+The decision (`selection` block: best/picked trial, noise, reference values,
+`deployed: tuned | reference_default`, `beats_reference`) is written to the YAML
+and to `study.user_attrs["selection"]`. A tuned configuration that cannot be
+told apart from the default is not a finding.
 
 ### Held-out objective
 
 Each trial fits on a `fit_idx` block and is scored on a disjoint `eval_idx`
-block (`_blocked_split`, 70/30). When `groups` is supplied — `main.py` passes
-`entity_id` — the split keeps **whole entities** on one side.
+block. `main.py` passes `valid_mask` (the chronological validation months), which
+has priority: fit on the training months, score on the validation months — what
+deployment looks like. Without it, `_blocked_split` (70/30) keeps **whole
+entities** on one side when `groups` is supplied.
 
 > **Why blocked.** All rows of one customer share the latent level that
 > generated them, so a row-wise split lets a trial be scored on months of an
@@ -187,46 +216,54 @@ The final model is refit on all of `X`: the split exists to make model
 ### Study fingerprinting
 
 The effective study name is `f"{study_name}_{fingerprint}"`, hashing
-`(X.shape, feature_names, objective mode, direction)`. Pass `study_tag` to
-override.
+`(X.shape, feature_names, objective mode, direction)` **plus** the fixed
+`n_estimators`, the ψ / `max_features` ranges, `bootstrap`, the hash of the
+held-out split and of the labels used, and the top-k fractions. Pass `study_tag`
+to override.
 
 > **Why.** `load_if_exists=True` resumes by name alone, so a fixed name pooled
-> trials from a 2,000-entity one-hot panel with trials from a 100,000-entity
-> frequency-encoded one, and TPE modelled a response surface stitched from
-> incomparable values.
+> trials with incomparable objective values (different data, split, objective or
+> search space) into one study.
 
 ### Objective modes
 
-`direction` defaults to `None` and auto-resolves (mirroring `tune_vae`); a
-callable `objective_metric` without an explicit direction logs a warning.
+`direction` defaults to `None` → `maximize` (every built-in objective is
+higher-is-better); a callable `objective_metric` without an explicit direction
+logs a warning.
 
-- **Supervised** (`y` given, 0/1 labels aligned row-for-row to `X`): scores the
-  **held-out block** against the labels, defaulting to **PR-AUC**
-  (`average_precision_score`) — the informative summary for heavily imbalanced
-  anomaly detection — switchable to **ROC-AUC** via
-  `objective_metric="roc_auc"`. Falls back to the unsupervised objective when
-  the held-out block is single-class.
-- **Unsupervised** (`y is None`): `_rank_agreement` — refit the same
-  configuration on two disjoint halves of `fit_idx` with different seeds, score
-  the common held-out block with both, and return
-  `max(spearman, 0) * jaccard(top-decile_a, top-decile_b)`. A constant score
-  vector returns `0.0`.
+- **Labelled** (`y` given, aligned to `X`, `NaN` = unknown row, ignored): scores
+  the held-out block against the labels on the **known rows only**, default
+  **average precision**, switchable to ROC-AUC via `objective_metric="roc_auc"`.
+  With reviewed labels this is the only real signal. It is used only when the
+  held-out block has at least `min_eval_positives` (10) positives and both
+  classes; otherwise the study says so in the log and falls back to label-free.
+  `main.py` supplies it in this precedence: explicit `--supervised` ground truth
+  → reviewed labels **when gate 4.5 authorises them** (level above `rojo`, no
+  veto) and the validation months hold enough mature positive rows (Phase 5b,
+  `--tune-with-labels auto|off`, `--tune-min-positive-rows`) → label-free. The
+  reviewed labels reach the tuner only as a held-out target of the validation
+  months, never as training data.
+- **Label-free (default)**: `tail_separation` — `(p95 − p50) / IQR` of the
+  held-out scores of a single forest fitted on the fit block. Both cut points are
+  fixed constants, so the only way to raise it is to push the tail away from the
+  bulk. It rewards *separation*, not *correctness* (nothing label-free can verify
+  the tail holds the true anomalies), but it is unrelated to the tree count and
+  tracked the true quality at Spearman 0.64 across the 156-configuration grid.
+- **`objective_metric="rank_agreement"`** keeps the legacy stability objective:
+  refit on two disjoint halves of `fit_idx`, score the common held-out block and
+  return `max(spearman, 0) × jaccard(top-k_a, top-k_b)`, where
+  *k = round(fraction × n_eval)* — a **top-k fraction, not a decile** (earlier
+  text said "top-decile"; the code never was) — averaged over `tail_fracs`
+  (0.5 %, 1 %, 2 %). Its ψ cap is half the fit block. Kept for comparison: it is
+  dominated by `n_estimators` and noisy (sd ≈ 0.034).
 
-> **Why this replaced `_separation_margin`.** The old proxy used the trial's own
-> `contamination` as the tail fraction `k` at which it cut scores that are
-> invariant to it. Shrinking `k` selects a more extreme tail, mechanically
-> raising `mean(top) − mean(rest)` — so the objective was monotone in a knob
-> that does not affect the model, and the search was driven to the lower bound
-> of the contamination range regardless of forest quality. It optimised the
-> metric's own parameter instead of the forest. `_rank_agreement` instead asks
-> whether the ranking survives refitting on different data, which is what "this
-> detector found real structure" actually means. It is the honest version of
-> `evaluation.metrics._rank_stability`, whose docstring concedes it only jitters
-> fixed scores because refitting is unavailable at metric-computation time —
-> during tuning, it is not.
+> **History.** `_separation_margin` was retired because it cut the tail at the
+> trial's own `contamination`, a knob that does not affect the scores, so the
+> search optimised the metric's parameter instead of the forest. `_rank_agreement`
+> replaced it and was in turn demoted to an option because of its tree-count
+> dependence.
 
-`objective_metric` may also be a callable `(detector, X) -> float` for a fully
-custom objective.
+`objective_metric` may also be a callable `(detector, X) -> float`.
 
 ### Measured: which anomaly geometry does it actually recover?
 

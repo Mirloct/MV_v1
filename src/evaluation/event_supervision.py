@@ -47,7 +47,8 @@ from src.models.event_challenger import ChallengerConfig, run_event_challengers
 from src.utils import paths
 from src.utils.logging_config import log_phase, setup_logging
 
-__all__ = ["EventSupervisionConfig", "run_event_supervision"]
+__all__ = ["EventSupervisionConfig", "prepare_event_labels", "labels_for_tuning",
+           "run_event_supervision"]
 
 CHALLENGER_MODES = ("off", "auto", "force")
 
@@ -135,27 +136,23 @@ def _json_default(value: Any) -> Any:
     return str(value)
 
 
-def run_event_supervision(
+def prepare_event_labels(
     *,
     cfg: EventSupervisionConfig,
     schema: PanelSchema,
     keys: pd.DataFrame,
     masks: dict[str, np.ndarray],
-    scores: dict[str, np.ndarray],
-    X: Any,
-    feature_names: list[str],
 ) -> dict[str, Any]:
-    """Run the whole phase (see module docstring) and write its artifacts.
+    """Load the labels file, align it to the panel and decide gate 4.5.
 
-    Args:
-        masks: Boolean row masks ``train``, ``val``, ``test`` and ``oot``.
-        scores: ``{"if_score": ..., "vae_score": ...}``, higher = more anomalous.
-        X, feature_names: The matrix the ridge/hazard challengers may use.
+    Split out of :func:`run_event_supervision` so the same loaded labels serve
+    two consumers: hyper-parameter selection *before* the detectors are tuned
+    (:func:`labels_for_tuning`, only when the gate authorises labels) and the
+    post-hoc evaluation of Phase 8c. Never raises for a missing/empty/unusable
+    file: it returns ``{"status": <no_labels_file|empty_labels_file|contract_error>,
+    "reason": ...}`` and the pipeline carries on unsupervised.
     """
     log = setup_logging()
-    if cfg.challenger_mode not in CHALLENGER_MODES:
-        raise ValueError(f"challenger_mode must be one of {CHALLENGER_MODES}")
-
     with log_phase("event_supervision.load_labels"):
         path = find_labels_file(cfg.labels_path, cfg.labels_dir)
         if path is None:
@@ -191,6 +188,90 @@ def run_event_supervision(
                  "%d entidad(es); vetos: %s.", gate["level"], gate["level_by_count"],
                  metrics["n_mature_positive_episodes"], metrics["n_positive_entities"],
                  [v["code"] for v in gate["vetoes"]] or "ninguno")
+    return {"status": "loaded", "labels": labels, "gate": gate, "metrics": metrics,
+            "source_path": labels.source_path}
+
+
+def labels_for_tuning(
+    prepared: Optional[dict[str, Any]],
+    *,
+    in_mask: np.ndarray,
+    val_mask: np.ndarray,
+    min_positive_rows: int = 10,
+) -> dict[str, Any]:
+    """Reviewed labels as a model-selection target for the IF/VAE tuners.
+
+    Used **only** when gate 4.5 authorises labels (level above ``rojo``, i.e.
+    no veto and enough mature independent episodes) and the *validation months*
+    hold at least ``min_positive_rows`` mature positive rows. The vector is aligned
+    to the in-time rows (``in_mask``) and is ``NaN`` everywhere except the mature
+    known rows of the validation window, so a tuner can neither train on labels
+    nor score on rows whose outcome is not yet known. Anything else returns
+    ``y=None`` with the reason, and tuning stays label-free.
+    """
+    def off(reason: str, **extra: Any) -> dict[str, Any]:
+        return {"y": None, "used": False, "reason": reason, **extra}
+
+    if not prepared:
+        return off("labels not loaded (feature disabled)")
+    if prepared.get("status") != "loaded":
+        return off(f"labels unavailable ({prepared.get('status')})")
+    gate = prepared["gate"]
+    if not gate.get("supervised_challengers_allowed"):
+        return off(f"gate 4.5 level {gate.get('level')!r} does not authorise labels",
+                   gate_level=gate.get("level"),
+                   vetoes=[v["code"] for v in gate.get("vetoes", [])])
+    labels: EventLabels = prepared["labels"]
+    in_mask = np.asarray(in_mask, dtype=bool)
+    val_in = np.asarray(val_mask, dtype=bool)[in_mask]
+    usable = np.asarray(labels.usable, dtype=bool)[in_mask]
+    target = np.asarray(labels.target, dtype=float)[in_mask]
+    y = np.full(target.shape[0], np.nan)
+    keep = usable & val_in & ~np.isnan(target)
+    y[keep] = target[keep]
+    n_pos = int((y == 1).sum())
+    n_neg = int((y == 0).sum())
+    eps = labels.episode_id[in_mask][keep & (target == 1)]
+    n_epi = int(len({e for e in eps if e}))
+    if n_pos < min_positive_rows or n_neg < 1:
+        return off(f"validation months hold {n_pos} mature positive row(s) and {n_neg} negative(s) "
+                   f"(need >= {min_positive_rows} positives)", gate_level=gate.get("level"),
+                   n_positive_rows=n_pos, n_negative_rows=n_neg)
+    return {"y": y, "used": True, "reason": "gate 4.5 authorises labels", "gate_level": gate.get("level"),
+            "n_positive_rows": n_pos, "n_negative_rows": n_neg, "n_positive_episodes": n_epi,
+            "source_path": prepared.get("source_path")}
+
+
+def run_event_supervision(
+    *,
+    cfg: EventSupervisionConfig,
+    schema: PanelSchema,
+    keys: pd.DataFrame,
+    masks: dict[str, np.ndarray],
+    scores: dict[str, np.ndarray],
+    X: Any,
+    feature_names: list[str],
+    prepared: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Run the whole phase (see module docstring) and write its artifacts.
+
+    Args:
+        masks: Boolean row masks ``train``, ``val``, ``test`` and ``oot``.
+        scores: ``{"if_score": ..., "vae_score": ...}``, higher = more anomalous.
+        X, feature_names: The matrix the ridge/hazard challengers may use.
+        prepared: Output of :func:`prepare_event_labels` when the caller already
+            loaded the labels (e.g. before tuning); loaded here when ``None``.
+    """
+    log = setup_logging()
+    if cfg.challenger_mode not in CHALLENGER_MODES:
+        raise ValueError(f"challenger_mode must be one of {CHALLENGER_MODES}")
+
+    if prepared is None:
+        prepared = prepare_event_labels(cfg=cfg, schema=schema, keys=keys, masks=masks)
+    if prepared["status"] != "loaded":
+        return {k: v for k, v in prepared.items() if k not in ("labels", "gate", "metrics")}
+    labels: EventLabels = prepared["labels"]
+    gate = prepared["gate"]
 
     with log_phase("event_supervision.evaluate_detectors"):
         evaluation = _evaluate_baselines(labels, scores, masks, cfg)

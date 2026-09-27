@@ -204,7 +204,10 @@ scores = detector.score_samples(X_if)     # mayor = más anómalo
 flags = detector.predict(X_if)            # 1 = anomalía, 0 = normal
 ```
 
-Sin etiquetas el objetivo de tuneo es un proxy de separación de scores; entrega
+Sin etiquetas el objetivo de tuneo es `tail_separation` (separación de la cola del score);
+con labels revisados que la compuerta 4.5 autoriza usa el AP contra ellos (ver abajo). `n_estimators`
+va fijo en 300, `max_samples` es un **entero absoluto** (1 024–32 768) y la contaminación no se
+busca; entrega
 `y` para el objetivo supervisado PR-AUC / ROC-AUC. Ver
 [`docs/models_isolation_forest.md`](docs/models_isolation_forest.md) para el
 concepto, la API completa, el espacio de búsqueda, la referencia de parámetros y
@@ -340,6 +343,53 @@ fuentes primarias verificadas y una limitación declarada explícitamente: el
 diseño *leave-one-period-out* aplicado a ranking no supervisado es una
 construcción metodológica propia, no un método publicado con ese nombre.
 
+### Un solo archivo de configuración y experimentos del apartado 9
+
+El segmento del apartado 8, la columna de identidad del analista, las columnas que solo
+identifican un registro y los experimentos del apartado 9 se editan en **un solo archivo**:
+`configs/pipeline.yaml`.
+
+```yaml
+data:
+  identification_columns: [puesto, nombre_empleado]   # nunca entran al modelo, en ninguna fase
+diagnostic:
+  segment_column: region        # columna del panel; '' desactiva el desglose
+experiments:
+  families: [capacity, beta_kl, loss_by_type, ablation, backtest, window_stability]
+  vae_fit_budget: 16            # reentrenos del VAE compartidos (0 = ninguno)
+```
+
+Precedencia: flag > valor en código > archivo > default. Si el segmento que pides no existe en
+el panel, la corrida se detiene al inicio y te dice la columna más parecida y todas las
+disponibles. Las seis familias que antes decían `NOT_REQUESTED` (capacidad y dimensión latente,
+beta y programación KL, pérdidas por tipo de feature, ablación de familias, backtests
+temporales, estabilidad entre ventanas) ahora **corren por defecto**; detalle y costo en
+`docs/guia_practica.md`.
+
+`data.identification_columns` marca columnas que solo sirven para identificar un registro
+(puesto, nombre, área, un número de referencia interno, ...): quedan fuera de TODA fase que
+decida qué ve el modelo (features de IF/VAE, filtro de fila en cero, diagnóstico de
+transformaciones numéricas, sensibilidad post-entrenamiento), pero siguen apareciendo donde
+identificar es el punto (dashboard del analista, Excel de OOT). `dashboard.identity_column` se
+agrega automáticamente a esta lista, sin repetirla. Todo se resuelve en un solo lugar
+(`src/data/loader.py::key_columns`), así que agregar una columna aquí es la única edición
+necesaria; ver `CONTEXT.md` → "Identification columns".
+
+### VAE: embeddings en lugar de one-hot para las categóricas
+
+`vae.categorical_representation` (en `configs/pipeline.yaml`, o `--vae-categorical-representation embedding`) cambia cómo el VAE ve las
+variables categóricas: en vez de una columna por nivel (que sobrepondera `recon_topk`), **un índice por variable** (tokens MISSING/UNKNOWN
+explícitos), un embedding aprendido por variable y **una sola contribución al score por variable original**. El Isolation Forest no cambia.
+Comparación controlada (sintéticos, ambas representaciones con las mismas dos normalizaciones): con la misma normalización los lugares top-k categóricos
+pasan de 72–73 % a 34–35 % (25 % esperado), `recon_topk` de azar a AP 0.22 y la estabilidad entre semillas de 0.46 a 0.90. **El default sigue en `onehot`**:
+tres criterios de aceptación no se cumplen (tail_separation del score de producción, y estabilidad entre ventanas medida literalmente contra el one-hot completo,
+inflada por atributos categóricos estáticos). Detalle: `docs/models_vae.md` §2c y `docs/validation/2026-09-25_vae_representations/`.
+
+```bash
+python main.py --vae-categorical-representation embedding
+py tools/compare_vae_representations.py --individuals 600 --periods 14 --epochs 20 --seeds 11 23 37
+```
+
 ### Labels revisados por eventos y compuerta de supervisión
 
 `data.csv` no trae la columna target. Si existe una tabla aparte con los
@@ -368,7 +418,12 @@ python main.py --labels-path C:\datos\labels.csv --review-capacity-k 200
 python main.py --event-challengers off           # solo evaluar IF/VAE, sin challengers
 python main.py --event-challengers force         # exploratorio aunque la compuerta esté en rojo
 python main.py --no-run-event-supervision        # omite la Fase 8c
+python main.py --tune-with-labels off            # el tuneo del IF nunca usa los labels revisados
+python main.py --tune-min-positive-rows 20       # positivos mínimos en los meses de validación
+python main.py --iforest-max-samples-range 1024 16384   # rango absoluto de ψ (filas por árbol)
 ```
+
+**Tuneo con labels (Fase 5b).** Antes de tunear, si la compuerta 4.5 autoriza labels (nivel sobre rojo, sin vetos) y los meses de validación tienen suficientes positivos maduros, el tuner del IF maximiza el AP contra esos labels (solo como objetivo de validación, nunca para entrenar); si no, queda label-free. `--supervised` (ground truth) tiene prioridad.
 
 Salidas: `artifacts/reports/label_gate.json` (acta de la compuerta),
 `event_evaluation.csv` y `event_challengers.json`, y un capítulo en el reporte.
@@ -415,7 +470,8 @@ python main.py --rare-min-frequency 0.01   # agrupa más categorías raras antes
                                             # ranking de atribución del VAE — ver feature_attribution.xlsx,
                                             # hoja vae_by_source)
 python main.py --no-live-view    # no abre la vista de progreso local en el navegador
-python main.py --diagnostic-segment-column region  # apartado 8 por una columna propia
+python main.py --diagnostic-segment-column region  # apartado 8 por una columna propia (gana al archivo)
+python main.py --config otra.yaml                # otro archivo de configuración
 python main.py --diagnostic-experiment-capacity-grid 4 8 16  # refits VAE opt-in
 python main.py --no-auto-install-suite  # valida ifvae_diag, pero no lo instala
 python main.py --analyst-identity-column puesto  # identificación visible bajo el ID
@@ -561,8 +617,10 @@ PYTHONPATH=src python scripts/quality_gate.py    # pruebas + complejidad + mutan
 
 Se ejecutan por separado: ambos árboles tienen un paquete `scripts` de primer
 nivel y un solo `pytest` no puede recolectarlos juntos. Las pruebas que ajustan un
-VAE real usan el directorio de checkpoints por defecto (`artifacts/models/vae/`);
-ver `CONTEXT.md` → *Testing*.
+VAE real usan un directorio temporal de checkpoints (nunca `artifacts/models/vae/`);
+las reglas para añadir pruebas están en `CONTEXT.md` → *Testing*. Para verificar
+el pipeline completo, ejecutar `main.py` desde un directorio temporal, no desde la
+raíz del proyecto.
 
 ## Documentación
 

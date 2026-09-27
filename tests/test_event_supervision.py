@@ -7,6 +7,13 @@ panel whose positives are built to be learnable, so a correct implementation has
 a checkable answer.
 
 Run: ``python -m pytest tests/ -q``
+
+Data sources / inputs: temporary reviewed-label CSV files and seeded synthetic
+panel keys/features.
+Created: 2026-09-23
+Last modified: 2026-09-25
+Changelog:
+- 2026-09-25: Added exact-day point-in-time availability and maturity coverage.
 """
 
 from __future__ import annotations
@@ -539,6 +546,180 @@ class SupervisionPhaseTests(unittest.TestCase):
         self.assertEqual(result["gate"]["level"], "rojo")
         self.assertIn("no_confirmed_negatives", [v["code"] for v in result["gate"]["vetoes"]])
         self.assertGreater(result["gate"]["metrics"]["n_unreviewed_rows"], 3000)
+
+
+class LabelsForTuningTests(unittest.TestCase):
+    """Reviewed labels as an IF-tuning target: only when gate 4.5 authorises, validation months only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.keys = make_keys(150)
+        self.masks = make_masks(self.keys)
+        self.in_mask = self.masks["train"] | self.masks["val"]
+
+    def _prepare(self, plan, path=None):
+        from src.evaluation.event_supervision import prepare_event_labels
+        if path is None:
+            path = os.path.join(self.tmp.name, "reviewed_labels.csv")
+            write_labels(path, self.keys, plan)
+        cfg = EventSupervisionConfig(labels_path=path, labels_dir=None,
+                                     out_dir=os.path.join(self.tmp.name, "out"))
+        return cfg, prepare_event_labels(cfg=cfg, schema=SCHEMA, keys=self.keys, masks=self.masks)
+
+    def _tuning(self, prepared, **kw):
+        from src.evaluation.event_supervision import labels_for_tuning
+        return labels_for_tuning(prepared, in_mask=self.in_mask, val_mask=self.masks["val"], **kw)
+
+    def test_authorised_gate_gives_labels_only_on_validation_rows(self):
+        _, prepared = self._prepare(episode_plan(60))
+        self.assertNotEqual(prepared["gate"]["level"], "rojo")
+        res = self._tuning(prepared, min_positive_rows=3)
+        self.assertTrue(res["used"])
+        y = res["y"]
+        self.assertEqual(y.shape[0], int(self.in_mask.sum()))
+        val_in = self.masks["val"][self.in_mask]
+        self.assertTrue(np.isnan(y[~val_in]).all())          # never a label on the fit rows
+        self.assertTrue(set(np.unique(y[~np.isnan(y)])) <= {0.0, 1.0})
+        self.assertGreaterEqual(res["n_positive_rows"], 3)
+
+    def test_red_gate_keeps_tuning_label_free(self):
+        _, prepared = self._prepare(episode_plan(12))
+        self.assertEqual(prepared["gate"]["level"], "rojo")
+        res = self._tuning(prepared, min_positive_rows=1)
+        self.assertFalse(res["used"])
+        self.assertIsNone(res["y"])
+        self.assertIn("rojo", res["reason"])
+
+    def test_too_few_validation_positives_keeps_tuning_label_free(self):
+        _, prepared = self._prepare(episode_plan(60))
+        res = self._tuning(prepared, min_positive_rows=10_000)
+        self.assertFalse(res["used"])
+        self.assertIn("positive", res["reason"])
+
+    def test_missing_or_disabled_labels_never_raise(self):
+        self.assertFalse(self._tuning(None)["used"])
+        _, prepared = self._prepare(None, path=os.path.join(self.tmp.name, "absent.csv"))
+        self.assertEqual(prepared["status"], "no_labels_file")
+        self.assertFalse(self._tuning(prepared)["used"])
+
+    def test_phase_8c_reuses_the_prepared_labels(self):
+        plan = episode_plan(60)
+        cfg, prepared = self._prepare(plan)
+        scores, X, names = learnable_scores(self.keys, plan)
+        again = run_event_supervision(cfg=cfg, schema=SCHEMA, keys=self.keys, masks=self.masks,
+                                      scores=scores, X=X, feature_names=names, prepared=prepared)
+        fresh = run_event_supervision(cfg=cfg, schema=SCHEMA, keys=self.keys, masks=self.masks,
+                                      scores=scores, X=X, feature_names=names)
+        self.assertEqual(again["status"], "executed")
+        self.assertEqual(again["gate"]["level"], fresh["gate"]["level"])
+
+
+class LabelDefectRegressionTests(unittest.TestCase):
+    """Four defects found in the Phase 8c review (fail-open availability, contradictory
+    duplicates read as negatives, episodes spanning the fold boundary, '#' id collisions)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "reviewed_labels.csv")
+
+    def _row(self, keys, entity, m):
+        return ((keys["entity_id"] == entity) & (keys["period"] == month_start(m))).to_numpy()
+
+    def test_unreadable_availability_date_fails_closed(self):
+        keys = make_keys(5)
+        pd.DataFrame([
+            {"entity_id": "00001", "codmes": codmes(3), "target": 1, "label_available_at": "2022-05-01"},
+            {"entity_id": "00002", "codmes": codmes(3), "target": 1, "label_available_at": ""},
+            {"entity_id": "00003", "codmes": codmes(3), "target": 1, "label_available_at": "not a date"},
+            {"entity_id": "00004", "codmes": codmes(3), "target": 0, "label_available_at": "2030-01-01"},
+        ]).to_csv(self.path, index=False)
+        labels = load_event_labels(self.path, SCHEMA, keys)
+        self.assertTrue(labels.known[self._row(keys, "00001", 3)].all())        # readable and available
+        self.assertFalse(labels.known[self._row(keys, "00002", 3)].any())       # blank -> not usable
+        self.assertFalse(labels.known[self._row(keys, "00003", 3)].any())       # unparseable -> not usable
+        self.assertFalse(labels.known[self._row(keys, "00004", 3)].any())       # available in the future
+        self.assertEqual(labels.audit["excluded"].get("availability_unreadable"), 2)
+
+    def test_explicit_as_of_date_does_not_admit_a_label_from_later_that_month(self):
+        keys = make_keys(2)
+        pd.DataFrame([
+            {"entity_id": "00001", "codmes": codmes(3), "target": 1,
+             "label_available_at": "2022-05-31"},
+        ]).to_csv(self.path, index=False)
+        labels = load_event_labels(
+            self.path, SCHEMA, keys, LabelSpec(as_of="2022-05-01")
+        )
+        self.assertFalse(labels.known[self._row(keys, "00001", 3)].any())
+        self.assertEqual(labels.audit["excluded"].get("not_yet_available"), 1)
+
+    def test_explicit_maturity_after_exact_as_of_day_is_not_mature(self):
+        keys = make_keys(2)
+        pd.DataFrame([
+            {"entity_id": "00000", "codmes": codmes(3), "target": 1,
+             "episode_id": "before", "maturity_date": "2022-05-14"},
+            {"entity_id": "00001", "codmes": codmes(3), "target": 1,
+             "episode_id": "after", "maturity_date": "2022-05-16"},
+        ]).to_csv(self.path, index=False)
+
+        labels = load_event_labels(
+            self.path, SCHEMA, keys,
+            LabelSpec(as_of="2022-05-15", maturity_col="maturity_date"),
+        )
+
+        self.assertEqual(labels.audit["episodes_mature"], 1)
+        self.assertTrue(labels.episode_mature[self._row(keys, "00000", 3)].all())
+        self.assertFalse(labels.episode_mature[self._row(keys, "00001", 3)].any())
+
+    def test_contradictory_duplicates_stay_unknown_even_when_unlisted_means_negative(self):
+        keys = make_keys(5)
+        pd.DataFrame([
+            {"entity_id": "00001", "codmes": codmes(3), "target": 1},
+            {"entity_id": "00001", "codmes": codmes(3), "target": 0},
+            {"entity_id": "00002", "codmes": codmes(4), "target": 1},
+        ]).to_csv(self.path, index=False)
+        labels = load_event_labels(self.path, SCHEMA, keys, LabelSpec(unlisted_as_negative=True))
+        conflict = self._row(keys, "00001", 3)
+        self.assertFalse(labels.known[conflict].any())
+        self.assertTrue(np.isnan(labels.target[conflict]).all())
+        self.assertEqual(labels.audit["conflicting_duplicate_rows"], 2)
+        other = self._row(keys, "00003", 3)                    # a truly unlisted row does become 0
+        self.assertEqual(float(labels.target[other][0]), 0.0)
+
+    def test_an_episode_that_started_before_the_window_is_not_out_of_sample(self):
+        keys = make_keys(6)
+        masks = make_masks(keys)
+        eval_rows = masks["test"] | masks["oot"]                 # months 16+
+        rows = []
+        for m in (15, 16, 17):                                  # starts in validation, runs into test
+            rows.append({"entity_id": "00001", "codmes": codmes(m), "target": 1})
+        for m in (17, 18):                                      # starts inside test
+            rows.append({"entity_id": "00002", "codmes": codmes(m), "target": 1})
+        for m in (2, 3, 4, 5, 20, 21):
+            rows.append({"entity_id": "00003", "codmes": codmes(m), "target": 0})
+        pd.DataFrame(rows).to_csv(self.path, index=False)
+        labels = load_event_labels(self.path, SCHEMA, keys)
+        metrics = sufficiency_metrics(labels, eval_rows)
+        self.assertEqual(metrics["n_mature_positive_episodes"], 2)
+        self.assertEqual(metrics["oos_positive_episodes"], 1)     # only the one that started in test
+
+    def test_hash_in_entity_ids_cannot_merge_two_episodes(self):
+        months = [month_start(i) for i in range(N_MONTHS)]
+        keys = pd.DataFrame({"entity_id": np.repeat(["a", "a#1"], N_MONTHS),
+                             "period": np.tile(months, 2)})
+        pd.DataFrame([
+            {"entity_id": "a", "codmes": codmes(3), "target": 1, "episode_id": "1#2"},
+            {"entity_id": "a#1", "codmes": codmes(3), "target": 1, "episode_id": "2"},
+            {"entity_id": "a", "codmes": codmes(8), "target": 0, "episode_id": ""},
+        ]).to_csv(self.path, index=False)
+        labels = load_event_labels(self.path, SCHEMA, keys)
+        self.assertEqual(len(labels.episodes), 2)                 # was 1: both became "a#1#2"
+        self.assertEqual(len(set(labels.episode_id[labels.target == 1.0])), 2)
+        derived = os.path.join(self.tmp.name, "derived.csv")
+        pd.DataFrame([{"entity_id": e, "codmes": codmes(3), "target": 1} for e in ("a", "a#1")]
+                     ).to_csv(derived, index=False)
+        self.assertEqual(len(load_event_labels(derived, SCHEMA, keys).episodes), 2)
 
 
 if __name__ == "__main__":

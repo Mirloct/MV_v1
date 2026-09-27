@@ -1,0 +1,609 @@
+{
+  "summary": {
+    "arms": {
+      "onehot": {
+        "ap_raw": [
+          0.06334324434364175,
+          0.039143922532123544
+        ],
+        "tail_raw": [
+          2.198166594525971,
+          0.07967642842566595
+        ],
+        "win_spearman_raw": [
+          0.2697723115897544,
+          0.013339693427836212
+        ],
+        "win_jaccard_raw": [
+          0.03528188286808976,
+          0.005251749636899435
+        ],
+        "active_units": [
+          8.0,
+          0.0
+        ],
+        "latent_dim": [
+          8.0,
+          0.0
+        ],
+        "mean_kl": [
+          2.565122482520011,
+          0.21573731572909932
+        ],
+        "fit_seconds": [
+          6.615731500001857,
+          0.7801288848031541
+        ],
+        "fit_rss_delta_mb": [
+          12.4734375,
+          27.340110444164655
+        ],
+        "n_input_columns": [
+          66.0,
+          0.0
+        ],
+        "n_contributions": [
+          66.0,
+          0.0
+        ],
+        "n_reference_rows": [
+          3600.0,
+          0.0
+        ],
+        "seed_stability_jaccard_raw": [
+          0.7291372748766196,
+          0.0566137569436659
+        ],
+        "norm": {
+          "historical": {
+            "ap": [
+              0.01832995027771476,
+              0.0015011455315052844
+            ],
+            "tail": [
+              1.3885042282469566,
+              0.10827142189427555
+            ],
+            "win_spearman": [
+              0.7972193122758674,
+              0.026352522928881923
+            ],
+            "win_jaccard": [
+              0.2916456779935041,
+              0.11060527279713764
+            ],
+            "win_spearman_numeric_only": [
+              0.280167916021989,
+              0.017186833352529296
+            ],
+            "cat_share_of_slots": [
+              0.9606444444444444,
+              0.016695419642435993
+            ],
+            "cat_share_of_units": [
+              0.6515151515151515,
+              0.0
+            ],
+            "over_representation": [
+              1.474477519379845,
+              0.025625527823273823
+            ],
+            "rho_oot": [
+              -0.18516401995451032,
+              0.2350278605572013
+            ],
+            "rho_reference": [
+              -0.3518116379135696,
+              0.3128973664075202
+            ],
+            "spread_reference": [
+              2.0546420817193836,
+              0.3297778984889287
+            ],
+            "share_reference": [
+              0.9576333333333332,
+              0.010706638070161516
+            ],
+            "seed_stability_jaccard": [
+              0.36466251892519025,
+              0.0684941875698531
+            ],
+            "slot_rate_by_variable": {
+              "region": 0.595,
+              "segment": 1.0678888888888889,
+              "employment_status": 0.818888888888889,
+              "marital_status": 0.6302222222222222,
+              "product_type": 0.6955555555555556,
+              "transaction_channel": 0.9956666666666667
+            }
+          },
+          "centered": {
+            "ap": [
+              0.020201504944616977,
+              0.0014052058449832735
+            ],
+            "tail": [
+              2.0126927218661503,
+              0.053154410385363414
+            ],
+            "win_spearman": [
+              0.6288193000536112,
+              0.004501713652785855
+            ],
+            "win_jaccard": [
+              0.2589294184076793,
+              0.03499709533620898
+            ],
+            "win_spearman_numeric_only": [
+              0.24565898238606212,
+              0.008616969229561523
+            ],
+            "cat_share_of_slots": [
+              0.728111111111111,
+              0.0023544022333796643
+            ],
+            "cat_share_of_units": [
+              0.6515151515151515,
+              0.0
+            ],
+            "over_representation": [
+              1.1175658914728683,
+              0.003613733660536232
+            ],
+            "rho_oot": [
+              0.9258200997725515,
+              0.0
+            ],
+            "rho_reference": [
+              0.9073036977771005,
+              0.04140393356054122
+            ],
+            "spread_reference": [
+              1.4935887805446557,
+              0.07360428991899028
+            ],
+            "share_reference": [
+              0.6966444444444444,
+              0.005835925350050145
+            ],
+            "seed_stability_jaccard": [
+              0.837195025151579,
+              0.030696787181800425
+            ],
+            "slot_rate_by_variable": {
+              "region": 0.6005555555555555,
+              "segment": 0.4336666666666667,
+              "employment_status": 0.5267777777777778,
+              "marital_status": 0.5018888888888888,
+              "product_type": 0.6113333333333333,
+              "transaction_channel": 0.9663333333333334
+            }
+          }
+        },
+        "unseen": [
+          {
+            "variable": "region",
+            "ok": true,
+            "mean_score_before": 0.19675788875669242,
+            "mean_score_after": 0.19038100726902485,
+            "score_lift": -0.006376881487667561,
+            "share_rows_higher": 0.18,
+            "token_used": "infrequent bucket / all-zero one-hot (implicit)"
+          },
+          {
+            "variable": "region",
+            "ok": true,
+            "mean_score_before": 0.19946557190269232,
+            "mean_score_after": 0.19292856276035308,
+            "score_lift": -0.00653700914233923,
+            "share_rows_higher": 0.08,
+            "token_used": "infrequent bucket / all-zero one-hot (implicit)"
+          },
+          {
+            "variable": "region",
+            "ok": true,
+            "mean_score_before": 0.21432497546076776,
+            "mean_score_after": 0.20713998708873987,
+            "score_lift": -0.007184988372027874,
+            "share_rows_higher": 0.055,
+            "token_used": "infrequent bucket / all-zero one-hot (implicit)"
+          },
+          {
+            "variable": "region",
+            "ok": true,
+            "mean_score_before": 0.20870598170906304,
+            "mean_score_after": 0.2013517228141427,
+            "score_lift": -0.007354258894920349,
+            "share_rows_higher": 0.09,
+            "token_used": "infrequent bucket / all-zero one-hot (implicit)"
+          },
+          {
+            "variable": "region",
+            "ok": true,
+            "mean_score_before": 0.2082165629044175,
+            "mean_score_after": 0.2011940470710397,
+            "score_lift": -0.007022515833377838,
+            "share_rows_higher": 0.095,
+            "token_used": "infrequent bucket / all-zero one-hot (implicit)"
+          }
+        ]
+      },
+      "embedding": {
+        "ap_raw": [
+          0.13272779657806696,
+          0.00638819625978161
+        ],
+        "tail_raw": [
+          1.5357147551617065,
+          0.01880555173288088
+        ],
+        "win_spearman_raw": [
+          0.5579146475406874,
+          0.009160386755911422
+        ],
+        "win_jaccard_raw": [
+          0.053499221085427984,
+          0.010277466141229452
+        ],
+        "active_units": [
+          6.4,
+          0.8944271909999159
+        ],
+        "latent_dim": [
+          8.0,
+          0.0
+        ],
+        "mean_kl": [
+          0.8156600153065391,
+          0.049518142863964734
+        ],
+        "fit_seconds": [
+          3.0300811199995223,
+          0.030638949052130836
+        ],
+        "fit_rss_delta_mb": [
+          1.45234375,
+          1.2803844971137455
+        ],
+        "n_input_columns": [
+          29.0,
+          0.0
+        ],
+        "n_contributions": [
+          24.0,
+          0.0
+        ],
+        "n_reference_rows": [
+          3600.0,
+          0.0
+        ],
+        "seed_stability_jaccard_raw": [
+          0.8223017950858835,
+          0.029792740196085774
+        ],
+        "norm": {
+          "historical": {
+            "ap": [
+              0.3106356358671517,
+              0.0007557819209061456
+            ],
+            "tail": [
+              2.26114750139921,
+              0.2630492188026896
+            ],
+            "win_spearman": [
+              0.39018266384073286,
+              0.046076942580928655
+            ],
+            "win_jaccard": [
+              0.08322175908382805,
+              0.022225785137918605
+            ],
+            "win_spearman_numeric_only": [
+              0.3427424565068236,
+              0.03534328020318651
+            ],
+            "cat_share_of_slots": [
+              0.4139555555555555,
+              0.010409100956184887
+            ],
+            "cat_share_of_units": [
+              0.25,
+              0.0
+            ],
+            "over_representation": [
+              1.655822222222222,
+              0.04163640382473955
+            ],
+            "rho_oot": [
+              -0.7715167498104596,
+              0.2138089935299395
+            ],
+            "rho_reference": [
+              -0.9073036977771005,
+              0.041403933560541215
+            ],
+            "spread_reference": [
+              9.312639116506514,
+              3.813350503059959
+            ],
+            "share_reference": [
+              0.3987222222222222,
+              0.017317612172526115
+            ],
+            "seed_stability_jaccard": [
+              0.7820746086807896,
+              0.056844866210557295
+            ],
+            "slot_rate_by_variable": {
+              "region": 0.18944444444444444,
+              "segment": 0.726,
+              "employment_status": 0.3323333333333333,
+              "marital_status": 0.41288888888888897,
+              "product_type": 0.08755555555555557,
+              "transaction_channel": 0.32155555555555554
+            }
+          },
+          "centered": {
+            "ap": [
+              0.2199135913137431,
+              0.044937111816236774
+            ],
+            "tail": [
+              2.292847557914152,
+              0.028158288681561134
+            ],
+            "win_spearman": [
+              0.3822592884980236,
+              0.015517708831414699
+            ],
+            "win_jaccard": [
+              0.03950738916256157,
+              0.006117108010354832
+            ],
+            "win_spearman_numeric_only": [
+              0.34796903769177134,
+              0.013379393897878948
+            ],
+            "cat_share_of_slots": [
+              0.3466666666666667,
+              0.0032365581474732294
+            ],
+            "cat_share_of_units": [
+              0.25,
+              0.0
+            ],
+            "over_representation": [
+              1.3866666666666667,
+              0.012946232589892918
+            ],
+            "rho_oot": [
+              0.26013071705999263,
+              0.1887832147945679
+            ],
+            "rho_reference": [
+              -0.4197051118968901,
+              0.2144761058952722
+            ],
+            "spread_reference": [
+              1.137923812437457,
+              0.04022516965621384
+            ],
+            "share_reference": [
+              0.2982444444444444,
+              0.0017291973446631702
+            ],
+            "seed_stability_jaccard": [
+              0.8391663663442983,
+              0.033726883618721795
+            ],
+            "slot_rate_by_variable": {
+              "region": 0.21144444444444446,
+              "segment": 0.225,
+              "employment_status": 0.20400000000000001,
+              "marital_status": 0.20455555555555555,
+              "product_type": 0.2111111111111111,
+              "transaction_channel": 0.6772222222222222
+            }
+          }
+        },
+        "unseen": [
+          {
+            "variable": "region",
+            "ok": true,
+            "mean_score_before": 0.6435674124956131,
+            "mean_score_after": 0.8198644599318504,
+            "score_lift": 0.17629704743623734,
+            "share_rows_higher": 1.0,
+            "perturbed_variable_mean_rank": 1.0,
+            "token_used": "UNKNOWN (explicit)"
+          },
+          {
+            "variable": "region",
+            "ok": true,
+            "mean_score_before": 0.6404283218085766,
+            "mean_score_after": 0.8247271272540092,
+            "score_lift": 0.18429880544543267,
+            "share_rows_higher": 1.0,
+            "perturbed_variable_mean_rank": 1.0,
+            "token_used": "UNKNOWN (explicit)"
+          },
+          {
+            "variable": "region",
+            "ok": true,
+            "mean_score_before": 0.6444564642012119,
+            "mean_score_after": 0.8270961979031562,
+            "score_lift": 0.18263973370194436,
+            "share_rows_higher": 1.0,
+            "perturbed_variable_mean_rank": 1.005,
+            "token_used": "UNKNOWN (explicit)"
+          },
+          {
+            "variable": "region",
+            "ok": true,
+            "mean_score_before": 0.6530598056316376,
+            "mean_score_after": 0.826162956058979,
+            "score_lift": 0.17310315042734145,
+            "share_rows_higher": 1.0,
+            "perturbed_variable_mean_rank": 1.0,
+            "token_used": "UNKNOWN (explicit)"
+          },
+          {
+            "variable": "region",
+            "ok": true,
+            "mean_score_before": 0.6542115268111229,
+            "mean_score_after": 0.8225788384675979,
+            "score_lift": 0.16836731165647506,
+            "share_rows_higher": 1.0,
+            "perturbed_variable_mean_rank": 1.005,
+            "token_used": "UNKNOWN (explicit)"
+          }
+        ]
+      }
+    },
+    "alert_jaccard_A_vs_B": {
+      "raw": [
+        0.38468093241748486,
+        0.010651580867838689
+      ],
+      "recon_topk (pipeline: A historical, B centred)": [
+        0.06589567283461732,
+        0.03343185339025239
+      ]
+    },
+    "alert_budget_rows": 90,
+    "checkpoint_rejection": {
+      "onehot_payload_as_mixed_v1": "rejected",
+      "embedding_payload_as_onehot_v1": "rejected"
+    },
+    "layout": {
+      "columns": 29,
+      "onehot_columns": 66,
+      "categorical_variables": 6,
+      "scored_variables": 24,
+      "numeric_and_binary": 18,
+      "onehot_in_layout": 0,
+      "cardinalities": {
+        "region": 10,
+        "segment": 4,
+        "employment_status": 5,
+        "marital_status": 4,
+        "product_type": 10,
+        "transaction_channel": 10
+      },
+      "fingerprint": "47a4095973a3"
+    },
+    "calibration_leak_check": {
+      "vocabularies_subset_of_train_levels": true,
+      "train_rows": 3600
+    },
+    "config": {
+      "n_individuals": 600,
+      "n_periods": 14,
+      "data_seed": 7,
+      "seeds": [
+        11,
+        23,
+        37,
+        51,
+        67
+      ],
+      "epochs": 20,
+      "latent_dim": 8,
+      "hidden_dim": 64,
+      "n_layers": 2,
+      "batch_size": 256,
+      "alert_fraction": 0.05,
+      "top_k": 5,
+      "min_frequency": 0.001,
+      "n_unseen_rows": 200
+    }
+  },
+  "criteria": [
+    {
+      "criterion": "Ninguna columna one-hot entra al VAE (arm B)",
+      "passed": true,
+      "evidence": "29 columnas de entrada frente a 66 one-hot; columnas `cat__*` con rol distinto de índice: 0"
+    },
+    {
+      "criterion": "Cada categórica produce una sola contribución al score",
+      "passed": true,
+      "evidence": "6 variables categóricas -> 6 contribuciones; contribuciones totales por fila = 24 (= variables originales 24); el one-hot tiene 66 términos"
+    },
+    {
+      "criterion": "Categorías nuevas no causan errores",
+      "passed": true,
+      "evidence": "5/5 corridas con nivel nunca visto sin error; elevación media del score 0.1769"
+    },
+    {
+      "criterion": "Los checkpoints incompatibles se rechazan",
+      "passed": true,
+      "evidence": "{'onehot_payload_as_mixed_v1': 'rejected', 'embedding_payload_as_onehot_v1': 'rejected'}"
+    },
+    {
+      "criterion": "Sin fuga temporal en la calibración",
+      "passed": true,
+      "evidence": "vocabularios ⊂ niveles de train; filas de referencia de la normalización = 3600 (train = 3600)"
+    },
+    {
+      "criterion": "El top-k categórico deja de depender de la cardinalidad (referencia sin deriva; MISMA normalización centrada en A y B)",
+      "passed": true,
+      "evidence": "dispersión máx/mín de la tasa de lugares entre categóricas: A=1.49x B=1.14x (límite 1.5x y B<=A); lugares top-k categóricos: A=73% B=35% (peso de las categóricas entre las variables originales: 25%). Referencia: normalización histórica A=2.05x B=9.31x"
+    },
+    {
+      "criterion": "No empeora materialmente AP del score de alertas recon_topk — pipeline actual (A histórica, B centrada)",
+      "passed": true,
+      "evidence": "A=0.0183±0.0015  B=0.2199±0.0449 (tolerancia 0.0050)"
+    },
+    {
+      "criterion": "No empeora materialmente AP del score de alertas recon_topk — misma normalización centrada",
+      "passed": true,
+      "evidence": "A=0.0202±0.0014  B=0.2199±0.0449 (tolerancia 0.0050)"
+    },
+    {
+      "criterion": "No empeora materialmente tail separation del score de alertas recon_topk — pipeline actual (A histórica, B centrada)",
+      "passed": true,
+      "evidence": "A=1.3885±0.1083  B=2.2928±0.0282 (tolerancia 0.1083)"
+    },
+    {
+      "criterion": "No empeora materialmente tail separation del score de alertas recon_topk — misma normalización centrada",
+      "passed": true,
+      "evidence": "A=2.0127±0.0532  B=2.2928±0.0282 (tolerancia 0.1006)"
+    },
+    {
+      "criterion": "No empeora materialmente AP del score de producción del Excel",
+      "passed": true,
+      "evidence": "A=0.0633±0.0391  B=0.1327±0.0064 (tolerancia 0.0391)"
+    },
+    {
+      "criterion": "No empeora materialmente tail separation del score de producción del Excel",
+      "passed": false,
+      "evidence": "A=2.1982±0.0797  B=1.5357±0.0188 (tolerancia 0.1099)"
+    },
+    {
+      "criterion": "La estabilidad entre semillas no cae bajo el piso del control — pipeline actual",
+      "passed": true,
+      "evidence": "A=0.365  B=0.839  (piso = 80 % del control = 0.292)"
+    },
+    {
+      "criterion": "La estabilidad entre semillas no cae bajo el piso del control — misma normalización",
+      "passed": true,
+      "evidence": "A=0.837  B=0.839  (piso = 80 % del control = 0.670)"
+    },
+    {
+      "criterion": "La estabilidad entre ventanas no cae bajo el piso del control — Spearman, control literal: A completo (pipeline actual)",
+      "passed": false,
+      "evidence": "A=0.797  B=0.382  (piso = 80 % del control = 0.638); el control literal de A está inflado por atributos categóricos que no cambian entre meses"
+    },
+    {
+      "criterion": "La estabilidad entre ventanas no cae bajo el piso del control — Jaccard top-K, control literal: A completo (pipeline actual)",
+      "passed": false,
+      "evidence": "A=0.292  B=0.040  (piso = 80 % del control = 0.233); el control literal de A está inflado por atributos categóricos que no cambian entre meses"
+    },
+    {
+      "criterion": "La estabilidad entre ventanas no cae bajo el piso del control — Spearman, control equivalente: ambos solo variables numéricas",
+      "passed": true,
+      "evidence": "A=0.246  B=0.348  (piso = 80 % del control = 0.197)"
+    }
+  ]
+}

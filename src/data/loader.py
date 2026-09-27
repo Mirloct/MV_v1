@@ -69,6 +69,20 @@ class PanelSchema:
             provenance marker written alongside it. Consumers use it to keep
             development artifacts out of the official ones; see
             `paths.SYNTHETIC_MARKER` and `main.py`'s tuning phases.
+        identification_columns: Columns that are in the raw panel purely to
+            identify or describe a record for a human reader (job title, name,
+            area, an internal reference number, ...) and carry no modelling
+            signal. Set once, by `main.py`, from `data.identification_columns`
+            of `configs/pipeline.yaml` (plus `dashboard.identity_column`,
+            folded in automatically -- no need to list it twice). Every
+            phase that decides what the model sees calls :func:`key_columns`
+            instead of re-deriving its own column list, so adding a name here
+            is the *only* edit needed to keep it out of feature building, the
+            VAE's categorical sources, the exact-zero-row filter, the
+            transform-diagnostic scope and the post-training sensitivity
+            study. It is never hidden from a *display* context (the analyst
+            dashboard, the OOT Excel "VARIABLES" columns, the raw data
+            profile) -- identification is exactly what those are for.
     """
 
     time_col: Optional[str]
@@ -76,6 +90,15 @@ class PanelSchema:
     target_col: Optional[str]
     ground_truth_path: Optional[str] = None
     is_synthetic: bool = False
+    identification_columns: tuple = ()
+
+
+def key_columns(schema: "PanelSchema") -> set:
+    """Every column no modelling phase may see: the structural keys, the target (if inline) and
+    `schema.identification_columns`. The one place this set is assembled -- see `PanelSchema.identification_columns`.
+    """
+    return {c for c in (schema.entity_col, schema.time_col, schema.target_col,
+                       *getattr(schema, "identification_columns", ())) if c}
 
 
 def _infer_time_col(df: pd.DataFrame, logger: logging.Logger) -> Optional[str]:
@@ -329,9 +352,9 @@ def drop_exact_zero_rows(
 
     Args:
         df: The panel, as loaded (before any split).
-        schema: The panel's `PanelSchema`; `entity_col`/`time_col`/
-            `target_col` are excluded from the checked columns, as is
-            anything that is not numeric or boolean.
+        schema: The panel's `PanelSchema`; `key_columns(schema)` (structural
+            keys, target, `identification_columns`) is excluded from the
+            checked columns, as is anything that is not numeric or boolean.
         logger: Logger the caller already has, so this reuses the caller's
             phase context instead of opening a new one.
         cutoff: Minimum share (0, 1] of checked columns that must equal 0 for
@@ -343,7 +366,7 @@ def drop_exact_zero_rows(
         matched). `stats` has `n_rows_before`, `n_rows_dropped`,
         `n_rows_after`, `n_columns_checked`, and `cutoff`.
     """
-    key_cols = {c for c in (schema.entity_col, schema.time_col, schema.target_col) if c}
+    key_cols = key_columns(schema)
     check_cols = [
         c for c in df.columns
         if c not in key_cols

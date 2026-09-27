@@ -197,9 +197,9 @@ Optuna **ya explora** el espacio (`tune_iforest`, `tune_vae`), pero para
 *optimizar*, no para *medir sensibilidad*. La diferencia importa: un estudio de
 Optuna dice cuál es el mejor punto, no cuánto cambia el ranking al moverse.
 
-Espacio real del IF (`src/models/iforest.py`): `n_estimators` ∈ [100,600] paso
-50; `max_samples_mode` ∈ {auto, int, float}; `max_features` ∈ [0.3,1.0];
-`bootstrap` ∈ {True, False}.
+Espacio real del IF (`src/models/iforest.py`, desde 2026-09-24): `max_samples` entero
+absoluto ∈ [1 024, 32 768] (log, con tope en las filas de ajuste); `max_features` ∈
+[0.5, 1.0]; `n_estimators=300` y `bootstrap=False` fijos; `contamination` no se busca.
 
 Por configuración calcular **solo**: Spearman entre rankings, Pearson entre
 scores, Jaccard top-k, cambios en percentiles del score, concentración por

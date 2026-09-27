@@ -17,6 +17,11 @@ from src.models.stacking import (
     build_stacked_matrix,
     score_shift_report,
 )
+from src.models.mixed_vae import (
+    IncompatibleCheckpointError,
+    MixedVAEConfig,
+    MixedVAEModel,
+)
 from src.models.vae import (
     VAEDetector,
     VAEModel,
@@ -36,6 +41,9 @@ __all__ = [
     "score_shift_report",
     "DEFAULT_SCORE_FEATURE",
     "VAEModel",
+    "MixedVAEModel",
+    "MixedVAEConfig",
+    "IncompatibleCheckpointError",
     "VAEDetector",
     "tune_vae",
     "vae_loss",

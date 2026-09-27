@@ -79,8 +79,8 @@ falling through on failure, and logs which tier fired:
    Whether the installed `shap` version accepts a scikit-learn
    `IsolationForest` is version-dependent, so this may raise and trigger the
    fallback. Cost scales with **tree depth/leaf count** (driven by
-   `max_samples`, especially as a float fraction of a large training set —
-   see `CONTEXT.md`), not just feature count.
+   `max_samples` — since 2026-09-24 always an absolute row count, so the float-fraction
+   blow-up described in `CONTEXT.md` can no longer come from the tuner), not just feature count.
 2. **Model-agnostic `shap.Explainer`** over `detector.score_samples` with a
    small subsample masker — used when tier 1 raises. Cost scales with the
    **feature count** (each evaluation re-scores the forest ~`2*n_features+1`

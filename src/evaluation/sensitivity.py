@@ -26,7 +26,7 @@ import pandas as pd
 import scipy.sparse as sp
 from scipy.stats import ks_2samp, spearmanr
 
-from src.data.loader import PanelSchema
+from src.data.loader import PanelSchema, key_columns
 from src.utils import paths
 from src.utils.logging_config import log_phase, setup_logging
 from src.utils.progress import Bar, track
@@ -185,10 +185,16 @@ def _apply_loss(frame: pd.DataFrame, columns: Sequence[str], kind: str,
 
 
 def _stacked_matrix(X, X_if, stack_context: Optional[dict]):
-    if not stack_context:
+    if not stack_context or "detector" not in stack_context:
         return X
     stack_scores = stack_context["detector"].score_samples(X_if)
     score_col = np.asarray(stack_scores, dtype=float).reshape(-1, 1)
+    if stack_context.get("score_only_scaler"):
+        # Mixed VAE matrix: standardise ONLY the appended score column (categorical indices and
+        # binary flags must not be rescaled), with the scaler fitted on the train rows.
+        scaler = stack_context.get("scaler")
+        col = scaler.transform(score_col) if scaler is not None else score_col
+        return np.hstack([np.asarray(X, dtype=np.float32), col.astype(np.float32)])
     if sp.issparse(X):
         augmented = sp.hstack([X.tocsr(), sp.csr_matrix(score_col)], format="csr")
     else:
@@ -202,7 +208,9 @@ def _score_frame(frame: pd.DataFrame, preprocessor, feature_names: Sequence[str]
     eval_local_mask: np.ndarray) -> dict[str, np.ndarray]:
     X = preprocessor.transform(frame)
     X_if = _iforest_matrix(X, feature_names)
-    matrices = {"iforest": X_if, "vae": _stacked_matrix(X, X_if, stack_context)}
+    vae_view = (stack_context or {}).get("vae_view")
+    X_vae_base = vae_view.transform(frame, X) if vae_view is not None else X
+    matrices = {"iforest": X_if, "vae": _stacked_matrix(X_vae_base, X_if, stack_context)}
     return {
         name: np.asarray(runtime.detector.score_samples(matrices[name][eval_local_mask]), dtype=float)
         for name, runtime in runtimes.items()
@@ -505,7 +513,7 @@ def run_post_training_sensitivity(
     log = setup_logging()
     resolved_dir = out_dir or paths.REPORTS_DIR
     os.makedirs(resolved_dir, exist_ok=True)
-    key_cols = {c for c in (schema.entity_col, schema.time_col, schema.target_col) if c}
+    key_cols = key_columns(schema)
     input_columns = [c for c in df.columns if c not in key_cols and not pd.api.types.is_datetime64_any_dtype(df[c])]
     if not input_columns:
         raise ValueError("sensitivity analysis requires at least one model input column")
@@ -534,6 +542,8 @@ def run_post_training_sensitivity(
         name: {"base": base[:2000].tolist()} for name, base in baseline_eval.items()
     }
 
+    skipped_non_finite: list[dict] = []
+
     def evaluate(scenario_id: str, scenario_type: str, variables: Sequence[str],
                  fraction: float = 0.0, capture: bool = False) -> None:
         perturbation = "ablation" if scenario_type == "pruning_path" else scenario_type
@@ -542,6 +552,15 @@ def run_post_training_sensitivity(
             perturbed, preprocessor, feature_names, runtimes, stack_context, eval_local_mask
         )
         for name, values in scored.items():
+            bad = int((~np.isfinite(values)).sum())
+            if bad:
+                # A scenario the model cannot score is not evidence about the variable: ranking it would turn
+                # NaN into an extreme "leverage" (a null boolean input once came out as INDISPENSABLE).
+                skipped_non_finite.append({"scenario_id": scenario_id, "model": name,
+                                           "n_non_finite": bad, "n_records": int(len(values))})
+                log.warning("Sensitivity scenario %s skipped for %s: %d of %d scores are not finite.",
+                            scenario_id, name, bad, len(values))
+                continue
             metrics = _compare_scores(
                 baseline_eval[name], values, runtimes[name].threshold, y_eval
             )
@@ -644,6 +663,7 @@ def run_post_training_sensitivity(
                            "performance_loss_max": 0.02},
         "required_variables": required,
         "high_zero_summary": high_zero_summary,
+        "skipped_non_finite_scenarios": skipped_non_finite,
     }
 
     def _in_output(default_path: str) -> str:

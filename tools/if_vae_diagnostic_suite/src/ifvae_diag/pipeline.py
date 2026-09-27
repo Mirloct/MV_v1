@@ -103,13 +103,14 @@ def _score_reconstruction_candidates(
     scored_residual: np.ndarray,
     config: DiagnosticConfig,
 ) -> tuple[pd.DataFrame, pd.DataFrame, np.ndarray]:
+    floor, center = config.contribution_scale_floor, config.contribution_center
     reference_scores = reconstruction_scores(
-        reference_residual, reference_residual, config.top_k_residuals
+        reference_residual, reference_residual, config.top_k_residuals, floor, center
     )
     scored_scores = reconstruction_scores(
-        reference_residual, scored_residual, config.top_k_residuals
+        reference_residual, scored_residual, config.top_k_residuals, floor, center
     )
-    contributions = residual_contributions(reference_residual, scored_residual)
+    contributions = residual_contributions(reference_residual, scored_residual, floor, center)
     return reference_scores, scored_scores, contributions
 
 

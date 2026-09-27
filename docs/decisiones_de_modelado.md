@@ -51,18 +51,32 @@ Definidos en los presets de `main.py`:
 Parece al revés —el VAE tiene un espacio de búsqueda más grande— y sin embargo
 recibe menos pruebas. La razón no es estadística sino de **costo por prueba**.
 
-**Espacio de búsqueda del Isolation Forest** (`src/models/iforest.py`):
+**Espacio de búsqueda del Isolation Forest** (`src/models/iforest.py`, rediseñado el
+2026-09-24; validación en `CHANGELOG.md`):
 
-| Parámetro           | Rango                          | Cardinalidad |
-| ------------------- | ------------------------------ | ------------ |
-| `n_estimators`      | 100–600, paso 50               | 11 valores   |
-| `max_samples_mode`  | `auto` / `int` / `float`       | 3 (condicional) |
-| └ `max_samples`     | 0.3–1.0 (si `float`)           | continuo     |
-| └ `max_samples_int` | {64, 128, 256} (si `int`)      | 3            |
-| `max_features`      | 0.3–1.0                        | continuo     |
-| `bootstrap`         | {True, False}                  | 2            |
+| Parámetro           | Rango                                        | Cardinalidad |
+| ------------------- | -------------------------------------------- | ------------ |
+| `max_samples` (ψ)   | **entero absoluto** 1 024–32 768, log-uniforme, tope = filas de ajuste | continuo |
+| `max_features`      | 0.5–1.0                                      | continuo     |
+| `n_estimators`      | **fijo en 300** (no se busca)                | —            |
+| `bootstrap`         | **fijo en `False`**                          | —            |
+| `contamination`     | **no se busca** (punto de operación de `predict`) | —       |
 
-Son ~4 dimensiones efectivas, dos de ellas continuas y una condicional.
+Son 2 dimensiones continuas. Se exploran con una secuencia Sobol (no TPE: con 15
+pruebas ruidosas sobre una respuesta casi unidimensional no hay nada que modelar),
+precedida de *anclas* en ψ ∈ {1 024, 4 096, 16 384, 32 768}. La selección no es el
+argmax: se re-evalúa el default del paper (ψ=256) con varias semillas para medir el
+ruido, se elige la configuración **más barata dentro de 1 error estándar del mejor**
+y solo se acepta si supera al default por **más que el ruido**; si no, se queda el
+default. Con labels revisados autorizados por la compuerta 4.5 el objetivo es el AP
+contra esos labels (meses de validación); sin ellos, `tail_separation`.
+
+> **Por qué ya no se busca `n_estimators`.** El objetivo anterior (`rank_agreement`)
+> subía mecánicamente con el número de árboles (Spearman 0.87): el estudio se
+> pegaba al máximo del rango (~5× el costo) sin mejorar la detección real.
+> **Por qué ψ es absoluto.** Una fracción daba tres tamaños distintos (la mitad del
+> bloque de ajuste en el objetivo, todas las filas en el refit final, solo `train` en
+> el bosque de stacking): lo validado no era lo desplegado (desajuste 2.5×).
 
 **Espacio de búsqueda del VAE** (`src/models/vae.py`): 9 dimensiones —
 `latent_dim` [4,32], `lr` [1e-4,1e-3] log, `optimizer` {adam, adamw, rmsprop},

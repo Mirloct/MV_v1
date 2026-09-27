@@ -68,6 +68,17 @@ class ExactZeroRowFilterTests(unittest.TestCase):
         self.assertIn("3/5", message)
         self.assertIn("quedan 2 filas", message)
 
+    def test_a_numeric_identification_column_is_never_checked(self):
+        # A numeric employee reference is not model input; it happening to be 0 for every row
+        # must not count towards the zero share, the way an ID number never means "no data".
+        frame = _frame()
+        frame["employee_ref"] = 0
+        schema = PanelSchema(time_col="period", entity_col="entity_id", target_col=None,
+                             identification_columns=("employee_ref",))
+        out, stats = drop_exact_zero_rows(frame, schema, self.logger, cutoff=0.90)
+        self.assertEqual(out["entity_id"].tolist(), ["C", "D"])          # unchanged from the base case
+        self.assertEqual(stats["n_columns_checked"], 10)                 # employee_ref not among them
+
 
 if __name__ == "__main__":
     unittest.main()

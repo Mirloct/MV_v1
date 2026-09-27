@@ -43,7 +43,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from scipy import stats  # noqa: E402
 
-from src.data.loader import PanelSchema  # noqa: E402
+from src.data.loader import PanelSchema, key_columns  # noqa: E402
 from src.preprocessing.pipeline import NUMERIC_TRANSFORMS, make_numeric_transformer  # noqa: E402
 from src.utils import paths  # noqa: E402
 from src.utils.logging_config import log_phase, setup_logging  # noqa: E402
@@ -71,14 +71,13 @@ def infer_numeric_features(
 ) -> list[str]:
     """Return continuous numeric feature columns worth diagnosing.
 
-    Excludes the key columns and booleans. Low-cardinality integer-like columns
+    Excludes the key columns (`src.data.loader.key_columns`: structural keys, target,
+    `schema.identification_columns`) and booleans. Low-cardinality integer-like columns
     (<= 20 distinct values, e.g. small counts/scores) are dropped as well: a
     monotone transform of a near-discrete column is not what this diagnostic is
     for.
     """
-    keys = set()
-    if schema is not None:
-        keys = {schema.entity_col, schema.time_col, schema.target_col} - {None}
+    keys = key_columns(schema) if schema is not None else set()
     cols = []
     for col in df.columns:
         if col in keys:

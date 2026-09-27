@@ -228,7 +228,7 @@ FIGURE_NOTES: dict[str, str] = {
         "afirma."
     ),
     "vae_recon_by_feature": (
-        "Qué columnas de entrada reconstruye peor el VAE. Dado que el "
+        "Qué columnas (o, con embeddings, qué variables originales) reconstruye peor el VAE. Dado que el "
         "puntaje de anomalía ES el error de reconstrucción, los features en "
         "la parte superior de este gráfico son los que efectivamente "
         "impulsan la clasificación del VAE."
@@ -1116,7 +1116,9 @@ def _build_static_replacements(chart_data, go, np, emit, log) -> list:
                 margin=dict(l=220, r=24, t=52, b=48),
             ))
             fig.update_xaxes(title_text="importancia media |SHAP|" if model == "iforest"
-                             else "error cuadrático medio")
+                             else ("contribución normalizada media por variable original"
+                                   if static.get("recon_by_feature_kind") == "contribution"
+                                   else "error cuadrático medio"))
             _emit(fig, fig_id, title, note, [model])
             produced.append(fig_id)
         except Exception as exc:

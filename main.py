@@ -13,6 +13,15 @@ optional artifact fails.
 
 Run ``python main.py --help`` for the CLI. ``python main.py`` performs a quick
 CPU run; ``--full`` triggers the spec-scale run deliberately.
+
+Data sources / inputs: configured panel data, reviewed-label files, model
+artifacts, and ``configs/pipeline.yaml``; writes run models, diagnostics, and
+reporting context under the project artifact tree.
+Created: 2026-08-22
+Last modified: 2026-09-26
+Changelog:
+- 2026-09-26: Enforced the fixed IF/VAE training contract at dataclass, CLI,
+  YAML and full-run entry points.
 """
 
 from __future__ import annotations
@@ -20,6 +29,7 @@ from __future__ import annotations
 import argparse
 import os
 import signal
+import sys
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
@@ -56,6 +66,22 @@ IFOREST_MODEL = paths.IFOREST_MODEL
 VAE_MODEL = paths.VAE_MODEL
 IFOREST_BEST_PARAMS = paths.IFOREST_BEST_PARAMS
 VAE_BEST_PARAMS = paths.VAE_BEST_PARAMS
+
+_VAE_MAX_EPOCHS = 15
+_IFOREST_CONTAMINATION = 0.005
+
+
+def _enforce_model_training_contract(config: "PipelineConfig") -> "PipelineConfig":
+    """Normalize fixed training controls after every configuration entry point."""
+    config.vae_epochs = max(1, min(int(config.vae_epochs), _VAE_MAX_EPOCHS))
+    config.diagnostic_experiment_epoch_cap = max(
+        1, min(int(config.diagnostic_experiment_epoch_cap), _VAE_MAX_EPOCHS)
+    )
+    config.iforest_params["n_estimators"] = 300
+    config.iforest_params["contamination"] = _IFOREST_CONTAMINATION
+    config.vae_params["kl_anneal_epochs"] = 3
+    config.vae_params["early_stopping_patience"] = 3
+    return config
 
 
 # --------------------------------------------------------------------------- #
@@ -143,6 +169,15 @@ class PipelineConfig:
     # ``puesto``.  A missing column is rendered explicitly as "No disponible"
     # and never prevents the dashboard from being generated.
     analyst_identity_column: str = "puesto"
+    # Columns that exist in the raw panel purely to identify/describe a record for a
+    # human reader (job title, name, area, an internal reference number, ...) and carry
+    # no modelling signal: never a model feature, never checked by the exact-zero-row
+    # filter, never perturbed by the post-training sensitivity study, in EVERY run --
+    # `analyst_identity_column` above is folded in automatically, so it never needs to
+    # be repeated here. `main()` copies the resolved set onto `PanelSchema.
+    # identification_columns`, the single place every one of those phases reads it from
+    # (`src.data.loader.key_columns`) -- see CONTEXT.md "Identification columns".
+    identification_columns: tuple = ()
     # Headline deliverable: everyone at or above this percentile of the OOT
     # score distribution, each row graded p90/p95/p99 so the queue can be
     # triaged. A percentile rather than a fixed headcount because the cut then
@@ -201,6 +236,15 @@ class PipelineConfig:
     # that is not one of `df`'s columns logs a warning and falls back to
     # NOT_APPLICABLE for that run -- never a silent no-op.
     diagnostic_segment_column: Optional[str] = "segment"
+    # The single user-editable file (`configs/pipeline.yaml`, or `--config PATH`) that
+    # can set the segment column, the analyst identity column and the diagnostic
+    # grids in ONE place. `cli_explicit` = fields given on the command line (never
+    # overridden by the file); `config_sources` records where each file-managed value
+    # came from (cli / code / file / default) and lands in the run's resolved config.
+    # See `src/utils/config_file.py` for the precedence rules.
+    config_file: Optional[str] = None
+    cli_explicit: tuple = ()
+    config_sources: dict = field(default_factory=dict)
     # Auto-install the vendored IF-VAE Diagnostic Suite
     # (`tools/if_vae_diagnostic_suite`) into this environment on first use if
     # it is not already importable, instead of requiring a manual
@@ -213,9 +257,28 @@ class PipelineConfig:
     # refit is fast) so it runs by default; capacity/beta are VAE refits --
     # a FULL retrain per grid point -- so they default to an empty grid
     # (NOT_REQUESTED) and only run when explicitly configured.
-    diagnostic_experiment_contamination_grid: tuple = (0.01, 0.02, 0.05)
-    diagnostic_experiment_capacity_grid: tuple = ()
-    diagnostic_experiment_beta_grid: tuple = ()
+    diagnostic_experiment_contamination_grid: tuple = (0.02, 0.01, 0.005)
+    # Section 9 families that used to be NOT_REQUESTED are ACTIVE BY DEFAULT: latent
+    # capacity, beta + KL schedule, loss by feature type, feature-family ablation,
+    # temporal backtests and window stability (src/evaluation/ifvae_experiments.py).
+    # Grids: `None` = automatic points derived from the production detector; `()` =
+    # that sweep is switched off; values = explicit points. All of these live in the
+    # `experiments:` block of configs/pipeline.yaml. The VAE retrains share ONE
+    # budget (`..._vae_fit_budget`, 0 = no retrains), epochs are capped and very large
+    # fits subsampled so a default run stays affordable; what was capped is written
+    # into each row of the report.
+    diagnostic_experiment_capacity_grid: Optional[tuple] = None
+    diagnostic_experiment_beta_grid: Optional[tuple] = None
+    diagnostic_experiment_kl_grid: Optional[tuple] = None
+    diagnostic_experiment_families: tuple = (
+        "capacity", "beta_kl", "loss_by_type", "ablation", "backtest", "window_stability")
+    # 1 noise control + 5 capacity + 4 beta/KL + 3 ablation + 2 backtest + 1 one-hot control (embedding mode)
+    diagnostic_experiment_vae_fit_budget: int = 16
+    diagnostic_experiment_epoch_cap: int = 15
+    diagnostic_experiment_max_fit_rows: int = 300_000
+    diagnostic_backtest_origins: int = 6
+    diagnostic_backtest_vae_origins: int = 2
+    diagnostic_backtest_min_fit_periods: int = 4
     # Post-training robustness analysis. It reuses the already fitted
     # preprocessor and detectors (never refits) and introduces labels only for
     # post-hoc performance comparison when they exist.
@@ -277,13 +340,29 @@ class PipelineConfig:
     # fallback path used this dict's 0.02, so the effective contamination
     # changed depending on --tune/--no-tune with no warning. `max_samples`/
     # `max_features`/`bootstrap` apply to the untuned fallback fit only (the
-    # tuned path searches its own values for these, see docs/models_isolation_forest.md §2b).
+    # tuned path searches `max_samples`/`max_features` on its own, see
+    # docs/models_isolation_forest.md §2b). `n_estimators` is FIXED for both paths
+    # (tuning it only inflated the old objective). `max_samples` is an ABSOLUTE
+    # row count (rows per tree), never a fraction: the untuned default 4096 is the
+    # value the lab found robust on the synthetic panel, but the best size is
+    # regime-dependent -- run `--tune` on real data (the paper's 256 is the
+    # tuner's reference and is capped to the rows available).
     iforest_params: dict = field(
         default_factory=lambda: {
-            "n_estimators": 200, "contamination": 0.02,
-            "max_samples": "auto", "max_features": 1.0, "bootstrap": False,
+            "n_estimators": 300, "contamination": 0.005,
+            "max_samples": 4096, "max_features": 1.0, "bootstrap": False,
         }
     )
+    # Absolute `max_samples` range and `max_features` range of the IF tuner.
+    iforest_max_samples_range: tuple = (1024, 32768)
+    iforest_max_features_range: tuple = (0.5, 1.0)
+    # Model selection against reviewed labels. `auto`: when gate 4.5 authorises labels
+    # and the validation months hold >= `tune_min_positive_rows` mature positive rows,
+    # the IF tuner maximises average precision against them (the only real signal);
+    # otherwise it stays label-free (`tail_separation`). `off` never uses them.
+    # An explicit `--supervised` (ground-truth column) has priority over both.
+    tune_with_labels: str = "auto"
+    tune_min_positive_rows: int = 10
     # Held-out fraction of each Optuna trial's fit set, used by `tune_iforest`
     # for its rank-agreement objective (see docs/models_isolation_forest.md §3).
     iforest_holdout_frac: float = 0.3
@@ -297,6 +376,26 @@ class PipelineConfig:
     vae_tuning_early_stopping: dict = field(
         default_factory=lambda: {"patience": 10, "min_delta": 0.005, "min_trials": 10}
     )
+    # -- How the VAE sees categorical variables (src/models/mixed_vae.py) ---------------
+    # `onehot`: the original MLP VAE over the one-hot matrix (kept as the migration path and
+    # as the control of the A/B comparison). `embedding`: continuous + binary + ONE integer index
+    # per categorical variable (explicit MISSING / UNKNOWN tokens), a learned embedding per variable
+    # and one softmax head per variable, so each original variable yields exactly one
+    # reconstruction contribution. The IF is unaffected. Edit these in `vae:` of configs/pipeline.yaml.
+    vae_categorical_representation: str = "onehot"
+    vae_embedding_dimension_strategy: str = "auto"
+    vae_embedding_dimension: Optional[int] = None
+    vae_embedding_min_dimension: int = 2
+    vae_embedding_max_dimension: int = 32
+    vae_numeric_loss: str = "huber"
+    vae_boolean_loss: str = "binary_cross_entropy"
+    vae_categorical_loss: str = "cross_entropy"
+    vae_aggregate_by_original_feature: bool = True
+    vae_weight_numeric: float = 1.0
+    vae_weight_boolean: float = 1.0
+    vae_weight_categorical: float = 1.0
+    vae_unknown_category_policy: str = "explicit_token"
+    vae_missing_category_policy: str = "explicit_token"
     # VAE architecture/training params for the untuned fallback fit (the tuned
     # path searches its own values for most of these -- see
     # docs/models_vae.md §2b). Defaults mirror VAEDetector's own class
@@ -306,10 +405,13 @@ class PipelineConfig:
         default_factory=lambda: {
             "latent_dim": 8, "hidden_dim": 64, "n_layers": 2, "dropout": 0.0,
             "beta": 1.0, "lr": 1e-3, "optimizer": "adam", "batch_size": 256,
-            "weight_decay": 0.0, "activation": "relu", "kl_anneal_epochs": 10,
-            "early_stopping_patience": 10,
+            "weight_decay": 0.0, "activation": "relu", "kl_anneal_epochs": 3,
+            "early_stopping_patience": 3,
         }
     )
+
+    def __post_init__(self) -> None:
+        _enforce_model_training_contract(self)
 
     @property
     def deliverable_models(self) -> tuple:
@@ -347,6 +449,137 @@ def _read_best_params(path: str) -> dict:
         return data.get("best_params", {}) or {}
     except Exception:
         return {}
+
+
+def _event_supervision_config(config: "PipelineConfig"):
+    """Build the Phase 5b / 8c :class:`EventSupervisionConfig` from the pipeline config."""
+    from src.evaluation.event_labels import LabelSpec
+    from src.evaluation.event_supervision import EventSupervisionConfig
+    from src.models.event_challenger import ChallengerConfig
+
+    return EventSupervisionConfig(
+        labels_path=config.labels_path,
+        labels_dir=config.labels_dir,
+        spec=LabelSpec(
+            entity_col=config.labels_entity_col,
+            period_col=config.labels_period_col,
+            target_col=config.labels_target_col,
+            status_col=config.labels_status_col,
+            usable_statuses=tuple(s.lower() for s in config.labels_usable_statuses),
+            unlisted_as_negative=config.labels_unlisted_as_negative,
+            horizon_months=config.label_horizon_months,
+            confirm_delay_months=config.label_confirm_delay_months,
+            maturity_buffer_months=config.label_maturity_buffer_months,
+            washout_months=config.label_washout_months,
+            as_of=config.labels_as_of,
+        ),
+        challenger=ChallengerConfig(
+            hazard_horizon_months=config.hazard_horizon_months,
+            review_capacity_k=config.review_capacity_k,
+            n_boot=config.event_bootstrap_reps, seed=config.seed,
+        ),
+        challenger_mode=config.event_challengers,
+        formal_calculation_ok=config.labels_formal_calc_ok,
+        unlisted_attested=config.labels_audit_attested,
+        out_dir=REPORTS_DIR,
+    )
+
+
+def _validate_segment_column(config: "PipelineConfig", df, logger) -> None:
+    """Fail EARLY (before any fitting) when a segment the user asked for is missing.
+
+    A segment given by the user (config file / CLI / code) that is not a column of
+    the panel used to degrade to a one-line warning and an unexplained NOT_APPLICABLE
+    section at the very end of the run. Now an *explicit* request that cannot be met
+    stops the run up front, naming the column asked for, the closest match ignoring
+    case/whitespace and every available column; only the built-in default degrades
+    (warning + observability incident).
+    """
+    import difflib
+
+    name = (config.diagnostic_segment_column or "").strip()
+    if not name or name in df.columns:
+        return
+    norm = {str(c).strip().lower(): c for c in df.columns}
+    close = norm.get(name.lower()) or next(
+        iter(difflib.get_close_matches(name, [str(c) for c in df.columns], 1, 0.6)), None)
+    msg = (f"La columna de segmento {name!r} no existe en el panel. "
+           + (f"¿Quisiste decir {close!r}? " if close else "")
+           + f"Columnas disponibles: {', '.join(map(str, df.columns))}. "
+           "Corrígela en configs/pipeline.yaml (diagnostic.segment_column) o usa '' para desactivar.")
+    source = config.config_sources.get("diagnostic_segment_column", "default")
+    explicit = source != "default"
+    observability.check(
+        name="config.segment_column_present", category="data",
+        definition="The configured segment column exists in the panel.",
+        expected=f"{name!r} in panel columns", severity="critical" if explicit else "warning",
+        passed=False, observed={"requested": name, "closest": close, "source": source},
+        evidence="configs/pipeline.yaml",
+    )
+    if explicit:
+        raise ValueError(msg)
+    logger.warning("%s La sección 8 por segmento quedará NOT_APPLICABLE.", msg)
+
+
+def _resolve_identification_columns(config: "PipelineConfig", df, logger) -> tuple:
+    """The columns no modelling phase may see: ``identification_columns`` plus
+    ``analyst_identity_column`` (folded in automatically -- an identity column is by
+    definition "for identification, not for the model", so it never needs to be listed
+    twice). A configured name absent from this panel only warns: unlike the segment
+    column, nothing downstream breaks if it is a no-op here, and the same config file
+    is meant to run against panels that do not all carry the same optional columns.
+    """
+    requested = tuple(dict.fromkeys(  # de-dup, keep order
+        [c for c in config.identification_columns if c]
+        + ([config.analyst_identity_column] if config.analyst_identity_column else [])
+    ))
+    missing = [c for c in requested if c not in df.columns]
+    if missing:
+        logger.warning(
+            "identification_columns/dashboard.identity_column %s not in this panel; "
+            "ignored (no effect on feature building). Available columns: %s.",
+            missing, ", ".join(map(str, df.columns)),
+        )
+    resolved = tuple(c for c in requested if c in df.columns)
+    observability.check(
+        name="config.identification_columns_present", category="data",
+        definition="Every configured identification column exists in the panel and is "
+                   "excluded from every modelling phase (features, VAE categorical "
+                   "sources, exact-zero-row filter, transform diagnostics, sensitivity).",
+        expected="requested ⊆ panel columns", severity="warning", passed=not missing,
+        observed={"requested": list(requested), "resolved": list(resolved), "missing": missing},
+        evidence="configs/pipeline.yaml (data.identification_columns, dashboard.identity_column)",
+    )
+    return resolved
+
+
+def _mixed_vae_config(config: "PipelineConfig"):
+    """The embedding / loss / token settings of the mixed-type VAE (validated on construction)."""
+    from src.models.mixed_vae import MixedVAEConfig
+
+    return MixedVAEConfig(
+        embedding_dimension_strategy=config.vae_embedding_dimension_strategy,
+        embedding_dimension=config.vae_embedding_dimension,
+        embedding_min_dimension=config.vae_embedding_min_dimension,
+        embedding_max_dimension=config.vae_embedding_max_dimension,
+        numeric_loss=config.vae_numeric_loss, boolean_loss=config.vae_boolean_loss,
+        categorical_loss=config.vae_categorical_loss,
+        aggregate_by_original_feature=config.vae_aggregate_by_original_feature,
+        weight_numeric=config.vae_weight_numeric, weight_boolean=config.vae_weight_boolean,
+        weight_categorical=config.vae_weight_categorical,
+        unknown_category_policy=config.vae_unknown_category_policy,
+        missing_category_policy=config.vae_missing_category_policy,
+    )
+
+
+def _metric_matrix(detector, X_model):
+    """Distance-based views (silhouette, PCA/UMAP) must not read category *indices* as magnitudes:
+    for the mixed VAE they use the continuous / binary / missing-flag block only."""
+    layout = getattr(detector, "layout", None)
+    if layout is None:
+        return X_model
+    keep = np.concatenate([layout.positions("num"), layout.positions("bool"), layout.positions("flag")])
+    return np.asarray(X_model)[:, np.sort(keep)]
 
 
 def _add_fig(figs: list, title: str, path: Optional[str]) -> None:
@@ -422,8 +655,17 @@ def run_pipeline(config: PipelineConfig) -> dict:
             logger.removeHandler(_h)
     incident_collector = IncidentCollector()
     logger.addHandler(incident_collector)
+    from src.utils.config_file import apply_config_file, find_config_file
+
+    _cfg_report = apply_config_file(
+        config, find_config_file(config.config_file), frozenset(config.cli_explicit)
+    )
+    _enforce_model_training_contract(config)
+    config.config_sources = dict(_cfg_report["sources"])
     logger.info("=" * 72)
     logger.info("Anomaly-detection pipeline starting")
+    logger.info("Configuration file: %s | sources: %s",
+                _cfg_report["path"] or "(none found)", config.config_sources)
     logger.info("Effective config: %s", asdict(config))
     ctx = observability.start_run(config=asdict(config), seed=config.seed)
     logger.info("Run ID: %s (config_hash=%s) -- structured events: %s",
@@ -512,6 +754,12 @@ def run_pipeline(config: PipelineConfig) -> dict:
             n_periods=config.n_periods,
             seed=config.seed,
         )
+        # Set once, here, before anything reads `schema`: every phase that decides what
+        # the model sees (feature building, VAE categorical sources, the exact-zero-row
+        # filter below, transform diagnostics, post-training sensitivity) calls
+        # `src.data.loader.key_columns(schema)` instead of keeping its own column list,
+        # so this is the only place identification columns need to be resolved.
+        schema.identification_columns = _resolve_identification_columns(config, df, logger)
         # -- exact-zero row filter ------------------------------------------- #
         # Hard exclusion, applied to `df` itself before the chronological
         # split, any fit, and every export: a row whose input columns are
@@ -521,6 +769,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         # Phase 9d -- which only *measures* such rows' effect on fitted
         # models -- this removes them, so nothing downstream ever sees them.
         # The helper logs rows before / dropped / after to execution.log.
+        _validate_segment_column(config, df, logger)
         df, zero_filter_stats = drop_exact_zero_rows(
             df, schema, logger, cutoff=config.exact_zero_row_cutoff,
         )
@@ -815,6 +1064,52 @@ def run_pipeline(config: PipelineConfig) -> dict:
             int(oot_mask.sum()), oot_period_str,
         )
 
+    # -- Phase 5b: reviewed labels + gate 4.5, BEFORE tuning ----------------- #
+    # The labels file is read here (not only in Phase 8c) because gate 4.5 decides
+    # whether the IF tuner may select hyper-parameters against reviewed labels --
+    # the only real signal available. Labels reach the tuner as a held-out target
+    # for the validation months only (never as training data). Any failure or a
+    # red gate leaves tuning label-free; Phase 8c reuses this same load.
+    event_prepared = None
+    tuning_labels = {"y": None, "used": False, "reason": "not evaluated"}
+    if config.run_event_supervision and config.tune and config.tune_with_labels != "off" \
+            and not supervised:
+        with log_phase("Phase 5b: reviewed labels for tuning (gate 4.5)"):
+            try:
+                from src.evaluation.event_labels import LabelSpec
+                from src.evaluation.event_supervision import (
+                    labels_for_tuning,
+                    prepare_event_labels,
+                )
+
+                event_prepared = prepare_event_labels(
+                    cfg=_event_supervision_config(config), schema=schema, keys=keys,
+                    masks={"train": train_mask, "val": val_mask,
+                           "test": test_mask, "oot": oot_mask},
+                )
+                tuning_labels = labels_for_tuning(
+                    event_prepared, in_mask=in_mask, val_mask=val_mask,
+                    min_positive_rows=config.tune_min_positive_rows,
+                )
+            except Exception as exc:  # noqa: BLE001 - labels are optional, never block tuning
+                event_prepared = None
+                tuning_labels = {"y": None, "used": False, "reason": f"labels step failed: {exc}"}
+                logger.warning("Reviewed labels for tuning failed (%s); tuning stays label-free.", exc)
+            logger.info(
+                "Tuning objective: %s (%s)",
+                "reviewed labels (AP on validation months)" if tuning_labels["used"] else "label-free (tail_separation)",
+                tuning_labels["reason"],
+            )
+            observability.check(
+                name="tuning.objective_source", category="training",
+                definition="Which signal selects the IF hyper-parameters: reviewed labels "
+                           "(only when gate 4.5 authorises them) or the label-free proxy.",
+                expected="labels used only when authorised by gate 4.5 and enough validation positives",
+                severity="info", passed=True,
+                observed={k: v for k, v in tuning_labels.items() if k != "y"},
+                evidence="src.evaluation.event_supervision.labels_for_tuning",
+            )
+
     # -- Phase 6: Isolation Forest ------------------------------------------ #
     with log_phase("Phase 6: Isolation Forest"):
         from src.models import (
@@ -824,23 +1119,37 @@ def run_pipeline(config: PipelineConfig) -> dict:
         )
 
         # Blocking gate: validates the *fallback* config (used verbatim when
-        # --no-tune, and as the seed for the tuning search space either way);
-        # a bad contamination value here would otherwise surface only much
-        # later as a silently-wrong threshold.
+        # --no-tune); a bad contamination value here would otherwise surface
+        # only much later as a silently-wrong threshold.
         assumptions.validate_iforest_config(
-            contamination=config.iforest_params.get("contamination", 0.02),
-            n_estimators=config.iforest_params.get("n_estimators", 200),
-            max_samples=config.iforest_params.get("max_samples", "auto"),
+            contamination=config.iforest_params.get("contamination", 0.005),
+            n_estimators=config.iforest_params.get("n_estimators", 300),
+            max_samples=config.iforest_params.get("max_samples", 4096),
         )
         assumptions.validate_matrix_for_fit(X_in, "iforest")
 
+        # Absolute `max_samples` never exceeds the rows the forest is fitted on.
+        fallback_if_params = dict(config.iforest_params)
+        if isinstance(fallback_if_params.get("max_samples"), int):
+            fallback_if_params["max_samples"] = min(fallback_if_params["max_samples"], X_in.shape[0])
+
         if_detector = None
+        if_tuning_ok = False
         if config.tune:
             try:
+                # Priority: explicit ground truth (--supervised) > reviewed labels
+                # authorised by gate 4.5 > label-free tail_separation.
+                if supervised:
+                    tune_y, tune_label_source = labels_in, "ground_truth"
+                elif tuning_labels["used"]:
+                    tune_y, tune_label_source = tuning_labels["y"], "reviewed_labels"
+                else:
+                    tune_y, tune_label_source = None, "labels"
                 tune_iforest(
                     X_in,
                     n_trials=config.iforest_trials,
-                    y=(labels_in if supervised else None),
+                    y=tune_y,
+                    label_source=tune_label_source,
                     random_state=config.seed,
                     # Passed explicitly, not left to the module defaults: on a
                     # synthetic run these point under `_dev/`.
@@ -853,29 +1162,49 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     valid_mask=valid_local,
                     groups=entities_in,
                     feature_names=names_if,
-                    # Centralized here (PipelineConfig.iforest_params) so the
-                    # tuned and untuned paths never silently disagree on the
-                    # operating-point contamination -- see the field's
-                    # docstring above for the inconsistency this closes.
-                    contamination=config.iforest_params.get("contamination", 0.02),
+                    # Only the deployed detector's operating point; it does not
+                    # take part in model selection.
+                    contamination=config.iforest_params.get("contamination", 0.005),
+                    n_estimators=config.iforest_params.get("n_estimators", 300),
+                    max_samples_range=tuple(config.iforest_max_samples_range),
+                    max_features_range=tuple(config.iforest_max_features_range),
+                    bootstrap=bool(config.iforest_params.get("bootstrap", False)),
                     holdout_frac=config.iforest_holdout_frac,
                     early_stopping_patience=config.iforest_tuning_early_stopping["patience"],
                     early_stopping_min_delta=config.iforest_tuning_early_stopping["min_delta"],
                     early_stopping_min_trials=config.iforest_tuning_early_stopping["min_trials"],
                 )
                 if_detector = IsolationForestDetector.load(IFOREST_MODEL)
+                if_tuning_ok = True
             except Exception as exc:
-                logger.warning(
-                    "iForest tuning/load failed (%s); fitting default detector.", exc
+                logger.error(
+                    "iForest tuning/load failed (%s); fitting the default detector %s.",
+                    exc, {k: fallback_if_params[k] for k in ("n_estimators", "max_samples", "max_features")},
                 )
+            observability.check(
+                name="tuning.iforest_completed", category="training",
+                definition="The IF tuning study finished and its refit model was loaded.",
+                expected="tuning completes; otherwise the run falls back to the default forest",
+                severity="warning", passed=if_tuning_ok,
+                observed={"tuned": if_tuning_ok, "fallback_params": fallback_if_params},
+                failure_action="The default forest was used; its parameters are recorded, and any "
+                               "stale best-params YAML from an earlier run is ignored.",
+                evidence=IFOREST_BEST_PARAMS,
+            )
         if if_detector is None:
             if_detector = IsolationForestDetector(
-                random_state=config.seed, **config.iforest_params
+                random_state=config.seed, **fallback_if_params
             )
             if_detector.fit(X_in)
 
         if_scores = if_detector.score_samples(X_if)
-        if_best_params = _read_best_params(IFOREST_BEST_PARAMS) or dict(config.iforest_params)
+        # A YAML left by an earlier run must not describe this run's model when
+        # tuning failed or was off: use the params of the detector actually fitted.
+        if_best_params = (
+            (_read_best_params(IFOREST_BEST_PARAMS) if if_tuning_ok else {})
+            or {k: getattr(if_detector, k) for k in
+                ("n_estimators", "max_samples", "max_features", "contamination", "bootstrap")}
+        )
         _add_fig(
             figures,
             "Isolation Forest score distribution",
@@ -999,6 +1328,46 @@ def run_pipeline(config: PipelineConfig) -> dict:
     # forest finds each row.
     X_vae, vae_feature_names = X, feature_names
     stack_info = None
+    # -- VAE view. IF keeps its own matrix (`X_if`, one-hot withheld). `onehot`: the VAE gets the
+    # full matrix as before. `embedding`: continuous + binary + missing-flag columns taken from the
+    # same causal preprocessing, plus ONE integer index per categorical variable (MISSING / UNKNOWN
+    # tokens; vocabularies learned on the train rows only) -- no one-hot column enters the VAE.
+    vae_layout = vae_builder = vae_mixed_cfg = None
+    _stack_scaler = None
+    if config.vae_categorical_representation == "embedding":
+        with log_phase("Phase 6a: VAE mixed-type view (embeddings)"):
+            from src.preprocessing.mixed_view import (
+                MixedViewBuilder,
+                MixedViewConfig,
+                assert_no_onehot,
+                categorical_sources,
+            )
+
+            vae_mixed_cfg = _mixed_vae_config(config)
+            vae_builder = MixedViewBuilder(MixedViewConfig(
+                min_frequency=config.rare_min_frequency,
+                unknown_category_policy=config.vae_unknown_category_policy,
+                missing_category_policy=config.vae_missing_category_policy,
+            ))
+            X_vae = vae_builder.fit_transform(df, X, feature_names, train_mask, categorical_sources(df, schema))
+            vae_layout = vae_builder.layout
+            vae_feature_names = list(vae_layout.columns)
+            assert_no_onehot(vae_layout)
+            logger.info(
+                "VAE view: %d columns (%d numeric, %d binary, %d missing-flag, %d categorical index) "
+                "instead of %d one-hot-expanded columns; cardinalities %s; layout %s",
+                vae_layout.n_columns, len(vae_layout.names("num")), len(vae_layout.names("bool")),
+                len(vae_layout.names("flag")), len(vae_layout.names("cat")), len(feature_names),
+                {s.name: s.cardinality for s in vae_layout.cat_specs()}, vae_layout.fingerprint(),
+            )
+            observability.check(
+                name="vae.no_onehot_input", category="data",
+                definition="No one-hot dummy column enters the VAE: every categorical variable is one index column.",
+                expected="no cat__ column with a role other than 'cat'", severity="critical", passed=True,
+                observed={"columns": vae_layout.n_columns, "categorical_variables": len(vae_layout.names("cat")),
+                          "onehot_columns_replaced": int(sum(n.startswith("cat__") for n in feature_names))},
+                evidence="src/preprocessing/mixed_view.py",
+            )
     if config.stack_iforest_into_vae:
         with log_phase("Phase 6b: IF -> VAE stacking"):
             from src.models import build_stacked_matrix, score_shift_report
@@ -1024,13 +1393,27 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 stack_scores, train_mask,
                 {"validation": val_mask, "test": test_mask, "oot": oot_mask},
             )
-            stacked = build_stacked_matrix(
-                X, stack_scores, fit_mask=train_mask, feature_names=feature_names,
-            )
-            X_vae, vae_feature_names = stacked.X, stacked.feature_names
+            if vae_layout is None:
+                stacked = build_stacked_matrix(
+                    X, stack_scores, fit_mask=train_mask, feature_names=feature_names,
+                )
+                X_vae, vae_feature_names = stacked.X, stacked.feature_names
+                _stack_score_name = stacked.score_name
+                _stack_scaler = stacked.scaler
+            else:
+                # Mixed matrix: only the appended score is standardised (train rows only); the
+                # category indices and binary flags must stay as they are.
+                from sklearn.preprocessing import StandardScaler
+                from src.models.stacking import DEFAULT_SCORE_FEATURE
+
+                _stack_scaler = StandardScaler().fit(np.asarray(stack_scores, float)[train_mask].reshape(-1, 1))
+                col = _stack_scaler.transform(np.asarray(stack_scores, float).reshape(-1, 1)).astype(np.float32)
+                X_vae = np.hstack([X_vae, col])
+                _stack_score_name = DEFAULT_SCORE_FEATURE
+                vae_layout = vae_layout.with_extra_numeric(_stack_score_name)
+                vae_feature_names = list(vae_layout.columns)
             logger.info(
-                "VAE input: %d -> %d features (last column = %r)",
-                stacked.n_original, X_vae.shape[1], stacked.score_name,
+                "VAE input: %d columns (last column = %r)", X_vae.shape[1], _stack_score_name,
             )
 
     # -- Phase 7: VAE ------------------------------------------------------- #
@@ -1045,12 +1428,20 @@ def run_pipeline(config: PipelineConfig) -> dict:
         X_vae_in = X_vae[in_mask]
         assumptions.validate_matrix_for_fit(X_vae_in, "vae")
         vae_detector = None
+        vae_tuning_ok = False
+        # Architecture the run is configured for: a checkpoint of the other one is REJECTED on load.
+        _vae_arch = "mixed_v1" if vae_layout is not None else "onehot_v1"
+        _vae_fp = None if vae_layout is None else vae_mixed_cfg.fingerprint(vae_layout)
+        _vae_kwargs = {} if vae_layout is None else {"layout": vae_layout, "mixed_config": vae_mixed_cfg}
         if config.tune:
             try:
                 tune_vae(
                     X_vae_in,
                     n_trials=config.vae_trials,
-                    y=(labels_in if supervised else None),
+                    # Ground truth (--supervised) > reviewed labels authorised by gate 4.5 (partial: NaN =
+                    # unknown, validation months only) > label-free ELBO.
+                    y=(labels_in if supervised else (tuning_labels["y"] if tuning_labels["used"] else None)),
+                    label_source=("ground_truth" if supervised else "reviewed_labels"),
                     max_epochs=config.vae_epochs,
                     random_state=config.seed,
                     # Explicit, so a synthetic run writes under `_dev/`.
@@ -1064,15 +1455,29 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     early_stopping_patience=config.vae_tuning_early_stopping["patience"],
                     early_stopping_min_delta=config.vae_tuning_early_stopping["min_delta"],
                     early_stopping_min_trials=config.vae_tuning_early_stopping["min_trials"],
+                    feature_names=vae_feature_names,
+                    **_vae_kwargs,
                 )
-                vae_detector = VAEDetector.load(VAE_MODEL)
+                vae_detector = VAEDetector.load(VAE_MODEL, expect_architecture=_vae_arch,
+                                                expect_fingerprint=_vae_fp)
+                vae_tuning_ok = True
             except Exception as exc:
-                logger.warning(
-                    "VAE tuning/load failed (%s); fitting default detector.", exc
+                logger.error(
+                    "VAE tuning/load failed (%s); fitting the default detector.", exc
                 )
+            observability.check(
+                name="tuning.vae_completed", category="training",
+                definition="The VAE tuning study finished and its refit model was loaded.",
+                expected="tuning completes; otherwise the run falls back to the default VAE",
+                severity="warning", passed=vae_tuning_ok,
+                observed={"tuned": vae_tuning_ok},
+                failure_action="The default VAE was used; a best-params YAML left by an "
+                               "earlier run is ignored.",
+                evidence=VAE_BEST_PARAMS,
+            )
         if vae_detector is None:
             vae_detector = VAEDetector(
-                random_state=config.seed, epochs=config.vae_epochs, **config.vae_params
+                random_state=config.seed, epochs=config.vae_epochs, **config.vae_params, **_vae_kwargs
             )
             # `valid_mask=valid_local` is NOT optional here. Without it `fit`
             # falls back to a shuffled 10% split, which in a panel draws its
@@ -1085,7 +1490,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             vae_detector.fit(X_vae_in, valid_mask=valid_local)
 
         vae_scores = vae_detector.score_samples(X_vae)
-        vae_best_params = _read_best_params(VAE_BEST_PARAMS)
+        vae_best_params = _read_best_params(VAE_BEST_PARAMS) if vae_tuning_ok else {}
         _add_fig(
             figures,
             "VAE reconstruction-error distribution",
@@ -1174,8 +1579,9 @@ def run_pipeline(config: PipelineConfig) -> dict:
         with log_phase(f"Phase 8: evaluation [{name}]"):
             from src.evaluation import plot_embedding, plot_roc_pr
 
+            X_metric = _metric_matrix(detector, X_model)
             metrics = _model_metrics(
-                supervised, labels, scores, eval_mask, X_model, label_types=label_types
+                supervised, labels, scores, eval_mask, X_metric, label_types=label_types
             )
             model_specs[name] = {"best_params": best_params, "metrics": metrics}
             if name in model_latent_diagnostics:
@@ -1240,7 +1646,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     figures,
                     f"{name} PCA embedding",
                     plot_embedding(
-                        X_model, scores, method="pca",
+                        X_metric, scores, method="pca",
                         y=(labels if supervised else None),
                         filename=f"embedding_{name}_pca.png",
                     ),
@@ -1249,7 +1655,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 logger.warning("plot_embedding(pca) failed for %s (%s).", name, exc)
             try:  # UMAP is optional; falls back internally but guard the import too
                 emb_path, emb_data = plot_embedding(
-                    X_model, scores, method="umap",
+                    X_metric, scores, method="umap",
                     y=(labels if supervised else None),
                     filename=f"embedding_{name}_umap.png",
                     return_data=True,
@@ -1450,40 +1856,11 @@ def run_pipeline(config: PipelineConfig) -> dict:
     if config.run_event_supervision:
         with log_phase("Phase 8c: event labels, gate 4.5 and challengers"):
             try:
-                from src.evaluation.event_labels import LabelSpec
-                from src.evaluation.event_supervision import (
-                    EventSupervisionConfig,
-                    run_event_supervision,
-                )
-                from src.models.event_challenger import ChallengerConfig
+                from src.evaluation.event_supervision import run_event_supervision
 
                 event_supervision_result = run_event_supervision(
-                    cfg=EventSupervisionConfig(
-                        labels_path=config.labels_path,
-                        labels_dir=config.labels_dir,
-                        spec=LabelSpec(
-                            entity_col=config.labels_entity_col,
-                            period_col=config.labels_period_col,
-                            target_col=config.labels_target_col,
-                            status_col=config.labels_status_col,
-                            usable_statuses=tuple(s.lower() for s in config.labels_usable_statuses),
-                            unlisted_as_negative=config.labels_unlisted_as_negative,
-                            horizon_months=config.label_horizon_months,
-                            confirm_delay_months=config.label_confirm_delay_months,
-                            maturity_buffer_months=config.label_maturity_buffer_months,
-                            washout_months=config.label_washout_months,
-                            as_of=config.labels_as_of,
-                        ),
-                        challenger=ChallengerConfig(
-                            hazard_horizon_months=config.hazard_horizon_months,
-                            review_capacity_k=config.review_capacity_k,
-                            n_boot=config.event_bootstrap_reps, seed=config.seed,
-                        ),
-                        challenger_mode=config.event_challengers,
-                        formal_calculation_ok=config.labels_formal_calc_ok,
-                        unlisted_attested=config.labels_audit_attested,
-                        out_dir=REPORTS_DIR,
-                    ),
+                    cfg=_event_supervision_config(config),
+                    prepared=event_prepared,
                     schema=schema, keys=keys,
                     masks={"train": train_mask, "val": val_mask,
                            "test": test_mask, "oot": oot_mask},
@@ -1641,7 +2018,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 # pre-stacking one -- so nothing about the detectors is
                 # asserted that the run did not actually do.
                 _stacked = bool(config.stack_iforest_into_vae)
-                _derived = [f for f in models["vae"][4] if f not in set(feature_names)]
+                _derived = [_stack_score_name] if config.stack_iforest_into_vae else []
                 _run_meta = {
                     "run_id": ctx.run_id,
                     "generated_at": generated_at,
@@ -1690,6 +2067,43 @@ def run_pipeline(config: PipelineConfig) -> dict:
                         _segment_col, ", ".join(df.columns[:20]),
                     )
                     _segment = None
+                # Context for the section-9 experiment families (retrains, ablations,
+                # rolling-origin backtests); built by the same function the tests use.
+                from src.evaluation.ifvae_experiments import build_experiment_context
+
+                _experiment_ctx = build_experiment_context(
+                    df=df, schema=schema, keys=keys,
+                    x_if_all=models["iforest"][3], if_feature_names=names_if,
+                    x_vae_all=models["vae"][3], vae_feature_names=models["vae"][4],
+                    if_detector=models["iforest"][0], vae_detector=models["vae"][0],
+                    train_mask=train_mask, in_mask=in_mask, oot_mask=oot_mask,
+                    valid_local=valid_local, n_val_periods=config.n_val_periods,
+                    derived_features=_derived, fitted_preprocessor=fitted_preprocessor,
+                    x_onehot_all=X, onehot_feature_names=feature_names,
+                    vae_builder=vae_builder, mixed_config=vae_mixed_cfg,
+                    stack_scaler=_stack_scaler if config.stack_iforest_into_vae else None,
+                    prep_kwargs={
+                        "numeric_transform": config.numeric_transform,
+                        "categorical_encoding": config.categorical_encoding,
+                        "rare_min_frequency": config.rare_min_frequency,
+                        "impute_numeric": config.impute_numeric,
+                        "add_panel_features": config.panel_features,
+                        "random_state": config.seed,
+                    },
+                )
+                _experiment_settings = {
+                    "families": tuple(config.diagnostic_experiment_families),
+                    "vae_fit_budget": config.diagnostic_experiment_vae_fit_budget,
+                    "epoch_cap": config.diagnostic_experiment_epoch_cap,
+                    "max_fit_rows": config.diagnostic_experiment_max_fit_rows,
+                    "capacity_grid": config.diagnostic_experiment_capacity_grid,
+                    "beta_grid": config.diagnostic_experiment_beta_grid,
+                    "kl_anneal_grid": config.diagnostic_experiment_kl_grid,
+                    "backtest_origins": config.diagnostic_backtest_origins,
+                    "backtest_vae_origins": config.diagnostic_backtest_vae_origins,
+                    "backtest_min_fit_periods": config.diagnostic_backtest_min_fit_periods,
+                    "seed": config.seed,
+                }
                 diagnostic_suite_result = run_ifvae_diagnostic_suite(
                     keys, schema,
                     models["iforest"][0], models["iforest"][1], models["iforest"][3],
@@ -1703,10 +2117,13 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     stability_refits=config.diagnostic_stability_refits,
                     base_seed=config.seed,
                     segment=_segment,
+                    segment_name=_segment_col or None,
                     auto_install_suite=config.diagnostic_auto_install_suite,
                     experiment_contamination_grid=config.diagnostic_experiment_contamination_grid,
                     experiment_capacity_grid=config.diagnostic_experiment_capacity_grid,
                     experiment_beta_grid=config.diagnostic_experiment_beta_grid,
+                    experiment_ctx=_experiment_ctx,
+                    experiment_settings=_experiment_settings,
                 )
                 _n_files = sum(
                     1 for name_ in (
@@ -1769,8 +2186,14 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     test_mask=test_mask,
                     labels=(labels if n_pos > 0 else None),
                     stack_context=(
-                        {"detector": stack_detector, "scaler": stacked.scaler}
-                        if config.stack_iforest_into_vae else None
+                        {
+                            **({"detector": stack_detector, "scaler": _stack_scaler}
+                               if config.stack_iforest_into_vae else {}),
+                            # Mixed VAE view: perturbed frames are re-encoded with the SAME vocabularies
+                            # (nulls -> MISSING, unseen levels -> UNKNOWN); only the score column is scaled.
+                            **({"vae_view": vae_builder, "score_only_scaler": True}
+                               if vae_builder is not None else {}),
+                        } or None
                     ),
                     max_test_rows=config.sensitivity_max_test_rows,
                     combination_top_k=config.sensitivity_combination_top_k,
@@ -1875,6 +2298,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
                         os.path.join(FIGURES_DIR, "vae_recon_by_feature.png"),
                     )
                     chart_static["recon_by_feature"] = recon
+                    chart_static["recon_by_feature_kind"] = (
+                        "contribution" if getattr(detector, "layout", None) is not None else "squared_error")
                     model_attributions["vae"] = recon
                 except Exception as exc:
                     logger.warning("reconstruction_error_by_feature failed (%s); continuing.", exc)
@@ -2109,12 +2534,13 @@ _QUICK = {
 }
 _FULL = {
     "n_individuals": 100_000, "n_periods": 16,
-    "iforest_trials": 50, "vae_trials": 30, "vae_epochs": 30,
+    "iforest_trials": 50, "vae_trials": 30, "vae_epochs": 15,
 }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,   # an abbreviated flag would not count as explicit for the config file
         prog="main.py",
         description=(
             "End-to-end banking-panel anomaly-detection pipeline: data -> "
@@ -2229,21 +2655,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "--no-auto-install-suite requires it pre-installed instead.")
     parser.add_argument("--diagnostic-experiment-contamination-grid", type=float, nargs="*",
                         default=None, metavar="C",
-                        help="Isolation Forest contamination values swept for the "
-                             "diagnostic chapter's §9 'Variantes de contaminación' "
-                             "experiment (default 0.01 0.02 0.05; cheap, IF refits only). "
-                             "Pass with no values to disable.")
+                        help="Isolation Forest operating points (top-c%% of the score) compared "
+                             "in the diagnostic chapter's §9 'Sensibilidad del punto de "
+                             "operación' experiment (default 0.02 0.01 0.005). Score cut-offs "
+                             "only: contamination does not change the forest, so nothing is "
+                             "refitted. Pass with no values to disable.")
     parser.add_argument("--diagnostic-experiment-capacity-grid", type=int, nargs="*",
                         default=None, metavar="DIM",
-                        help="VAE latent_dim values swept for §9 'Capacidad y dimensión "
-                             "latente' (default: none, disabled). Each value is a FULL "
-                             "VAE retrain -- opt in explicitly, e.g. "
-                             "--diagnostic-experiment-capacity-grid 4 8 16.")
+                        help="VAE latent_dim values for §9 'Capacidad y dimensión latente'. "
+                             "Default: automatic points around the production width (½x, 2x, "
+                             "4x latent_dim and ½x/2x hidden width). Each point is a VAE "
+                             "retrain drawn from the shared budget. Pass with no values to "
+                             "switch the sweep off.")
     parser.add_argument("--diagnostic-experiment-beta-grid", type=float, nargs="*",
                         default=None, metavar="BETA",
-                        help="VAE beta (KL weight) values swept for §9 'Beta y "
-                             "programación KL' (default: none, disabled). Each value is "
-                             "a FULL VAE retrain -- opt in explicitly.")
+                        help="VAE beta values for §9 'Beta y programación KL'. Default: "
+                             "automatic (0.25x and 4x the production beta, plus kl_anneal_epochs "
+                             "0 and =epochs). Pass with no values to skip the beta points.")
+    parser.add_argument("--diagnostic-experiment-vae-fit-budget", type=int, default=None,
+                        metavar="N",
+                        help="Total VAE retrains the §9 experiments may use (default 16: 1 noise control + 1 one-hot control + "
+                             "5 + 4 + 3 + 2; 0 = none, the VAE-based points become NOT_REQUESTED).")
+    parser.add_argument("--diagnostic-experiment-families", type=str, nargs="*", default=None,
+                        metavar="FAMILY",
+                        help="§9 families to run (default all): capacity beta_kl loss_by_type "
+                             "ablation backtest window_stability.")
     parser.add_argument("--run-sensitivity-analysis", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Run the post-training variable/data-quality sensitivity study "
@@ -2320,6 +2756,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hazard-horizon-months", type=int, default=3,
                         help="Horizon H of the discrete-hazard challenger: 'a new episode "
                              "starts within H months' (default 3).")
+    parser.add_argument("--tune-with-labels", choices=("auto", "off"), default="auto",
+                        help="IF tuning objective: 'auto' uses average precision against the "
+                             "reviewed labels of the validation months when gate 4.5 authorises "
+                             "them (and there are enough positives), otherwise the label-free "
+                             "tail_separation; 'off' never uses labels for model selection.")
+    parser.add_argument("--tune-min-positive-rows", type=int, default=10,
+                        help="Minimum mature positive rows in the validation months for the "
+                             "labelled tuning objective (default 10).")
+    parser.add_argument("--iforest-max-samples-range", type=int, nargs=2, default=None,
+                        metavar=("LO", "HI"),
+                        help="Absolute rows-per-tree range searched by the IF tuner "
+                             "(default 1024 32768, capped to the rows available).")
     parser.add_argument("--event-challengers", choices=("off", "auto", "force"), default="auto",
                         help="Supervised challengers: off; auto = only if gate 4.5 authorises "
                              "them (default); force = exploratory run despite a red gate.")
@@ -2351,9 +2799,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Trailing months reserved AFTER test, exclusively for the OOT "
                              "Excel deliverable -- never used for fitting, tuning, threshold "
                              "calibration, or test-set metrics (default 3: the last 3 months).")
-    parser.add_argument("--analyst-identity-column", type=str, default="puesto",
+    parser.add_argument("--analyst-identity-column", type=str, default=None,
                         help="Source column shown below the entity ID in the analyst profile "
-                             "(default 'puesto'). Missing values are shown as unavailable.")
+                             "(default 'puesto', or dashboard.identity_column of "
+                             "configs/pipeline.yaml). Missing values are shown as unavailable. "
+                             "Folded into --identification-columns automatically: it is never "
+                             "a model feature either.")
+    parser.add_argument("--identification-columns", type=str, nargs="*", default=None,
+                        metavar="COLUMN",
+                        help="Panel columns that identify/describe a record for a human reader "
+                             "(job title, name, area, an internal reference number, ...) and "
+                             "must never be a model feature, in ANY phase (default: none besides "
+                             "--analyst-identity-column). Still shown wherever identification is "
+                             "the point: the analyst dashboard, the OOT Excel export, the raw "
+                             "data profile. Default: data.identification_columns of "
+                             "configs/pipeline.yaml.")
+    parser.add_argument("--vae-categorical-representation", choices=("onehot", "embedding"), default=None,
+                        help="How the VAE receives categorical variables: 'embedding' (one index per "
+                             "variable, learned embeddings, one contribution per variable) or 'onehot' "
+                             "(original MLP over dummy columns; migration/control). Default: vae."
+                             "categorical_representation of configs/pipeline.yaml.")
+    parser.add_argument("--config", type=str, default=None, metavar="PATH",
+                        help="Single configuration file for the diagnostic knobs (segment "
+                             "column, analyst identity column, experiment grids). Default: "
+                             "configs/pipeline.yaml next to main.py if it exists. Precedence: "
+                             "CLI flag > value set in code > file > built-in default.")
     parser.add_argument("--threshold-method", default="pot", choices=["pot", "percentile"],
                         help="Threshold calibration on validation scores (default 'pot').")
     parser.add_argument("--threshold-percentile", type=float, default=99.0,
@@ -2367,6 +2837,47 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--full", action="store_true",
                         help="Spec-scale run (100000 individuals, 10 periods, more trials).")
     return parser
+
+
+#: argparse dest -> the file-managed PipelineConfig attribute it sets.
+_FILE_MANAGED_DESTS = {
+    "diagnostic_segment_column": "diagnostic_segment_column",
+    "diagnostic_entity_view": "diagnostic_entity_view",
+    "diagnostic_stability_refits": "diagnostic_stability_refits",
+    "diagnostic_sensitivity_grid": "diagnostic_sensitivity_grid",
+    "analyst_identity_column": "analyst_identity_column",
+    "identification_columns": "identification_columns",
+    "diagnostic_experiment_contamination_grid": "diagnostic_experiment_contamination_grid",
+    "diagnostic_experiment_capacity_grid": "diagnostic_experiment_capacity_grid",
+    "diagnostic_experiment_beta_grid": "diagnostic_experiment_beta_grid",
+    "diagnostic_experiment_vae_fit_budget": "diagnostic_experiment_vae_fit_budget",
+    "diagnostic_experiment_families": "diagnostic_experiment_families",
+    "vae_categorical_representation": "vae_categorical_representation",
+}
+
+
+def _cli_explicit_fields(args: argparse.Namespace) -> set:
+    """File-managed attributes the user gave on the command line (so the file never wins).
+
+    ``main()`` records the dests actually present in argv; without that (programmatic
+    callers, tests) a value different from the parser's default counts as explicit.
+    """
+    seen = getattr(args, "_explicit_dests", None)
+    if seen is None:
+        parser = build_arg_parser()
+        seen = {d for d in _FILE_MANAGED_DESTS
+                if getattr(args, d, None) != parser.get_default(d)}
+    return {_FILE_MANAGED_DESTS[d] for d in seen if d in _FILE_MANAGED_DESTS}
+
+
+def _explicit_dests(parser: argparse.ArgumentParser, argv: Optional[list]) -> set:
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    out = set()
+    for action in parser._actions:  # noqa: SLF001 - stable argparse internals
+        for opt in action.option_strings:
+            if any(tok == opt or tok.startswith(opt + "=") for tok in tokens):
+                out.add(action.dest)
+    return out
 
 
 def config_from_args(args: argparse.Namespace) -> PipelineConfig:
@@ -2406,7 +2917,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         n_val_periods=args.n_val_periods,
         n_test_periods=args.n_test_periods,
         n_oot_periods=args.n_oot_periods,
-        analyst_identity_column=args.analyst_identity_column,
+        **({"analyst_identity_column": args.analyst_identity_column}
+           if args.analyst_identity_column is not None else {}),
         threshold_method=args.threshold_method,
         threshold_percentile=args.threshold_percentile,
         threshold_target_far=args.threshold_target_far,
@@ -2438,11 +2950,26 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         hazard_horizon_months=args.hazard_horizon_months,
         event_challengers=args.event_challengers,
         event_bootstrap_reps=args.event_bootstrap_reps,
+        tune_with_labels=args.tune_with_labels,
+        tune_min_positive_rows=args.tune_min_positive_rows,
     )
+    config.config_file = args.config
+    if args.vae_categorical_representation is not None:
+        config.vae_categorical_representation = args.vae_categorical_representation
+    config.cli_explicit = tuple(sorted(_cli_explicit_fields(args)))
+    if args.iforest_max_samples_range is not None:
+        lo, hi = args.iforest_max_samples_range
+        if not 2 <= lo <= hi:
+            raise SystemExit("--iforest-max-samples-range needs 2 <= LO <= HI.")
+        config.iforest_max_samples_range = (int(lo), int(hi))
+    if args.tune_min_positive_rows < 1:
+        raise SystemExit("--tune-min-positive-rows must be at least 1.")
     if args.labels_dir is not None:
         config.labels_dir = args.labels_dir
     if args.labels_usable_statuses is not None:
         config.labels_usable_statuses = tuple(args.labels_usable_statuses)
+    if args.identification_columns is not None:
+        config.identification_columns = tuple(args.identification_columns)
     for _flag, _val in (("--label-horizon-months", args.label_horizon_months),
                         ("--label-confirm-delay-months", args.label_confirm_delay_months),
                         ("--label-maturity-buffer-months", args.label_maturity_buffer_months),
@@ -2496,6 +3023,17 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         if any(b <= 0 for b in grid):
             raise SystemExit("--diagnostic-experiment-beta-grid takes positive values.")
         config.diagnostic_experiment_beta_grid = grid
+    if args.diagnostic_experiment_vae_fit_budget is not None:
+        if args.diagnostic_experiment_vae_fit_budget < 0:
+            raise SystemExit("--diagnostic-experiment-vae-fit-budget cannot be negative.")
+        config.diagnostic_experiment_vae_fit_budget = args.diagnostic_experiment_vae_fit_budget
+    if args.diagnostic_experiment_families is not None:
+        from src.evaluation.ifvae_experiments import ALL_FAMILIES
+
+        bad = [f for f in args.diagnostic_experiment_families if f not in ALL_FAMILIES]
+        if bad:
+            raise SystemExit(f"Unknown §9 family {bad}; valid: {list(ALL_FAMILIES)}.")
+        config.diagnostic_experiment_families = tuple(args.diagnostic_experiment_families)
     if args.sensitivity_max_test_rows <= 0:
         raise SystemExit("--sensitivity-max-test-rows must be positive.")
     if args.sensitivity_combination_top_k < 2:
@@ -2517,7 +3055,7 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         config.iforest_params["contamination"] = args.contamination
     if args.p95_percentile is not None:
         config.p95_percentile = args.p95_percentile
-    return config
+    return _enforce_model_training_contract(config)
 
 
 def _close_run_as(status: str, error: Optional[str], live_view: bool) -> None:
@@ -2574,7 +3112,9 @@ def _install_sigbreak_handler() -> None:
 
 
 def main(argv: Optional[list] = None) -> None:
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    args._explicit_dests = _explicit_dests(parser, argv)
     config = config_from_args(args)
     _install_sigbreak_handler()
     try:

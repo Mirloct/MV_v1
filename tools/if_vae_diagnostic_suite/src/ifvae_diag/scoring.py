@@ -6,6 +6,10 @@ from sklearn.covariance import LedoitWolf
 
 
 EPSILON = 1e-12
+#: Absolute lower bound of a contribution's scale when the relative floor is on (see
+#: ``residual_contributions``): keeps a variable whose reference contributions are all ~0 from
+#: turning a tiny numeric difference into a huge normalised value.
+MIN_SCALE_WHEN_FLOORED = 1e-6
 
 
 def anomaly_percentile(
@@ -22,10 +26,35 @@ def anomaly_percentile(
 
 
 def residual_contributions(
-    reference_residuals: np.ndarray, residuals: np.ndarray
+    reference_residuals: np.ndarray, residuals: np.ndarray, scale_floor_fraction: float = 0.0,
+    center: bool = False,
 ) -> np.ndarray:
+    """``|contribution| / scale`` per variable, ``scale`` = MAD of the reference (fallbacks below).
+
+    ``scale_floor_fraction`` (default ``0.0`` = historical behaviour) puts a floor under the scale:
+    ``scale >= scale_floor_fraction * mean(reference contribution)`` and ``>= MIN_SCALE_WHEN_FLOORED``
+    (with ``center=True`` the mean is that of the *centred excess*, i.e. after the reference median is removed).
+    Needed when the contributions are one-per-variable negative log-likelihoods or BCE terms: a
+    variable the model reconstructs almost perfectly has a MAD close to zero, and dividing by it
+    would let that one variable dominate every top-k. With ``0.1`` a contribution is never divided
+    by less than a tenth of its variable's average reference contribution.
+
+    ``center=True`` (default ``False`` = historical) first subtracts each variable's reference
+    *median* and keeps the excess (``max(c - median_ref, 0)``) for both reference and scored values.
+    A residual ``|x - x^|`` is naturally centred at zero, but a negative log-likelihood or a BCE term
+    is not: a categorical whose contribution is (almost) constant -- e.g. a uniform many-level variable,
+    NLL = log(cardinality) for every row -- has MAD ~ 0, and without centring it would look "high" on
+    every row and monopolise the top-k. Centred, a constant contribution is 0 and only the *excess over
+    the variable's usual level* competes. Known limit: a variable whose reference excess is essentially
+    zero is normalised by a tiny scale (bounded below by ``MIN_SCALE_WHEN_FLOORED``), so a small real
+    change in it is amplified.
+    """
     reference = np.abs(np.asarray(reference_residuals, dtype=float))
     values = np.abs(np.asarray(residuals, dtype=float))
+    if center:
+        median = np.nanmedian(reference, axis=0)
+        reference = np.maximum(reference - median, 0.0)
+        values = np.maximum(values - median, 0.0)
     if reference.ndim != 2 or values.ndim != 2:
         raise ValueError("residual arrays must be 2-dimensional")
     if reference.shape[1] != values.shape[1]:
@@ -34,6 +63,9 @@ def residual_contributions(
     mad = np.nanmedian(np.abs(reference - median), axis=0) * 1.4826
     fallback = np.maximum(median, np.nanmean(reference, axis=0))
     scale = np.where(mad > EPSILON, mad, np.maximum(fallback, EPSILON))
+    if scale_floor_fraction > 0.0:
+        scale = np.maximum(scale, float(scale_floor_fraction) * np.nanmean(reference, axis=0))
+        scale = np.maximum(scale, MIN_SCALE_WHEN_FLOORED)
     return values / scale
 
 
@@ -47,8 +79,10 @@ def reconstruction_scores(
     reference_residuals: np.ndarray,
     scored_residuals: np.ndarray,
     top_k: int,
+    scale_floor_fraction: float = 0.0,
+    center: bool = False,
 ) -> pd.DataFrame:
-    contributions = residual_contributions(reference_residuals, scored_residuals)
+    contributions = residual_contributions(reference_residuals, scored_residuals, scale_floor_fraction, center)
     return pd.DataFrame({
         "recon_mean": contributions.mean(axis=1),
         "recon_topk": _largest_k_mean(contributions, top_k),

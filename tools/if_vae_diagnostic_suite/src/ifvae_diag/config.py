@@ -35,6 +35,12 @@ class DiagnosticConfig:
     if_max_features: float = 1.0
     n_jobs: int = -1
     active_variance_threshold: float = 1e-3
+    # Relative floor under the per-variable normalisation scale of the reconstruction contributions
+    # (see scoring.residual_contributions). 0.0 = historical MAD-only behaviour.
+    contribution_scale_floor: float = 0.0
+    # Centre every variable's contribution at its reference median before scaling (see
+    # scoring.residual_contributions). False = historical behaviour (|residual| / MAD).
+    contribution_center: bool = False
 
     def __post_init__(self) -> None:
         if not self.features:
@@ -43,6 +49,8 @@ class DiagnosticConfig:
             raise ValueError("top_k_residuals must be >= 1")
         if not 0.5 < self.percentile_threshold < 1.0:
             raise ValueError("percentile_threshold must be between 0.5 and 1")
+        if not 0.0 <= self.contribution_scale_floor < 1.0:
+            raise ValueError("contribution_scale_floor must be in [0, 1)")
         if any(k < 1 for k in self.alert_budgets):
             raise ValueError("alert_budgets must contain positive integers")
         if len(set(self.features)) != len(self.features):

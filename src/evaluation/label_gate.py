@@ -127,7 +127,14 @@ def sufficiency_metrics(
     blocks = np.unique(starts // max(1, thresholds.origin_step_months)) if len(starts) else np.array([])
     oos = 0
     if eval_mask is not None and len(mature):
-        oos = int(len(np.unique(labels.episode_id[np.asarray(eval_mask, dtype=bool) & labels.episode_mature])))
+        # An episode is out-of-sample only when it STARTS inside the evaluation
+        # window. One that began in a training month and merely continues into
+        # test/OOT is not an unseen event (counting any overlapping row inflated
+        # the OOS count that gates the amber-2 / green levels).
+        start_of = labels.episodes.set_index("episode_id")["start_m"]
+        row_start = pd.Series(labels.episode_id).map(start_of).to_numpy(dtype=float)
+        first_row = labels.episode_mature & (labels.month.astype(float) == row_start)
+        oos = int(len(np.unique(labels.episode_id[np.asarray(eval_mask, dtype=bool) & first_row])))
     return {
         "eligible_rows": n_usable,
         "event_rate_row": (float(pos_rows.sum()) / n_usable) if n_usable else None,

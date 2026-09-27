@@ -34,6 +34,14 @@ row-per-observation tables were removed from the factual ficha.
 
 The contract is a plain ``dict`` (JSON-serializable) so it can be snapshotted,
 diffed between runs, and asserted against in tests.
+
+Data sources / inputs: factual diagnostic dictionaries produced by
+``src.evaluation.ifvae_diagnostic``; output is a JSON-serializable report contract.
+Created: 2026-09-04
+Last modified: 2026-09-25
+Changelog:
+- 2026-09-25: Aligned §9 documentation with the six default experiment families
+  and scoped seed controls to temporally comparable variants.
 """
 
 from __future__ import annotations
@@ -703,11 +711,14 @@ def _section_temporal(temporal: dict, segmentation: dict) -> dict:
             ("Resultados por periodo",
              missing(temporal["status"], temporal["reason"], source=temporal["source"])),
         ], title="Por periodo"))
+    segment_label = segmentation.get("column")
+    segment_title = f"Por segmento ({segment_label})" if segment_label else "Por segmento"
     if segmentation["status"] == STATUS_EXECUTED:
         blocks.append(_table_block(
-            ["Segmento", "Observaciones", "BOTH", "IF_ONLY", "VAE_ONLY", "NEITHER",
+            [f"Segmento ({segment_label})" if segment_label else "Segmento",
+             "Observaciones", "BOTH", "IF_ONLY", "VAE_ONLY", "NEITHER",
              "Tasa marginal IF", "Tasa marginal VAE", "Advertencia de tamaño"],
-            segmentation["rows"], title="Por segmento",
+            segmentation["rows"], title=segment_title,
             empty_text="La corrida no expuso segmentos.",
         ))
     else:
@@ -715,7 +726,7 @@ def _section_temporal(temporal: dict, segmentation: dict) -> dict:
             ("Resultados por segmento",
              missing(segmentation["status"], segmentation["reason"],
                      source=segmentation["source"])),
-        ], title="Por segmento"))
+        ], title=segment_title))
     blocks.append(_note_block(
         "Los grupos por debajo del tamaño mínimo declarado se marcan en la "
         "columna de advertencia. Las diferencias entre grupos no se "
@@ -725,13 +736,12 @@ def _section_temporal(temporal: dict, segmentation: dict) -> dict:
 
 
 def _section_experiments(experiments: Sequence[dict]) -> dict:
-    """§9 Matriz de experimentos: las familias que son genuinamente baratas o
-    ya se calculan en otra parte se ejecutan de verdad para esta corrida
-    (Ensembles, variantes de reconstrucción siempre; contaminación IF por
-    defecto; capacidad/beta VAE si se configura una malla); las que
-    requieren tocar código de modelo/preprocesamiento o múltiples ventanas
-    temporales quedan `NOT_REQUESTED` con el motivo específico de cada una,
-    no una limitación genérica."""
+    """§9 matrix: the six configured diagnostic families run by default.
+
+    Non-execution is explicit per row (disabled family, exhausted VAE budget,
+    unavailable data, or a deliberately bounded ablation), never a generic
+    placeholder for an implemented family.
+    """
     rows = [
         [e["experiment"], STATUS_LABELS.get(e["status"], e["status"]) + f" ({e['status']})",
          e.get("detail") or NO_VALUE_TEXT, e.get("configuration") or NO_VALUE_TEXT,
@@ -744,13 +754,22 @@ def _section_experiments(experiments: Sequence[dict]) -> dict:
              "Artefacto", "Motivo de no ejecución"],
             rows,
             caption="Familias tomadas de la matriz de experimentos de la suite "
-                    "diagnóstica (evidence/EXPERIMENT_MATRIX.md). Se ejecutan "
-                    "las que son baratas o ya se calculan en otra sección de "
-                    "esta misma corrida (Ensembles, variantes de "
-                    "reconstrucción, contaminación IF); las que exigen tocar "
-                    "código de modelo o preprocesamiento, o comparar entre "
-                    "múltiples ventanas OOT que esta corrida no conserva, "
-                    "quedan NOT_REQUESTED con el motivo puntual de cada una.",
+                    "diagnóstica (evidence/EXPERIMENT_MATRIX.md). Todas son "
+                    "descriptivas (sin umbral de pasa/no pasa) y se ejecutan por "
+                    "defecto: ensembles, variantes de reconstrucción, punto de "
+                    "operación IF, capacidad/dimensión latente, beta y programación "
+                    "KL, pérdidas por tipo de feature, ablación de familias, "
+                    "backtests temporales y estabilidad entre ventanas. Las filas "
+                    "de capacidad, beta/KL y ablación traen un control (la configuración de producción "
+                    "reentrenada con otra semilla y los mismos topes, medida con el "
+                    "mismo Jaccard de conjuntos de alerta): una variante cercana al "
+                    "control está dentro del ruido combinado de semilla y topes "
+                    "experimentales. Los backtests no comparan ese Jaccard porque "
+                    "su geometría temporal difiere de producción. Una fila "
+                    "queda NOT_REQUESTED si se apagó en configs/pipeline.yaml, se "
+                    "agotó el presupuesto de reentrenos, o por diseño (preprocesamiento; "
+                    "la ablación del VAE solo cubre cat, derivada y panel_hist para "
+                    "acotar el costo); NOT_APPLICABLE si no existe en esta corrida.",
             empty_text="No se declararon experimentos.",
         ),
     ])

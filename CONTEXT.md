@@ -41,8 +41,10 @@ Modelo-v0.1/
 │   ├── interpretability/   # SHAP, path length, latent space, per-feature recon
 │   ├── reporting/          # HTML/MD report builder, analyst dashboard, flow visualization (no PDF)
 │   └── utils/              # paths, logging, observability, console dashboard, assumptions gate, atomic_io
-├── tests/                  # pytest suite for the diagnostic chapter, analyst dashboard,
-│                           # sensitivity, zero-row filter, report incidents, live progress
+├── tests/                  # pytest suite: diagnostic chapter, analyst dashboard, sensitivity,
+│                           # zero-row filter, report incidents, live/phase progress, event
+│                           # labels + gate 4.5 + challengers, single config file, IF/VAE tuners,
+│                           # §9 experiment families, mixed (embedding) VAE
 ├── docs/                   # *.md sources + generated documentation.html
 ├── tools/                  # external/adjacent tooling -- NOT part of the
 │   │                       # pipeline import graph; see "IF-VAE Diagnostic
@@ -127,9 +129,38 @@ Produced by `src/data`, consumed by every downstream module:
 - **Schema-inference contract**: `load_or_generate_panel()` returns
   `(df, PanelSchema)`. `PanelSchema` carries `time_col` (`"period"`),
   `entity_col` (`"entity_id"`), `target_col` (`None` for synthetic data —
-  labels live in the separate file), and `ground_truth_path` (or `None` if
-  none was located). `time_col`/`entity_col` can be `None` for arbitrary
-  inputs; callers must handle that.
+  labels live in the separate file), `ground_truth_path` (or `None` if
+  none was located), and `identification_columns` (see below; `()` unless
+  `main()` sets it right after loading). `time_col`/`entity_col` can be
+  `None` for arbitrary inputs; callers must handle that.
+- **Identification columns (2026-09-27)**: `data.identification_columns` of
+  `configs/pipeline.yaml` (or `--identification-columns`) names panel columns
+  that exist purely to identify/describe a record for a human reader (job
+  title, name, area, an internal reference number, ...) and carry no
+  modelling signal. `main._resolve_identification_columns` folds in
+  `dashboard.identity_column` automatically (it is never listed twice) and
+  sets the result on `schema.identification_columns` once, right after
+  `load_or_generate_panel`, before anything else reads `schema`. Every phase
+  that decides what the model sees calls `src.data.loader.key_columns(schema)`
+  — the *one* place that set is assembled — instead of keeping its own column
+  list: feature building (`PanelFeatureEngineer`/`build_preprocessing_pipeline`),
+  the VAE's categorical sources (`categorical_sources`), the exact-zero-row
+  filter, the numeric-transform diagnostic (`infer_numeric_features`) and the
+  post-training sensitivity study. A name absent from the loaded panel only
+  warns (`config.identification_columns_present`, category `data`) — unlike
+  the segment column, nothing downstream breaks, and the same config file is
+  meant to run against panels that do not all carry the same optional
+  columns. This is a *modelling* exclusion, not a display one: the analyst
+  dashboard, the OOT Excel "VARIABLES" columns and the raw data profile keep
+  showing these columns, since identification is exactly what they are for.
+  The vendored IF-VAE Diagnostic Suite needs no separate configuration for
+  this — its `DiagnosticConfig.features` list is built from the
+  already-preprocessed feature names, so an excluded column is already absent
+  by the time the suite sees it. Tests: `tests/test_identification_columns.py`
+  (the shared `key_columns` helper and the two call sites with no test file of
+  their own), plus one test in each of `test_config_file.py` (resolution/
+  precedence), `test_zero_row_filter.py`, `test_mixed_vae.py`
+  (`categorical_sources`) and `test_sensitivity.py`.
 - **Period parsing**: `src/data/loader.py::detect_period_format` /
   `parse_period_column` handle compact formats pandas cannot infer on its
   own — `^\d{6}$` -> `"%Y%m"`, `^\d{8}$` -> `"%Y%m%d"` (after normalizing
@@ -262,7 +293,7 @@ it locks in:
 | 1 Features | `PanelFeatureEngineer` | `lag/diff/ratio` at horizons `(1, 3, 6)`, resolved against the **fit window**; ratios fill to `1.0`, not `0.0` |
 | 2 Split | `chronological_split` | train / val / test / OOT strictly by period, no randomness; OOT (`n_oot_periods`, default 3) is reserved strictly after test and is never the same block |
 | 3 Preprocessing | `fit_transform_panel(fit_mask=)` | stage 1 (causal) over the full panel, stage 2 (estimators) on train only |
-| 4 Tuning | `tune_*(valid_mask=)` | static temporal holdout; label-free proxies `rank_agreement` (IF) / `recon_p50` (VAE); VAE gets KL annealing + early stopping |
+| 4 Tuning | `tune_*(valid_mask=)` | static temporal holdout. IF: `n_estimators=300` fixed, `max_samples` an **absolute integer** (1 024–32 768) + `max_features`, Sobol sweep with anchors, 1-SE + noise-margin selection against the ψ=256 default, objective = AP vs reviewed labels when gate 4.5 authorises them, else `tail_separation`; contamination not searched. VAE: `-ELBO@β=1`/`recon_p50`, KL annealing + early stopping, fingerprinted study |
 | 5 Final fit | `tune_*` refit | winning config refit on train+val |
 | 6 Threshold | `calibrate_threshold` | POT/GPD (or percentile) fitted on **validation**, applied to test |
 | 7 Deliverable | `export_oot_top_anomalies` | distinct individuals at/above P90 of the OOT score (default), graded p90/p95/p99; `--top-n` switches to a fixed headcount |
@@ -396,8 +427,10 @@ P95 checkpoint, stacking, or the VAE deliverable.
   theorized) to reach minutes-to-hours in two independent, realistic
   scenarios: ~150-200 features (`src/interpretability/iforest_explain.py`,
   paths 2/3), and — the actual root cause behind a real production hang —
-  **`max_samples` tuned to a float fraction (Optuna's search space allows
-  0.3-1.0) combined with a multi-month training block**. `max_samples` as a
+  **`max_samples` tuned to a float fraction (Optuna's search space allowed
+  0.3-1.0 until 2026-09-24; `max_samples` is now an absolute integer in the
+  tuner, so this trigger no longer comes from tuning) combined with a
+  multi-month training block**. `max_samples` as a
   fraction is relative to the *training set size*, not a fixed row count, so
   a 200,000-row train block (e.g. 10 months × 20k entities) with
   `max_samples=0.5` builds trees with ~100,000-row leaves and ~17 levels of
@@ -1005,13 +1038,29 @@ report chapters — a reconciliation of "no interpretation in the ficha" with
 - *Segmentation* — `--diagnostic-segment-column` (default `segment`; `""`
   disables). A configured column absent from the panel logs a warning and makes
   §8 `NOT_APPLICABLE`.
-- *§9 experiments* — ensembles (max/mean) and reconstruction variants reuse
-  computed scores; the IF contamination sweep really refits over
-  `--diagnostic-experiment-contamination-grid` (default `0.01 0.02 0.05`);
-  VAE capacity/beta sweeps are opt-in (`--diagnostic-experiment-capacity-grid`,
-  `--diagnostic-experiment-beta-grid`; each point retrains the VAE). Five
-  families that need model/preprocessing changes or several retained temporal
-  windows stay `NOT_REQUESTED`, each with its own reason.
+- *§9 experiments* — **all active by default** (`src/evaluation/ifvae_experiments.py`,
+  2026-09-25): ensembles and reconstruction variants reuse computed scores; the IF
+  operating-point sensitivity compares the top-c % of the IF score with the production
+  alert set (`0.02 0.01 0.005`, no refits: `contamination` does not change any score); and
+  six families that used to be `NOT_REQUESTED` now run — VAE capacity/latent dimension,
+  beta + KL schedule, loss by feature type, feature-family ablation, rolling-origin
+  temporal backtests and window stability. Alert sets are built exactly like production
+  (VAE: the diagnostic's `recon_topk` percentile vs the train block; IF: score percentile vs
+  train), so the Jaccards are comparable (the previous VAE sweep compared a plain-MSE
+  percentile with the production `recon_topk` one). All VAE retrains share ONE budget
+  (`experiments.vae_fit_budget`, default 16 = 1 noise control + 5 capacity + 4 beta/KL + 1 one-hot control (embedding mode) + 3
+  ablation + 2 backtest), epochs are capped (`epoch_cap` 30) and fits above `max_fit_rows` (300k) are
+  subsampled; each cap is written into the row's detail, exhausted budget → `NOT_REQUESTED`
+  with that reason. Each refit is isolated (temp checkpoint dir, `resume=False`) and a failing
+  point is a `FAILED` row. Every variant row is read against a **control** (production configuration refitted with
+  another seed and the same caps, compared through the same alert-set Jaccard); the
+  stability section's raw-score top-k Jaccard is NOT used as a floor here (independent
+  validation showed it measures a different set and was misleading).
+  Backtest origins (last 6 periods, one step ahead, no gap) re-run `fit_transform_panel` with
+  `fit_mask = period < origin` and fit on strictly earlier periods; the VAE backtest (2 last
+  origins) uses the base matrix without the stacked IF column. Everything is descriptive (no
+  pass/fail) and on this run's own data. Only "Preprocesamiento" stays `NOT_REQUESTED`.
+  Switches/grids live in the `experiments:` block of `configs/pipeline.yaml`.
 
 **Label-free mode (a change made to the vendored copy).** `label_col: str | None`;
 `contracts.py`/`pipeline.py` skip every label-dependent output when it is `None`.
@@ -1075,7 +1124,125 @@ flow-state edge cases, dashboard rendering). The suite's own
 green. `tools/render_diagnostic_example.py` renders both chapters from a
 synthetic fixture without a pipeline run.
 
+## IF tuner redesign, labels-aware objective and VAE reliability (2026-09-24)
+
+Current contract (validation numbers in `CHANGELOG.md` 2026-09-24; **all measured on
+synthetic data** — the direction of the ψ effect must be re-checked on real data):
+
+- **IF tuner** (`src/models/iforest.py::tune_iforest`): `n_estimators=300` and
+  `bootstrap=False` fixed; searches only `max_samples` (ψ, an **absolute integer**,
+  log-uniform in `--iforest-max-samples-range`, default 1 024–32 768, capped to the fit
+  rows) and `max_features` ∈ [0.5, 1.0]; Sobol (`QMCSampler`) with anchors at
+  ψ ∈ {1 024, 4 096, 16 384, 32 768}. Same ψ in the trials, the refit and the stacking
+  forest (`main.py` fits the latter on `train`, which is exactly the tuner's fit block).
+  Untuned fallback: `PipelineConfig.iforest_params` = 300 trees, ψ=4096 (clipped to the
+  rows), all features. `contamination` stays only as the deployed `predict()` operating
+  point (`contamination_tuned: false` in the YAML).
+- **Selection**: the paper default (ψ=256) is re-evaluated with 3 seeds → noise `sd`;
+  deployed = cheapest trial within 1 `sd` of the best, kept only if it beats the default
+  by > 1 `sd`, else the default. YAML `selection` block + `study.user_attrs["selection"]`.
+- **Objective**: labelled → AP on the *known* validation rows (`NaN` = unknown); needs
+  ≥ 10 positives and both classes, else it falls back and logs why. Label-free →
+  `tail_separation`. `rank_agreement` remains selectable (`objective_metric=`), averaged
+  over top-k fractions (0.5/1/2 %); it is a top-k **fraction**, never a decile.
+- **Phase 5b** (`main.py`, before tuning): loads the reviewed labels and gate 4.5 once
+  (`prepare_event_labels`); `labels_for_tuning` hands the tuner labels **only on the
+  mature known validation rows** when the gate level is above `rojo` (no vetoes) and the
+  validation months hold ≥ `--tune-min-positive-rows` (10) positives. Precedence:
+  `--supervised` ground truth > reviewed labels > label-free. `--tune-with-labels off`
+  disables it. Phase 8c reuses the same load. Recorded as `tuning.objective_source`.
+- **Study identity / resume** (IF and VAE): the study name carries a fingerprint of the
+  data, features, split, objective and search space; `n_trials` is a *total* budget
+  (`n_trials − completed`); `RUNNING` trials from a crash are closed as failed.
+- **VAE**: `save`/`load` persist `epochs`, `kl_anneal_epochs`, `early_stopping_patience`
+  (was `epochs=0` on load); `fit` refuses `epochs < 1`; a checkpoint resumes only if the
+  full training config **and** the data fingerprint match (legacy checkpoints start
+  fresh); trial checkpoints live in `checkpoint_dir/<study_name>/trial_<n>`; the refit
+  uses the winning trial's `epochs` and KL ramp (`_kl_anneal_for`); the diagnostic's VAE
+  refits use a temp `checkpoint_dir` and `resume=False` (they used to resume the
+  production checkpoint and return the same model regardless of seed).
+- **Failure handling** (`main.py`): a failed IF/VAE tuning logs an ERROR, records
+  `tuning.iforest_completed` / `tuning.vae_completed`, fits the default detector and
+  **does not read** a best-params YAML left by an earlier run.
+- **Phase 8c fixes**: (E-3) an unreadable/blank `label_available_at` now excludes the
+  row (`availability_unreadable`; it used to pass); (E-2) contradictory duplicate rows
+  stay unknown under `--labels-unlisted-as-negative` (they used to become negatives);
+  (E-4) an episode counts as out-of-sample only if it **starts** in test/OOT; (E-8)
+  `entity#suffix` episode ids escape `%`/`#` so they cannot collide.
+
+## Single configuration file (`configs/pipeline.yaml`, 2026-09-25)
+
+The diagnostic knobs a user edits most live in **one** file, `configs/pipeline.yaml` next
+to `main.py` (or `--config PATH`), loaded by `src/utils/config_file.py`: the segment column
+(`diagnostic.segment_column`), the analyst identity column (`dashboard.identity_column`),
+the identification-only columns excluded from every modelling phase
+(`data.identification_columns` — see "Identification columns" above), entity view,
+stability refits, the sensitivity grid and the whole `experiments:` block.
+Precedence: **explicit CLI flag > value set in code > file > built-in default** (the file only
+overrides a field still at its built-in default and not given on the command line). Unknown
+keys or invalid values are an error that lists the valid keys (a typo is never an ignored
+setting). `execution.log` records the source of each value (`cli` / `code` / `file` /
+`default`) and `config_sources` lands in the resolved config.
+
+Why: the segment used to exist in three places (the `PipelineConfig` default, a CLI flag and
+the vendored suite's default), editing the wrong one was a silent no-op and the report always
+said "segmento". Now an **explicit** segment that is not a column of the panel stops the run
+**at the start** (`_validate_segment_column`: closest match ignoring case + every available
+column); only the built-in default degrades to `NOT_APPLICABLE` with a warning and an
+observability incident. The report names the real column ("Por segmento (region)") and
+`tools/export_diagnostic_suite_inputs.py` reads the same value. `--analyst-identity-column`
+no longer has a dead dataclass default (argparse default is `None`).
+
+## Mixed-type VAE: embeddings for categorical variables (2026-09-25)
+
+`vae.categorical_representation` (`configs/pipeline.yaml`, `--vae-categorical-representation`) chooses how the VAE sees categorical
+variables. **Default `onehot`** (the original MLP over one-hot columns) until every acceptance criterion passes; `embedding` builds the
+mixed-type VAE (`src/models/mixed_vae.py`, `architecture = mixed_v1`). Contract:
+
+- **Two views.** IF view unchanged. VAE view (`src/preprocessing/mixed_view.py::MixedViewBuilder`): continuous / binary / missing-flag columns
+  from the same causal preprocessing + ONE integer index column per categorical variable built from the raw panel column (tokens `0` = MISSING,
+  `1` = UNKNOWN, `2..` = vocabulary sorted alphabetically; vocabulary learned on the train rows only, levels rarer than `rare_min_frequency` →
+  UNKNOWN). No one-hot column enters the VAE (`assert_no_onehot`, check `vae.no_onehot_input`). Stacking appends the standardised IF score
+  as one more numeric column (only that column is scaled).
+- **Model.** Per-variable embeddings (`auto` width = `round(1.6·card^0.56)` clipped to `[2, 32]`), decoder heads: numeric (Huber/MSE), binary
+  (BCE with logits), one softmax head per categorical (cross-entropy vs the true index; NLL floored at p = 1e-6). Family weights default 1.0.
+  Loss and history are reported by family and by original categorical variable.
+- **Score.** One contribution per ORIGINAL variable; `score_samples` = weighted mean. Diagnostic frames carry one column per original variable;
+  `recon_topk` selects among variables. Contributions are centred at the train-reference median and scaled by MAD with a floor of
+  `0.1 × mean` and `1e-6` (`MIXED_CONTRIBUTION_SCALE_FLOOR`, `MIXED_CONTRIBUTION_CENTER`; suite options `contribution_scale_floor`,
+  `contribution_center`, both off by default for the one-hot path).
+- **Identity.** `architecture_fingerprint` (variables + order, vocabularies/cardinalities, embedding dims, loss types/weights, token policy, code
+  version) is part of checkpoint compatibility, the Optuna study name and the YAML. One-hot payloads/checkpoints are **rejected**, never loaded
+  partially (`IncompatibleCheckpointError`; `VAEDetector.load(expect_architecture=, expect_fingerprint=)`).
+- **Everywhere else.** Tuning (with and without labels, partial labels with `NaN`), the sensitivity study (perturbed frames re-encoded with the same
+  vocabularies), attribution/explanations (original names; categorical shown as `variable=category (p=…)`) and the six §9 families (loss by type in
+  original variables + MISSING/UNKNOWN rows + a one-hot control; ablation with a sub-layout; per-origin vocabularies in the backtest) work with both
+  architectures.
+- **Validation** (`tools/compare_vae_representations.py`, `docs/validation/2026-09-25_vae_representations/`): both arms are scored with the historical AND the
+  centred normalisation (an independent review showed centring alone lowers the one-hot categorical share from 95 % to 70 %). With embeddings the categorical
+  share of the top-k is 34–35 % vs 72–73 % under the same normalisation (25 % expected), `recon_topk` AP goes from chance to 0.22, seed stability 0.46 → 0.90
+  (as-is). **Three criteria fail, so the default stays `onehot`**: tail separation of the production score (1.6 vs 2.5) and window stability judged literally
+  against the complete one-hot arm (0.41 vs 0.78 Spearman; 0.05 vs 0.22 Jaccard — the one-hot value is inflated by time-invariant categorical attributes; like-for-like
+  on numeric variables B is higher, 0.39 vs 0.25). Analyst explanations and the attribution chart rank NORMALISED contributions (train reference kept in the
+  detector). Incompatible checkpoints are set aside, never overwritten. Synthetic data only.
+
 ## Known open problems
+
+- **Diagnostic `recon_topk` is dominated by one-hot columns (found 2026-09-24, fix
+  pending).** The diagnostic's VAE percentile is `vae_primary_score="recon_topk"`: the
+  mean of the 5 largest `|residual| / MAD_reference` per row
+  (`ifvae_diag.scoring.residual_contributions`). A one-hot column's residual is ~0 for
+  most rows, so its MAD is ~10× smaller than a numeric column's and any active level is
+  inflated (measured on the synthetic panel: 98 % of each row's top-5 contributors are
+  one-hot, which are 66 % of the columns; Spearman(`recon_topk`, IF) = 0.06 versus 0.58
+  for the raw MSE that the Excel deliverable uses; 8/76 of the VAE top-1 % rows have an
+  IF percentile ≤ 20 % versus 0/76 with the raw MSE). It is a scale artifact, not model
+  behaviour, and it inflates the VAE_ONLY quadrant and the "top features by error" table
+  with `puesto`-like categorical levels. The IF is blind to categoricals by design
+  (`split_matrix_for_model`), which is a second, legitimate source of VAE-high/IF-low.
+  Remedy implemented behind `vae.categorical_representation: embedding` (see "Mixed-type VAE" above): one contribution per original variable, centred and
+  floored normalisation. Still opt-in (default `onehot`) because the production score's tail separation is lower with embeddings; until the default flips, the
+  "Pérdidas por tipo de feature" experiment keeps exposing the bias on every run.
 
 - **`local`-type anomalies are unrecovered — and, independently confirmed
   2026-09-03, so is `contextual`.** The Isolation Forest ranks a `local`
@@ -1164,16 +1331,29 @@ Measured on the synthetic generator (`generate_synthetic_panel`):
   dependencies and attempts to auto-install anything missing. `pyarrow`
   (parquet engine for ground truth) is in `requirements.txt` and validated too.
 - **Testing**: `python -m pytest tests -q` (host project: diagnostic chapter,
-  analyst dashboard, sensitivity, zero-row filter, report incidents, live
-  progress) plus the vendored suite's own gate, run **from its directory** —
+  analyst dashboard, sensitivity, zero-row filter, report incidents, live/phase
+  progress, event labels and gate 4.5, single config file, identification
+  columns, IF/VAE tuners, §9 families, mixed VAE; ~5 min) plus the vendored
+  suite's own gate, run **from its directory** —
   `cd tools/if_vae_diagnostic_suite && PYTHONPATH=src python scripts/quality_gate.py`
   (unit + adversarial tests, no tautologies, cyclomatic complexity ≤ 10,
   compile, mutation probe; the two suites cannot be collected in one pytest
-  invocation because both have a top-level `scripts` package). **Known
-  hazard:** tests that fit a real `VAEDetector` (`tests/test_diagnostic_section.py`)
-  do not pass `checkpoint_dir`, so they use the default `artifacts/models/vae/`
-  and, on a machine with no compatible checkpoint, would write one there; they
-  also append to `artifacts/logs/execution.log`. A new test that fits a VAE
-  should pass `checkpoint_dir=<tmpdir>`. Beyond tests, verify a change by
-  running the pipeline (`python main.py --quick`) — but that rewrites
-  `artifacts/`, so do it deliberately, not as a side effect.
+  invocation because both have a top-level `scripts` package).
+  **Rules for a test in `tests/`:**
+  - It must pin a behaviour or a defect that was actually found (name the failure
+    in the test name/docstring). Do not add tests that only check a file exists,
+    grep the source for a name or a docstring word, or assert a magic size
+    (`len(json) > 3000`) — those were removed in the 2026-09-25 audit.
+  - A test that fits a real `VAEDetector` must pass `checkpoint_dir=<tmpdir>` and
+    `resume=False`, otherwise it writes over `artifacts/models/vae/` (the
+    2026-09-25 audit found and fixed the last one, in
+    `RealStabilityTests._fit_tiny_detectors`). Tests still append to
+    `artifacts/logs/execution.log`; that is only a log.
+  - Do not re-run an expensive fixture per test: the §9 matrix takes 7–11 s, so
+    the tests that only *read* the default matrix share one run through
+    `default_rows()` (`test_ifvae_experiments.py`, `test_mixed_vae.py`); a test
+    that changes a setting calls `run_families(**over)` itself.
+  Beyond tests, verify a change by running the pipeline from a **throw-away
+  working directory** (`cd <tmp> && py <repo>/main.py --quick`; the config file is
+  resolved next to `main.py`, not the CWD) — running it in the project root
+  rewrites `artifacts/`, so never do that as a side effect.

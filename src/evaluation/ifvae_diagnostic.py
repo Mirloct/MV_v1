@@ -38,6 +38,17 @@ part of the core requirements. ``ensure_suite_installed`` validates the lazy
 import and installs the repository's own copy automatically when needed; it
 never resolves a package name from an index. Any remaining failure is the
 caller's to catch (see ``main.py`` "Phase 9c").
+
+Data sources / inputs: fitted project IF/VAE detectors, preprocessed matrices,
+reference/scored diagnostic frames, and the optional segment vector from
+``configs/pipeline.yaml``.
+Created: 2026-09-04
+Last modified: 2026-09-26
+Changelog:
+- 2026-09-25: Preserved rows with missing segment values as an explicit
+  ``Sin segmento`` group so report totals reconcile with the OOT population.
+- 2026-09-26: Added the standard deviation to three-seed stability outputs so
+  reports can show mean, dispersion, and minimum without seed selection.
 """
 
 from __future__ import annotations
@@ -67,6 +78,7 @@ from src.evaluation.ifvae_contract import (
     build_diagnostic_contract,
 )
 from src.evaluation.ifvae_interpretation import build_interpretation_contract
+from src.models.mixed_vae import CONTRIBUTION_FLOOR_FRACTION as _FLOOR_FRACTION
 from src.utils.logging_config import setup_logging
 
 __all__ = ["run_ifvae_diagnostic_suite", "diagnose_frames", "ensure_suite_installed"]
@@ -190,6 +202,7 @@ QUADRANT_KEYS = ("BOTH", "IF_ONLY", "VAE_ONLY", "NEITHER")
 #: excluded -- that is the one thing each refit varies.
 _IF_REFIT_PARAMS = ("n_estimators", "max_samples", "max_features", "contamination", "bootstrap")
 _VAE_REFIT_PARAMS = (
+    "layout", "mixed_config",      # architecture: the mixed-type layout/loss (None = one-hot MLP)
     "latent_dim", "hidden_dim", "n_layers", "hidden_dims", "dropout", "activation",
     "beta", "lr", "optimizer", "batch_size", "weight_decay", "score_kl_weight",
     "epochs", "kl_anneal_epochs", "early_stopping_patience",
@@ -304,6 +317,55 @@ def _vae_forward(detector: Any, x: np.ndarray) -> tuple[np.ndarray, np.ndarray, 
             logvars[start:end] = logvar.cpu().numpy()
             recon[start:end] = xr.cpu().numpy()
     return mus, logvars, recon
+
+
+#: Relative floor under the per-variable normalisation scale of the mixed VAE's contributions
+#: (``scale >= 0.1 * mean reference contribution`` and ``>= 1e-6``); see the suite's
+#: ``scoring.residual_contributions``. Not used for the one-hot architecture (historical behaviour).
+MIXED_CONTRIBUTION_SCALE_FLOOR = _FLOOR_FRACTION      # 0.1 x mean centred excess (absolute floor 1e-6)
+#: ...and centred at each variable's reference median (excess over its usual level), because NLL / BCE
+#: terms are not centred at zero like ``|x - x^|`` (see the suite's ``residual_contributions``).
+MIXED_CONTRIBUTION_CENTER = True
+
+
+def mixed_norm(det: Any) -> dict:
+    """``reconstruction_scores`` / ``residual_contributions`` keyword arguments for a detector: the
+    contribution normalisation of the mixed architecture, or none (historical) for one-hot."""
+    if getattr(det, "layout", None) is None:
+        return {}
+    return {"scale_floor_fraction": MIXED_CONTRIBUTION_SCALE_FLOOR, "center": MIXED_CONTRIBUTION_CENTER}
+
+
+def _vae_frame_arrays(detector: Any, x: Any, feature_names: Sequence[str]) -> tuple:
+    """``(mu, logvar, values, recon, names)`` -- what the suite's frame contract needs.
+
+    One-hot architecture: the model's own reconstruction of every matrix column.
+    Mixed architecture: **one column per ORIGINAL variable** -- ``values`` is the observed value
+    (transformed number, 0/1 or category index) and ``recon`` is ``value + contribution`` so that the
+    suite's ``|x - recon|`` is exactly that variable's contribution (Huber/MSE, BCE, or the NLL of the
+    observed category). No embedding dimension, logit or dummy column ever becomes a "feature".
+    """
+    if getattr(detector, "layout", None) is None:
+        mu, logvar, recon = _vae_forward(detector, x)
+        return mu, logvar, _densify(x), recon, list(feature_names)
+    import torch
+
+    model = detector._check_fitted()
+    xd = detector._prepare(x)
+    model.eval()
+    n, bs = xd.shape[0], detector.batch_size
+    mus = np.empty((n, model.latent_dim), dtype=np.float64)
+    logvars = np.empty((n, model.latent_dim), dtype=np.float64)
+    contrib = np.empty((n, len(detector.variable_names)), dtype=np.float64)
+    with torch.no_grad():
+        for start in range(0, n, bs):
+            xb = torch.from_numpy(xd[start:start + bs]).to(detector.device)
+            mu, logvar = model.encode(xb)
+            end = start + xb.size(0)
+            mus[start:end], logvars[start:end] = mu.cpu().numpy(), logvar.cpu().numpy()
+            contrib[start:end] = model.contributions(xb, model.decode(mu)).cpu().numpy()
+    values = detector.variable_matrix(xd).astype(np.float64)
+    return mus, logvars, values, values + contrib, list(detector.variable_names)
 
 
 def _build_frame(
@@ -543,6 +605,40 @@ def _build_latent(summary: dict, config: dict, reference: pd.DataFrame) -> dict:
     }
 
 
+def _refit_tmp_root(detector_cls: Any) -> Optional[str]:
+    """Scratch checkpoint root for detectors that checkpoint (the VAE); ``None`` otherwise."""
+    if detector_cls.__name__ != "VAEDetector":
+        return None
+    import tempfile
+
+    return tempfile.mkdtemp(prefix="ifvae_diag_refit_")
+
+
+def _drop_tmp(tmp_root: Optional[str]) -> None:
+    if tmp_root:
+        import shutil
+
+        shutil.rmtree(tmp_root, ignore_errors=True)
+
+
+def _isolated_fit_kwargs(fit_kwargs: Optional[dict], tmp_root: Optional[str]) -> dict:
+    """``fit`` kwargs for a diagnostic refit: never touch the production checkpoints.
+
+    ``VAEDetector.fit`` defaults to ``artifacts/models/vae`` with ``resume=True``: a
+    refit there would resume (or overwrite) the production model's own checkpoint
+    -- at the target epoch it returns that same model without training, so seeded
+    refits would all be the production VAE. Each refit gets a fresh temp dir and
+    ``resume=False``.
+    """
+    kwargs = dict(fit_kwargs or {})
+    if tmp_root is not None:
+        import tempfile
+
+        kwargs["checkpoint_dir"] = tempfile.mkdtemp(dir=tmp_root)
+        kwargs["resume"] = False
+    return kwargs
+
+
 def _seeded_refit_stability(
     detector_cls: Any, base_detector: Any, param_names: Sequence[str],
     fit_x: np.ndarray, score_x: np.ndarray, seeds: Sequence[int], k: int,
@@ -560,17 +656,37 @@ def _seeded_refit_stability(
 
     params = {name: getattr(base_detector, name) for name in param_names}
     runs = []
+    tmp_root = _refit_tmp_root(detector_cls)
     refits = progress.track(
         seeds, desc=f"stability_refit[{detector_cls.__name__}]", unit="refit",
         label=lambda seed: f"seed={seed}",
     )
-    for seed in refits:
-        with progress.step(f"{_NS}refit[{detector_cls.__name__} seed={seed}]",
-                           label="Reajuste completo con otra semilla"):
-            detector = detector_cls(random_state=seed, **params)
-            detector.fit(fit_x, **(fit_kwargs or {}))
-            runs.append(np.asarray(detector.score_samples(score_x), dtype=float))
-    return top_k_stability(np.vstack(runs), k)
+    try:
+        for seed in refits:
+            with progress.step(f"{_NS}refit[{detector_cls.__name__} seed={seed}]",
+                               label="Reajuste completo con otra semilla"):
+                detector = detector_cls(random_state=seed, **params)
+                detector.fit(fit_x, **_isolated_fit_kwargs(fit_kwargs, tmp_root))
+                runs.append(np.asarray(detector.score_samples(score_x), dtype=float))
+    finally:
+        _drop_tmp(tmp_root)
+    score_runs = np.vstack(runs)
+    result = top_k_stability(score_runs, k)
+    effective_k = min(int(k), score_runs.shape[1])
+    top_sets = [
+        set(np.argsort(-row, kind="stable")[:effective_k].tolist())
+        for row in score_runs
+    ]
+    pairwise = []
+    for left_idx in range(len(top_sets)):
+        for right_idx in range(left_idx + 1, len(top_sets)):
+            union = top_sets[left_idx] | top_sets[right_idx]
+            pairwise.append(
+                len(top_sets[left_idx] & top_sets[right_idx]) / len(union)
+                if union else 1.0
+            )
+    result["std_jaccard"] = float(np.std(pairwise, ddof=1)) if len(pairwise) > 1 else 0.0
+    return result
 
 
 def _build_stability(
@@ -607,6 +723,7 @@ def _build_stability(
             "source": "src/evaluation/ifvae_diagnostic.py (reajuste multisemilla)",
             "seeds": list(seeds), "refits": len(seeds), "top_k": if_result["k"],
             "mean_jaccard": if_result["mean_jaccard"],
+            "std_jaccard": if_result["std_jaccard"],
             "min_jaccard": if_result["min_jaccard"],
             "resampling_unit": "Observación entidad–periodo (población evaluada)",
             "artifact": None,
@@ -627,6 +744,7 @@ def _build_stability(
             "source": "src/evaluation/ifvae_diagnostic.py (reajuste multisemilla)",
             "seeds": list(seeds), "refits": len(seeds), "top_k": vae_result["k"],
             "mean_jaccard": vae_result["mean_jaccard"],
+            "std_jaccard": vae_result["std_jaccard"],
             "min_jaccard": vae_result["min_jaccard"],
             "resampling_unit": "Observación entidad–periodo (población evaluada)",
             "artifact": None,
@@ -689,6 +807,7 @@ def _swept_refit_experiment(
 
     base_params = {name: getattr(base_detector, name) for name in param_names}
     rows = []
+    tmp_root = _refit_tmp_root(detector_cls)
     points = progress.track(
         sweep_grid, desc=f"experiment[{detector_cls.__name__}.{sweep_param}]",
         unit="punto", label=lambda value: f"{sweep_param}={value}",
@@ -699,7 +818,7 @@ def _swept_refit_experiment(
             with progress.step(step_name, label="Reajuste de la malla de experimentos"):
                 detector = detector_cls(random_state=base_seed,
                                         **{**base_params, sweep_param: value})
-                detector.fit(fit_x, **(fit_kwargs or {}))
+                detector.fit(fit_x, **_isolated_fit_kwargs(fit_kwargs, tmp_root))
                 fit_scores = np.asarray(detector.score_samples(fit_x), dtype=float)
                 variant_scores = np.asarray(detector.score_samples(score_x), dtype=float)
                 variant_pct = anomaly_percentile(fit_scores, variant_scores)
@@ -713,6 +832,7 @@ def _swept_refit_experiment(
                 })
         except Exception as exc:  # noqa: BLE001 - one bad grid point must not kill the sweep
             rows.append({"value": value, "status": STATUS_FAILED, "reason": str(exc)})
+    _drop_tmp(tmp_root)
     return rows
 
 
@@ -725,6 +845,9 @@ def _build_experiments(
     contamination_grid: Sequence[float] = (),
     capacity_grid: Sequence[int] = (), beta_grid: Sequence[float] = (),
     base_seed: int = 42,
+    ctx: Optional[dict] = None, settings: Optional[dict] = None,
+    frames: Optional[dict] = None, config_dict: Optional[dict] = None,
+    noise_floor: Optional[dict] = None,
 ) -> list[dict]:
     """§9 tracking rows -- genuinely executed where the underlying comparison
     is cheap or already computed elsewhere; explicitly out of bounds (with a
@@ -771,44 +894,73 @@ def _build_experiments(
                  "corrida, no se repite el cómputo aquí.",
     })
 
-    # -- Variantes de contaminación (IF): reajuste real y barato (el forest
-    #    no necesita reentrenamiento profundo), comparado contra la alerta
-    #    de producción. --------------------------------------------------
-    if contamination_grid and if_detector is not None and x_if_fit is not None:
-        from src.models import IsolationForestDetector
-
-        sweep = _swept_refit_experiment(
-            IsolationForestDetector, if_detector, _IF_REFIT_PARAMS,
-            "contamination", contamination_grid, x_if_fit, x_if_score,
-            if_high, threshold, base_seed,
-        )
-        for value, row in zip(contamination_grid, sweep):
-            if row["status"] == STATUS_EXECUTED:
-                detail = (f"{row['alerts']} alertas de {row['total']}; Jaccard vs. "
-                         f"producción = {row['jaccard_vs_production']:.3f}"
-                         if row["jaccard_vs_production"] is not None
-                         else f"{row['alerts']} alertas de {row['total']}")
-            else:
-                detail = None
-            experiments.append({
-                "experiment": f"Variantes de contaminación (IF, contamination={value})",
-                "status": row["status"],
-                "configuration": f"contamination={value}",
-                "artifact": None,
-                "detail": detail,
-                "reason": row.get("reason"),
-            })
+    # -- Punto de operación (IF): sensibilidad de la contaminación. -----------
+    #    `contamination` NO cambia ningún puntaje del bosque (solo desplaza
+    #    `offset_`, el corte de `predict`), así que reajustar con otra
+    #    contaminación devuelve el mismo bosque y no mide nada. Lo que sí se
+    #    puede medir es cómo cambia el CONJUNTO DE ALERTAS al mover el corte
+    #    sobre el mismo puntaje: top-c% de la distribución de referencia
+    #    (misma que usa el percentil de la suite) frente a la alerta de
+    #    producción. Sin reajustes: no depende de detectores ni de la malla de
+    #    estabilidad.
+    if contamination_grid and "if_percentile" in scored_diag.columns:
+        total = len(scored_diag)
+        for value in contamination_grid:
+            try:
+                cut = 1.0 - float(value)
+                op_high = (scored_diag["if_percentile"] >= cut).to_numpy()
+                relations = _set_relations(_quadrant_counts(if_high, op_high))
+                jac = relations["jaccard"]
+                detail = (f"{int(op_high.sum())} alertas de {total}; Jaccard vs. producción "
+                          f"(umbral {threshold:.3f}) = {jac:.3f}" if jac is not None
+                          else f"{int(op_high.sum())} alertas de {total}")
+                experiments.append({
+                    "experiment": f"Sensibilidad del punto de operación (IF, top {100 * float(value):g}%)",
+                    "status": STATUS_EXECUTED,
+                    "configuration": f"contamination={value} (solo corte; no cambia el modelo)",
+                    "artifact": None,
+                    "detail": detail,
+                    "reason": None,
+                })
+            except Exception as exc:  # noqa: BLE001 - one bad grid point must not kill the sweep
+                experiments.append({
+                    "experiment": f"Sensibilidad del punto de operación (IF, top {value}%)",
+                    "status": STATUS_FAILED, "reason": str(exc),
+                })
     else:
         experiments.append({
-            "experiment": "Variantes de contaminación (IF)",
+            "experiment": "Sensibilidad del punto de operación (IF)",
             "status": STATUS_NOT_REQUESTED,
             "reason": "No se configuró una malla de contaminación "
-                     "(--diagnostic-experiment-contamination-grid).",
+                     "(--diagnostic-experiment-contamination-grid) o falta el percentil IF.",
         })
 
-    # -- Capacidad y dimensión latente / Beta y programación KL (VAE):
-    #    ejecutables con la misma clase VAEDetector, pero cada punto de la
-    #    malla es un entrenamiento completo -- apagado por defecto, opt-in.
+    # -- Las seis familias que antes quedaban NOT_REQUESTED (capacidad, beta y
+    #    programación KL, pérdidas por tipo, ablación, backtests, estabilidad
+    #    entre ventanas): activas por defecto cuando el puente recibe su
+    #    contexto (`main.py`). Ver `src/evaluation/ifvae_experiments.py`.
+    if ctx is not None and settings is not None and frames is not None:
+        from src.evaluation.ifvae_experiments import run_experiment_families
+
+        cfg = config_dict or {}
+        run_ctx = dict(ctx)
+        run_ctx["threshold"] = threshold
+        run_ctx["scale_floor"] = float((config_dict or {}).get("contribution_scale_floor", 0.0))
+        run_ctx["center"] = bool((config_dict or {}).get("contribution_center", False))
+        run_ctx["top_k"] = int(cfg.get("top_k_residuals", 5))
+        run_ctx["alert_k"] = int(max(cfg.get("alert_budgets") or [run_ctx["top_k"]]))
+        experiments.extend(run_experiment_families(
+            ctx=run_ctx, settings=settings, frames=frames,
+            prod_if_high=if_high, prod_vae_high=vae_high,
+            prod_if_scores=scored_diag["if_score"].to_numpy(dtype=float),
+            noise_floor=noise_floor,
+        ))
+        experiments.append({"experiment": "Preprocesamiento", "status": STATUS_NOT_REQUESTED,
+                            "reason": dict(_OUT_OF_SCOPE_EXPERIMENTS)["Preprocesamiento"]})
+        return experiments
+
+    # -- Camino heredado (sin contexto de `main.py`, p. ej. pruebas unitarias):
+    #    mallas opt-in de capacidad / beta y familias fuera de alcance.
     for label, param, grid, refit_param_names in (
         ("Capacidad y dimensión latente (VAE)", "latent_dim", capacity_grid, _VAE_REFIT_PARAMS),
         ("Beta y programación KL (VAE)", "beta", beta_grid, _VAE_REFIT_PARAMS),
@@ -856,7 +1008,12 @@ def _build_experiments(
 
 def _group_quadrants(scored_diag: pd.DataFrame, group_column: str) -> list:
     rows = []
-    for group, block in scored_diag.groupby(group_column, sort=True):
+    # Missing segment membership is operationally meaningful: dropping it would
+    # make the table's population smaller than the evaluated OOT population.
+    grouped = scored_diag.assign(
+        **{group_column: scored_diag[group_column].fillna("Sin segmento")}
+    )
+    for group, block in grouped.groupby(group_column, sort=True, dropna=False):
         counts = {k: int((block["quadrant"] == k).sum()) for k in QUADRANT_KEYS}
         relations = _set_relations(counts)
         n = len(block)
@@ -937,10 +1094,13 @@ def run_ifvae_diagnostic_suite(
     stability_refits: int = 3,
     base_seed: int = 42,
     segment: Optional[np.ndarray] = None,
+    segment_name: Optional[str] = None,
     auto_install_suite: bool = True,
-    experiment_contamination_grid: Sequence[float] = (0.01, 0.02, 0.05),
+    experiment_contamination_grid: Sequence[float] = (0.02, 0.01, 0.005),
     experiment_capacity_grid: Sequence[int] = (),
     experiment_beta_grid: Sequence[float] = (),
+    experiment_ctx: Optional[dict] = None,
+    experiment_settings: Optional[dict] = None,
 ) -> dict:
     """Run the suite label-free against this run's own OOT window and return
     ``{"contract": ..., "interpretation": ..., ...run-level fields}``.
@@ -970,9 +1130,9 @@ def run_ifvae_diagnostic_suite(
         "ifvae_diagnostic[prep]", total=2, unit="paso"
     ) as prep:
         with prep.stage(f"{_NS}_vae_forward", label="Pasada del VAE ajustado (mu, logvar, recon)"):
-            mu, logvar, recon = _vae_forward(vae_detector, x_vae)
+            mu, logvar, x_vae_dense, recon, vae_feature_names = _vae_frame_arrays(
+                vae_detector, x_vae, vae_feature_names)
         with prep.stage(f"{_NS}_build_frame", label="Poblaciones de referencia y evaluada"):
-            x_vae_dense = _densify(x_vae)
             entity_ids = keys[entity_col].to_numpy()
             periods = keys[time_col].astype(str).to_numpy()
 
@@ -994,6 +1154,11 @@ def run_ifvae_diagnostic_suite(
         sensitivity_grid=sensitivity_grid,
         entity_view=entity_view,
         segment_col=("segment" if segment is not None else None),
+        segment_name=segment_name,
+        contribution_scale_floor=mixed_norm(vae_detector).get("scale_floor_fraction", 0.0),
+        contribution_center=mixed_norm(vae_detector).get("center", False),
+        experiment_ctx=experiment_ctx,
+        experiment_settings=experiment_settings,
         stability=(
             {
                 "if_detector": if_detector, "x_if_fit": x_if[in_mask],
@@ -1023,10 +1188,15 @@ def diagnose_frames(
     entity_view: bool = False,
     label_col: Optional[str] = None,
     segment_col: Optional[str] = None,
+    segment_name: Optional[str] = None,
+    experiment_ctx: Optional[dict] = None,
+    experiment_settings: Optional[dict] = None,
+    contribution_scale_floor: float = 0.0,
+    contribution_center: bool = False,
     vae_primary_score: str = "recon_topk",
     stability: Optional[dict] = None,
     auto_install_suite: bool = True,
-    experiment_contamination_grid: Sequence[float] = (0.01, 0.02, 0.05),
+    experiment_contamination_grid: Sequence[float] = (0.02, 0.01, 0.005),
     experiment_capacity_grid: Sequence[int] = (),
     experiment_beta_grid: Sequence[float] = (),
 ) -> dict:
@@ -1063,6 +1233,8 @@ def diagnose_frames(
         vae_primary_score=vae_primary_score,
         top_k_residuals=top_k_residuals,
         percentile_threshold=percentile_threshold,
+        contribution_scale_floor=contribution_scale_floor,
+        contribution_center=contribution_center,
     )
     with _suite_progress() as progress, progress.stages(
         "ifvae_diagnostic", total=_N_DIAGNOSTIC_TESTS, unit="prueba"
@@ -1123,10 +1295,16 @@ def diagnose_frames(
                 )
                 segmentation = {"status": STATUS_EXECUTED, "reason": None,
                                 "source": "ifvae_diagnostics/scored_diagnostics.csv",
-                                "rows": segment_rows}
+                                "rows": segment_rows,
+                                # The user's real column name (the frame column is always
+                                # called "segment" internally): shown in the report.
+                                "column": segment_name or segment_col}
             else:
-                segmentation = {"status": STATUS_NOT_APPLICABLE, "reason": REASON_NO_SEGMENT,
-                                "source": "ifvae_diag.config::segment_col", "rows": []}
+                segmentation = {"status": STATUS_NOT_APPLICABLE,
+                                "reason": REASON_NO_SEGMENT + (
+                                    f" Columna solicitada: {segment_name!r}." if segment_name else ""),
+                                "source": "ifvae_diag.config::segment_col", "rows": [],
+                                "column": segment_name}
 
             populations = {
                 "reference": _population_meta(
@@ -1163,6 +1341,9 @@ def diagnose_frames(
                 capacity_grid=experiment_capacity_grid,
                 beta_grid=experiment_beta_grid,
                 base_seed=(stability or {}).get("base_seed", 42),
+                ctx=experiment_ctx, settings=experiment_settings,
+                frames={"reference": reference, "scored": scored, "features": list(features)},
+                config_dict=config_dict,
             )
 
         with stages.stage(f"{_NS}build_diagnostic_contract", label="Ficha factual"):
@@ -1201,6 +1382,7 @@ def diagnose_frames(
     return {
         "contract": contract,
         "interpretation": interpretation,
+        "stability": stability_result,
         "rows_reference": int(len(reference)),
         "rows_scored": int(len(scored)),
         "quadrants": agreement["quadrants"],

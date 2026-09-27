@@ -2669,3 +2669,245 @@ ejecutadas y comparadas con IF/VAE sobre las mismas filas; el reporte y el HTML 
 capítulo y la fase. Con el hazard a 3 meses la ventana OOT (últimos 3 meses) queda censurada por diseño y
 se informa como "sin filas elegibles". Es un panel sintético: prueba el cableado y los fallbacks, no el
 desempeño sobre datos reales.
+
+---
+
+## 2026-09-24/25 — IF tuner redesign, VAE tuning reliability, one config file, six §9 experiment families
+
+Everything measured here is on **synthetic** data; the point is functional and methodological
+validation, not a claim about real data.
+
+**IF tuner (`tune_iforest`).** Diagnosis (earlier this cycle, 156-configuration grid on two labelled
+panels + 15-trial study replays): the label-free `rank_agreement` objective rose mechanically with the
+tree count (Spearman 0.87 with `n_estimators`), was noisy (sd ≈ 0.034) and was blind to the ψ axis that
+matters; `max_samples` as a fraction meant three different absolute sizes (objective halves, refit on all
+in-time rows, stacking forest on train only: a 2.5× mismatch); the docs said "top-decile" where the code
+used a top-k fraction. Redesign: `n_estimators=300` and `bootstrap=False` fixed; only `max_samples`
+(absolute integer, log-uniform 1 024–32 768, capped to the fit rows) and `max_features` (0.5–1.0) are
+searched, with a Sobol sweep and anchors at ψ ∈ {1 024, 4 096, 16 384, 32 768}; default label-free
+objective `tail_separation`; labelled objective = AP on the known validation rows of the reviewed labels
+when gate 4.5 authorises them (Phase 5b); selection = cheapest trial within 1 noise-sd of the best, kept
+only if it beats the re-evaluated paper default (ψ=256) by > 1 sd; `contamination` no longer searched
+(YAML `contamination_tuned: false`); `n_trials` is a total budget; fingerprinted study name.
+
+*Validation of the new tuner* (real `tune_iforest`, panels 42 and 7 × 5 study seeds, 15 trials, true AP on
+the held-out test+OOT windows):
+
+| variant | true AP (mean ± sd) | recall@5 % | beats ψ=256 default |
+|---|---|---|---|
+| default ψ=256, 300 trees, all features | 0.0269 ± 0.0011 | 0.041 | — |
+| untuned fallback ψ=4096 | 0.0356 ± 0.0022 | 0.154 | 10/10 |
+| new tuner, label-free (`tail_separation`) | 0.0364 ± 0.0040 | 0.165 | 10/10 |
+| new tuner, reviewed labels (AP, validation months) | **0.0423 ± 0.0033** | **0.241** | 10/10 |
+
+The selection rule deployed the tuned configuration in 20/20 studies (a gain of that size is far above the
+default's noise). ~56 s per 15-trial study. The direction of the ψ effect is regime-dependent (it reverses
+under `robust` scaling), which is why the tuner always re-evaluates the ψ=256 default as its reference.
+
+**VAE tuning reliability.** `VAEDetector.load` rebuilt with `epochs=0` → the schedule (`epochs`,
+`kl_anneal_epochs`, `early_stopping_patience`) is now persisted and restored; `fit` refuses `epochs < 1`;
+checkpoint resume requires the whole training config and a data fingerprint (before, only the architecture:
+a same-shape checkpoint from other data/beta/lr was resumed or returned as the "result" without training);
+study name fingerprinted (was the fixed string `vae`); per-study trial checkpoint dirs; `n_trials − completed`
+resume budget; stale `RUNNING` trials closed; the refit uses the winning trial's KL ramp; the diagnostic's VAE
+stability/sweep refits use a temp checkpoint dir with `resume=False` (they used to resume the production
+checkpoint and return the same model whatever the seed); a failed tuning is an incident and never reads a stale
+YAML. **Phase 8c fixes:** unreadable/blank `label_available_at` now excludes the row (fail-closed); contradictory
+duplicates stay unknown under `--labels-unlisted-as-negative`; an episode is out-of-sample only if it *starts* in
+test/OOT; `entity#suffix` episode ids escape `#`/`%` (two episodes used to merge).
+
+**Contamination.** The §9 refit sweep returned the identical forest for every value (contamination only moves
+`offset_`); it is now a score-based operating-point sensitivity (top 2 %, 1 %, 0.5 % of the IF score vs the
+production alert set, no refits).
+
+**Finding, not yet changed (see CONTEXT "Known open problems").** The diagnostic's VAE percentile
+(`recon_topk` of |residual|/MAD) is dominated by one-hot columns: on the synthetic panel 98 % of each row's
+top-5 contributors are one-hot (66 % of the columns), Spearman(`recon_topk`, IF) = 0.06 vs 0.58 for the raw
+MSE, and 8/76 of the VAE top-1 % rows have an IF percentile ≤ 20 % vs 0/76 with the raw MSE. A scale artifact of
+the MAD on mostly-zero columns; the new "Pérdidas por tipo de feature" experiment exposes it on every run.
+
+**One configuration file.** `configs/pipeline.yaml` (`--config PATH`) holds the segment column, the analyst
+identity column and the §9 `experiments:` block; precedence CLI > code > file > default; unknown keys are an
+error; an explicit segment missing from the panel stops the run at the start with the closest match and all
+columns; the report names the real column; `config_sources` is logged. Root cause of "I set the segment and it
+was ignored": three independent sources (dataclass default, CLI flag, the vendored suite's default), a dead
+`--analyst-identity-column` default of the same kind, a case-sensitive lookup that only warned at the end, and
+a report that never said which column was requested.
+
+**§9 experiments, all active by default** (`src/evaluation/ifvae_experiments.py`): capacity/latent dimension,
+beta + KL schedule, loss by feature type, feature-family ablation, rolling-origin backtests (each origin
+re-preprocesses and refits on strictly earlier periods; a test spies on `fit_transform_panel` to prove it) and
+window stability; alert sets built like production; shared VAE retrain budget (15 = 1 noise control + 14), epoch and row caps disclosed
+per row; every variant is read against a control (production configuration refitted with another
+seed and the same caps, same alert-set Jaccard). A real scratch run of `main.run_pipeline`
+(300 entities × 12 periods, 4 VAE epochs): 46 §9 rows, all six families EXECUTED, 13 of 14 VAE retrains
+used (before the control was added); 6.5 min for the whole run.
+
+**Independent validation (data-team quality-validator role) and fixes.** No leakage and no row
+misalignment found in the backtest (perturbing rows at/after each origin left the fit rows identical; the
+alert arrays reproduce production's exactly). It confirmed and I fixed: (1) the "seed floor" shown next to the
+Jaccards was the stability section's raw-score top-100 Jaccard, a different set (0.86 shown vs ≈0.1–0.3 for the
+alert-set measure) → replaced by a per-run control refit; (2) the shipped yaml's `segment_column: segment` made the
+built-in default an explicit request that raised on panels without it → the shipped file no longer sets it (the
+export tool follows the same rule); (3) `backtest_origins: 0` emitted no row and `families: []` ran everything → both
+visible now (`[]` = none); plus: abbreviated flags no longer bypass the file precedence (`allow_abbrev=False`), non-UTF-8
+yaml gives a clear error, value ranges validated (`epoch_cap`, `max_fit_rows`, grids), VAE ablation no longer prints
+the non-comparable −ELBO, `kl_anneal_epochs` clipping is disclosed, backtest VAE text depends on stacking, chance
+reference added to window-stability Jaccards, temp checkpoint dirs cleaned in `finally`, categorical source columns
+detected by non-numeric dtype (pandas 2/3). Known limits left as documented: each backtest origin re-runs the
+preprocessing on the full panel (`max_fit_rows` caps the fits only), and the VAE backtest is not comparable with
+production when stacking is on.
+
+**Tests.** 210 pass (new: `test_tuning_iforest.py`, `test_tuning_vae.py`, `test_config_file.py`,
+`test_ifvae_experiments.py`; extended: `test_event_supervision.py`, `test_diagnostic_section.py`).
+
+---
+
+## 2026-09-25 — VAE con embeddings para las categóricas (opt-in; el default sigue en `onehot`)
+
+**Problema.** Con one-hot cada nivel de una categórica es una feature independiente del VAE: una variable de 40 niveles aporta 40 términos, una columna casi
+siempre en cero tiene un MAD minúsculo y el `recon_topk` del diagnóstico elegía *columnas dummy* en lugar de variables de negocio (sintético: 93–96 % de los lugares
+top-5 eran one-hot, que son el 65 % de las columnas; AP de `recon_topk` = 0.018, el nivel del azar).
+
+**Qué se construyó.** `vae.categorical_representation: embedding` (`configs/pipeline.yaml`, `--vae-categorical-representation`): vista mixta del VAE
+(`src/preprocessing/mixed_view.py`: numéricas/binarias/flags de missing tomadas del mismo preprocesamiento causal + **un índice entero por categórica**, tokens
+MISSING=0 / UNKNOWN=1, vocabulario ordenado aprendido solo en train), modelo mixto (`src/models/mixed_vae.py`: embedding por variable; cabezas numérica Huber, binaria BCE
+con logits y **una softmax por categórica**, cross-entropy contra el índice real; KL/β/rampa sin cambio; pérdida registrada por familia y por variable categórica),
+score y `recon_topk` con **una contribución por variable original** (centrada en la mediana de referencia de train y escalada con MAD y piso `0.1 × media del exceso`
+y `1e-6`), identidad de arquitectura (`architecture_fingerprint` con variables, orden, vocabularios, dimensiones, pérdidas, pesos, política de tokens y versión),
+checkpoints one-hot **rechazados** (y los incompatibles, apartados en vez de sobrescritos), tuneo con y sin labels (incl. parciales con NaN), sensibilidad
+que recodifica con los mismos vocabularios, explicaciones con nombre original + categoría + probabilidad reconstruida, y las seis familias del §9 con ambas
+arquitecturas (pérdidas por tipo en variables originales con filas MISSING/UNKNOWN y control one-hot, ablación con sub-layout, vocabulario por origen en el backtest).
+La suite vendorizada ganó `contribution_scale_floor` y `contribution_center` (apagados por defecto).
+
+**Antes / después** (paneles sintéticos independientes, 600×14, 5 semillas, 20 épocas; semilla de datos 42 / 7; misma normalización en ambos brazos donde se indica):
+
+| | one-hot (antes) | embeddings (después) |
+|---|---|---|
+| Columnas de entrada / términos de reconstrucción por fila | 66 / 66 | 29 / 24 |
+| Lugares top-k en términos categóricos (25 % esperado) | 72 % / 73 % (95 % con la normalización histórica) | 34 % / 35 % |
+| AP de `recon_topk` | 0.019 / 0.020 (azar) | 0.224 / 0.220 |
+| AP del score de producción (Excel) | 0.043 / 0.063 | 0.112 / 0.133 |
+| `tail_separation` del score de producción (Excel) | 2.53 / 2.20 | 1.62 / 1.54 |
+| Estabilidad entre semillas (Jaccard de alertas, pipeline tal cual) | 0.46 / 0.37 | 0.90 / 0.84 |
+| Estabilidad entre ventanas Spearman: literal (A completo) / solo numéricas | 0.78 / 0.25 | 0.41 / 0.39 |
+| Dispersión máx/mín de la tasa de lugares entre categóricas (referencia sin deriva, ambos centrados) | 1.44× / 1.49× | 1.24× / 1.14× |
+| Tiempo de ajuste / memoria pico Δ | 7.4 s / 12 MB | 3.0 s / 1.9 MB |
+
+**Decisión.** Tres criterios de aceptación medibles **no** se cumplen (`tail_separation` del score de producción; estabilidad entre ventanas Spearman y Jaccard
+medida literalmente contra el one-hot completo, inflado por atributos categóricos estáticos), así que **el default de producción sigue en `onehot`**. Cambiarlo es una línea
+en `configs/pipeline.yaml`. Detalle y comparación en `docs/models_vae.md` §2c y `docs/validation/2026-09-25_vae_representations/`.
+
+**Revisión independiente (rol quality-validator del equipo) y correcciones.** Sin fugas temporales ni roturas del núcleo. Confirmó y se corrigió: (1) las explicaciones
+al analista y el gráfico de atribución rankeaban contribuciones **crudas** (una uniforme de 40 niveles quedaba en el top-5 de 400/400 filas) → ahora rankean
+contribuciones normalizadas con la referencia de train que el detector guarda y persiste; (2) la comparación A/B aplicaba el centrado solo a B → ahora ambos brazos
+se miden con las dos normalizaciones y los criterios se evalúan por pares (tal cual y misma normalización); (3) el control de estabilidad entre ventanas se redefinía
+a posteriori → se reportan el control literal y el equivalente, y los criterios "asertados" (una contribución por variable, sin one-hot, referencia de train) ahora
+se miden; (4) el piso de normalización documentado no coincidía con el código → documentado tal cual; (5) `categorical_sources` no era la rama categórica del pipeline
+→ ahora usa el mismo selector; (6) `fit(resume=True)` sobrescribía el checkpoint de otra arquitectura → se aparta; además: `load(expect_fingerprint)` contra un payload one-hot,
+claves desconocidas en la configuración guardada, `NLL_CAP` y las constantes de normalización en la identidad, valores no finitos o binarios fuera de {0,1}.
+
+**Riesgos de migración.**
+- Un modelo one-hot **no se convierte** en uno con embeddings (ni al revés): `VAEDetector.load` lo rechaza (`IncompatibleCheckpointError`) **solo si quien llama exige** `expect_architecture`/`expect_fingerprint` (lo hace `main.py` tras tunear); sin esos argumentos carga cualquiera de las dos. Cambiar de arquitectura implica reentrenar.
+- Checkpoints de reanudación: con `fit(resume=True)` el checkpoint incompatible se **aparta** a `<archivo>.incompatible-<arquitectura>` en vez de sobrescribirse, pero hay un solo hueco por arquitectura (una cuarentena previa con la misma etiqueta se reemplaza) y con `resume=False` se sobrescribe sin cuarentena. Ir onehot → embedding → onehot no restaura el ajuste anterior.
+- Al volver a la arquitectura anterior, `vae_best.pt` y el YAML de mejores parámetros se sobrescriben sin respaldo: el rollback cuesta un reajuste (semilla determinista). Los estudios de Optuna previos no se reanudan (la huella del estudio ahora incluye la arquitectura).
+- Con `embedding`, los flags de missing numérico ya no puntúan.
+- La deriva de la suite vendorizada lee los índices de categoría como números, no como niveles.
+- Los niveles categóricos se comparan por su forma de texto: `'1'` y `1` son el mismo nivel.
+- El backtest reprocesa el panel completo en cada origen: costo lineal en el número de orígenes (`backtest_origins`).
+- El default sigue en `onehot`; pasar a `embedding` es una línea en `configs/pipeline.yaml` (`vae.categorical_representation`) y requiere aceptar los tres criterios fallidos de arriba.
+
+**Depuración de las pruebas (2026-09-25).** Se auditó cada archivo de `tests/`: se conservó toda prueba que fija un comportamiento o un defecto real y se quitó lo que no aportaba.
+- Eliminadas (4): `test_vendored_suite_tests_are_present` (solo miraba que existieran archivos; la suite corre su propio gate), `test_interpretation_renderer_is_allowed_interpretive_language` (buscaba una palabra en un docstring), `test_report_module_delegates_both_chapters` (buscaba nombres de función en el código fuente; el comportamiento ya lo cubren las pruebas del reporte) y `test_no_generic_tracking_reason_leaks_into_any_row` (subsumida por `test_out_of_scope_families_carry_a_specific_not_generic_reason`).
+- Endurecida: `test_contract_is_versioned_and_serializable` ya no afirma tamaños arbitrarios de JSON (`> 3000`, `> 500`).
+- Más rápidas sin perder cobertura: las pruebas que solo *leen* la matriz §9 por defecto la comparten (`default_rows()`), en vez de reentrenar seis familias por cada prueba (7–11 s cada una).
+- Defecto de aislamiento corregido: `RealStabilityTests._fit_tiny_detectors` ajustaba un VAE sin `checkpoint_dir` y escribía sobre `artifacts/models/vae/` del proyecto; ahora usa un directorio temporal. Se verificó que la suite completa ya no modifica ese checkpoint.
+- La suite vendorizada no se tocó: su quality gate ya rechaza tautologías y mata mutantes.
+- Código muerto quitado de una prueba (`... if False else None`, `"configuracion" if False else "configuration"`).
+
+**Hallazgo de la corrida sintética completa (embeddings + tuneo).** El código de salida fue 0 pero el log traía un aviso: la fase de sensibilidad post-entrenamiento
+**fallaba** ("the mixed VAE input holds NaN/inf…"). Causa: el escenario `null::<columna booleana>` deja `NaN` en la matriz (el preprocesador solo convierte los booleanos a
+float, sin imputar); el VAE mixto exige valores finitos y abortaba **toda** la fase. Las pruebas no lo veían porque ninguna perturbaba una columna booleana. Corregido en
+`MixedViewBuilder.transform`: un nulo en una columna binaria se puntúa como `False` (una columna binaria no tiene token MISSING ni flag); un `NaN` numérico sigue rechazado.
+Prueba nueva: `test_a_null_binary_value_is_scored_as_false_instead_of_aborting_the_scoring`.
+**Defecto preexistente en la ruta por defecto (one-hot), corregido:** ese mismo `NaN` pasa sin error y **las 1500 puntuaciones** del VAE en ese escenario eran `NaN` (no una fila; lo dije mal antes de que la
+revisión del quality-validator lo verificara). `sensitivity_variables.csv` lo convertía en `leverage 102.3`, `min_rank_correlation 0.0` y "INDISPENSABLE — conservar" (rank 5) para `is_digital_active`, mientras que con
+embeddings la misma variable salía "MARGINAL — candidata a eliminación" (rank 20); el health check de artefactos pasaba igual. Ahora `run_post_training_sensitivity` **omite** todo escenario cuyas
+puntuaciones no sean finitas, lo avisa en el log y lo registra en `sensitivity_summary.json` → `skipped_non_finite_scenarios`; la variable se juzga por sus otros escenarios. Prueba nueva con mutante verificado:
+`NonFiniteScenarioTests`. **Sigue pendiente de decisión** imputar los booleanos nulos en el preprocesador (cambiaría también lo que ve el IF) o validar entrada finita en el VAE one-hot.
+**Fallo de fase con código de salida 0 (abierto):** la corrida de embeddings previa al arreglo terminó `status=success` con la fase de sensibilidad caída (solo un WARNING y un check de artefacto ausente: 54 checks frente a 55).
+Un operador que mire solo el código de salida no lo ve.
+**Huecos de prueba conocidos (abiertos):** no hay prueba unitaria de que `build_report` incluya los capítulos IF-VAE e Interpretación (los cubre la corrida e2e); el enmascarado de booleanos nulos en la vista mixta no cuenta ni registra las celdas.
+
+**Hallazgo abierto: colapso posterior del VAE con embeddings tuneado (corrida sintética `--quick`, 500×13, 5 trials).** El health check crítico `vae.posterior_collapse` falla
+en las dos corridas con embeddings (0/25 unidades activas, KL media 0.055; idénticas a 16 dígitos porque la corrida es determinista: es una sola evidencia, no dos). La corrida
+one-hot, también tuneada, pasa (21/21 activas, KL 0.61). Lo que se sabe y lo que no (revisión del rol data-scientist, verificada contra `run_events.jsonl` y `best_params_vae.yaml`):
+- El tuner eligió `beta=0.32, latent_dim=25, 3×128` (y el trial de un `beta` parecido en one-hot baja su KL de 0.137 a 0.024 en 4 épocas): es la configuración elegida, no algo exclusivo de la arquitectura.
+- La escala de la reconstrucción con embeddings es ≈17–19 frente a ≈68–71 en one-hot, así que el mismo `beta` pesa ~3.5× más en relativo; el rango 0.1–2.0 del tuner se diseñó para one-hot.
+- Un modelo colapsado gana el −ELBO(β=1) (19.25 frente a 19.55 del modelo activo): el objetivo del tuner no puede distinguirlos. No hay restricción anti-colapso en la selección.
+- Confusión con `--quick`: ~55 pasos de optimización (4 épocas). No se puede separar con estos datos.
+- Su estabilidad entre semillas (0.979 frente a 0.371 en one-hot) es en parte un síntoma: con z ignorado el score es casi determinista.
+- En el A/B (20 épocas, β=1) el brazo embedding ya muestra colapso parcial (6.4–6.6 de 8 unidades activas frente a 8).
+Experimento mínimo propuesto: arquitectura fija, sin tuner, `beta ∈ {0.01, 0.03, 0.1, 0.3, 1}` × épocas `{5, 20, 60}` × 3 semillas, registrando unidades activas (δ=0.01 y 0.001), KL, AP y Jaccard entre semillas; y una restricción anti-colapso en la selección del tuner.
+**Consecuencia para la decisión sobre el default:** mantener `onehot`. Promover `embedding` queda condicionado a resolver el colapso, repetir el A/B exigiendo ≥1/3 de unidades activas por semilla y más semillas de datos.
+**Limitaciones de la comparación A/B (documentadas, no corregidas):** el criterio "sin fuga temporal en la calibración" es tautológico (`n_reference_rows` se fija con `tr.sum()` y se compara con `train_mask.sum()`; no puede fallar); la
+normalización MAD usa residuales de las filas con que se ajustó el modelo; n=5 semillas de modelo y 2 de datos, sin intervalo ni prueba, con tolerancia ad hoc; ~17 criterios × 2 datasets con criterios y controles ajustados tras ver los resultados;
+el generador sintético solo pone anomalías en columnas numéricas (el AP azaroso del one-hot es casi mecánico) y no hay escenario con señal categórica; el control de "solo numéricas" existe para Spearman pero no para Jaccard top-K.
+
+**Pruebas y corridas (2026-09-25, verificado al final).**
+- `py -m pytest tests -q` → **265 passed** (3 min 30 s; antes 267 → −4 eliminadas → +2 nuevas: booleano nulo en la vista mixta y escenarios no finitos en sensibilidad).
+- `cd tools/if_vae_diagnostic_suite && PYTHONPATH=src py scripts/quality_gate.py` → **49 passed**, 4/4 mutantes muertos, compile OK, complejidad ≤ 10.
+- Corrida sintética completa (`--quick`, 500 individuos × 13 periodos, directorio temporal, nunca `artifacts/` del proyecto):
+  - **one-hot (default), final**: código 0, sin errores, 0 checks fallidos, §9 = 43 EXECUTED / 6 NOT_APPLICABLE / 5 NOT_REQUESTED / 0 FAILED; `null::is_digital_active` se omite con aviso y la variable queda "CONSERVAR — impacto intermedio" (rank 17).
+  - **embedding + tuneo (`--tune`), tras el arreglo del booleano nulo**: código 0, sin errores, sensibilidad completa (7 artefactos), §9 = 42 / 7 / 5 / 0 FAILED. Único check en rojo: `vae.posterior_collapse` (ver hallazgo abierto).
+- Revisión independiente del equipo de DataPipeline (quality-validator, data-scientist, mlops-engineer): produjo los hallazgos y correcciones de este bloque. Las afirmaciones se verificaron contra el código y los artefactos antes de aplicarlas.
+
+---
+
+## 2026-09-27 — Identification-only columns (single source of truth) and the missing report-chapters test
+
+**Decisión mantenida.** El default del VAE sigue en `onehot` (ver el bloque anterior); no se tocó.
+
+**Columnas de identificación, excluidas de toda fase de modelado.** Petición explícita: poder declarar columnas del panel que solo identifican
+un registro para un lector humano (puesto, nombre, área, un número de referencia interno, ...) y que **nunca** deben ser evaluadas por el
+modelo, sin tener que repetir esa exclusión en cada archivo que decide qué ve el modelo. Antes de este cambio, la única columna con esa
+semántica (`dashboard.identity_column`, "puesto") **sí** se colaba como feature: no había forma de declarar "esto es solo para identificar".
+- **Una sola fuente de verdad.** `PanelSchema.identification_columns` (nuevo campo) y `src/data/loader.py::key_columns(schema)` (nueva función):
+  el único lugar donde se junta el conjunto {`entity_col`, `time_col`, `target_col`, `identification_columns`}. `main()` lo resuelve UNA vez,
+  justo después de cargar el panel (`_resolve_identification_columns`), y lo asigna a `schema.identification_columns` antes de que nada más
+  lea `schema`. Cinco sitios que antes recalculaban su propia lista de "columnas clave" por separado ahora llaman a `key_columns(schema)`:
+  construcción de features (`PanelFeatureEngineer`/`build_preprocessing_pipeline`, vía un nuevo parámetro `excluded_columns`), las fuentes
+  categóricas del VAE mixto (`categorical_sources`), el filtro de fila en cero exacto (`drop_exact_zero_rows`), el diagnóstico de
+  transformaciones numéricas (`infer_numeric_features`) y la sensibilidad post-entrenamiento (`run_post_training_sensitivity`).
+- **Config.** `data.identification_columns` (lista de nombres) en `configs/pipeline.yaml`, o `--identification-columns COL [COL ...]`, con la
+  misma precedencia CLI > código > archivo > default de siempre. `dashboard.identity_column` se agrega automáticamente al conjunto — no hace
+  falta repetirla. Un nombre configurado que no existe en el panel **solo avisa** (`config.identification_columns_present`, no detiene la
+  corrida): a diferencia del segmento, no hay nada que se rompa río abajo, y el mismo archivo puede correr contra paneles que no traen todas
+  las mismas columnas opcionales.
+- **Deliberadamente NO tocado: los contextos de exhibición.** El dashboard del analista, la columna "VARIABLES" del Excel de OOT y el perfil
+  crudo del panel siguen mostrando estas columnas — identificar es justamente para qué existen ahí. Solo se excluyen de las fases que deciden
+  qué ve el modelo.
+- **La suite vendorizada no necesita configuración aparte.** Su `DiagnosticConfig.features` se arma a partir de los nombres de feature ya
+  preprocesados, así que una columna excluida aguas arriba ya no existe para la suite; no hay una segunda lista que mantener sincronizada.
+- **Pruebas.** `tests/test_identification_columns.py` (nuevo: `key_columns` y los dos sitios sin archivo de prueba propio) + una prueba en cada
+  uno de `test_config_file.py` (resolución/precedencia/dedup, con mutante verificado a mano para el helper de sensibilidad), `test_zero_row_filter.py`,
+  `test_mixed_vae.py` (`categorical_sources`) y `test_sensitivity.py`. Dos `mock.Mock(...)` de pruebas existentes que representaban un `PanelSchema`
+  se actualizaron con `identification_columns=()` explícito: un `Mock` sin ese atributo lo autogenera en vez de usar el default de `getattr`, lo que
+  habría roto la nueva llamada a `key_columns` con un `TypeError` al desempaquetarlo.
+
+**Prueba faltante que el usuario pidió explícitamente: que el reporte incluya los capítulos IF-VAE e Interpretación.** Antes solo lo cubría la
+corrida end-to-end; la prueba `test_report_module_delegates_both_chapters` eliminada en la auditoría del 2026-09-25 solo comprobaba (con un grep)
+que el código fuente *nombrara* las funciones delegadoras, así que un regreso real (un capítulo caído en silencio del ensamblado, o renderizado
+desde un stub en vez del contrato real) no habría hecho fallar ninguna prueba. `ReportIncludesBothChaptersTests`
+(`tests/test_diagnostic_section.py`) construye un contrato y una interpretación reales (el mismo camino `build()` que usa el resto del archivo),
+arma el contexto del reporte y verifica en Markdown y HTML: (1) que aparecen ambos encabezados de capítulo, (2) que el texto no es solo el
+encabezado estático — un título de sección que únicamente existe dentro del contrato real también aparece, y (3) que sin `diagnostic_suite` en
+el contexto ninguno de los dos capítulos aparece (nunca un stub). Mutante verificado a mano: con `_diagnostic_suite_section_md` forzada a
+devolver `""`, la prueba falla.
+
+**Pruebas y corrida final (2026-09-27, verificado).**
+- `py -m pytest tests -q` → **286 passed** (~4 min 50 s; +21 sobre las 265 anteriores).
+- `cd tools/if_vae_diagnostic_suite && PYTHONPATH=src py scripts/quality_gate.py` → **49 passed**, 4/4 mutantes muertos, compile OK, complejidad ≤ 10 (sin cambios en este bloque).
+- Corrida sintética completa (`--quick`, directorio temporal, default `onehot`, con tuneo — el preset `--quick` siempre tunea, 5 trials): código 0, sin excepciones, 651 s. 61 checks de observabilidad, 2 en rojo:
+  - `config.identification_columns_present` (severidad `warning`, **esperado**): el panel sintético no trae `puesto`, así que el `identity_column` por defecto queda fuera de la lista resuelta con un aviso — el mismo comportamiento que ya tenía el dashboard con esa columna ("No disponible"), ahora también aplicado a la exclusión de modelado.
+  - `vae.posterior_collapse` (severidad `critical`, **hallazgo nuevo**): 0/31 unidades activas con `latent_dim=31, beta=1.84` (el estudio de Optuna, misma semilla 42, eligió un punto distinto al de la corrida anterior del bloque previo — `latent_dim=21, beta=1.4` — que sí pasaba). **No lo causaron los cambios de este bloque**: `identification_columns` resuelve vacío en este panel (nada excluido de la matriz de features), así que la matriz que ve el VAE es idéntica a antes del cambio. Es evidencia adicional para el hallazgo abierto de la sección anterior: el colapso posterior con `--quick` (pocas épocas, pocos trials) no es exclusivo de la arquitectura `embedding` — el mismo estudio de 5 trials también puede aterrizar en un punto colapsado con `onehot`, según qué trial gane. Refuerza la recomendación ya hecha ahí (restricción anti-colapso en la selección del tuner) en vez de abrir una nueva.

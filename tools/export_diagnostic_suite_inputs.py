@@ -200,7 +200,15 @@ def main() -> None:
 
     entity_ids = keys[entity_col].to_numpy()
     periods = keys[time_col].astype(str).to_numpy()
-    segments = df["segment"].to_numpy() if "segment" in df.columns else None
+    # Same single source as the pipeline: diagnostic.segment_column of configs/pipeline.yaml.
+    from src.utils.config_file import configured_value
+
+    requested = configured_value("diagnostic.segment_column", None)   # None = the file does not say
+    if requested and requested not in df.columns:                      # explicit + missing: loud
+        raise SystemExit(f"Segment column {requested!r} (configs/pipeline.yaml) is not in the "
+                         f"panel. Available: {', '.join(map(str, df.columns))}")
+    segment_name = requested if requested is not None else "segment"   # untouched default: silent if absent
+    segments = df[segment_name].to_numpy() if segment_name and segment_name in df.columns else None
 
     def _slice(mask, with_labels: bool) -> pd.DataFrame:
         return _build_frame(

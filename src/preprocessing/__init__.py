@@ -20,6 +20,12 @@ from src.preprocessing.linear_scaling import (
     select_continuous_columns,
     standard_scale,
 )
+from src.preprocessing.mixed_view import (
+    CategoricalSpec,
+    MixedLayout,
+    MixedViewBuilder,
+    MixedViewConfig,
+)
 from src.preprocessing.pipeline import (
     CATEGORICAL_ENCODINGS,
     NUMERIC_TRANSFORMS,
@@ -41,6 +47,10 @@ from src.preprocessing.statistics import (
 )
 
 __all__ = [
+    "CategoricalSpec",
+    "MixedLayout",
+    "MixedViewBuilder",
+    "MixedViewConfig",
     "build_preprocessing_pipeline",
     "fit_transform_panel",
     "make_numeric_transformer",

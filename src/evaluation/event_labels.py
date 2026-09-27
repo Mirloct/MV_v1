@@ -24,6 +24,13 @@ that file and turns it into per-row arrays aligned with the panel's ``keys``:
 
 Nothing here touches training: labels are consumed after the detectors are
 fitted (evaluation, sufficiency gate, optional challengers).
+Data sources / inputs: reviewed-label CSV/parquet files and panel entity/time
+keys; produces an in-memory point-in-time label contract and audit metadata.
+Created: 2026-09-23
+Last modified: 2026-09-25
+Changelog:
+- 2026-09-25: Enforced exact-day availability and explicit maturity dates when
+  ``as_of`` includes a day; unreadable and future labels continue to fail closed.
 """
 
 from __future__ import annotations
@@ -274,6 +281,16 @@ def _coerce_target(raw: pd.Series) -> tuple[pd.Series, int, int]:
 # --------------------------------------------------------------------------- #
 # Episodes and maturity                                                       #
 # --------------------------------------------------------------------------- #
+def _esc(values) -> np.ndarray:
+    """Escape ``%`` and ``#`` so ``entity#suffix`` episode ids cannot collide.
+
+    Without it entity ``"a#1"`` with episode ``"2"`` and entity ``"a"`` with episode
+    ``"1#2"`` both became ``"a#1#2"`` and silently merged into one episode.
+    """
+    s = pd.Series(np.asarray(values, dtype=object)).astype(str)
+    return s.str.replace("%", "%25", regex=False).str.replace("#", "%23", regex=False).to_numpy(dtype=object)
+
+
 def _derive_episodes(entity: np.ndarray, month: np.ndarray, washout: int) -> np.ndarray:
     """Episode ids for positive rows: an entity's positives belong to one episode
     while fewer than ``washout`` non-positive months separate them."""
@@ -285,12 +302,14 @@ def _derive_episodes(entity: np.ndarray, month: np.ndarray, washout: int) -> np.
     frame["seq"] = new_episode.cumsum()
     first = frame.groupby("seq")["m"].transform("min").astype(int)
     ids[frame["i"].to_numpy()] = (
-        frame["e"].astype(str) + "#" + first.astype(str)
+        pd.Series(_esc(frame["e"].to_numpy()), index=frame.index) + "#" + first.astype(str)
     ).to_numpy()
     return ids
 
 
-def _episode_table(entity, month, episode_id, positive, maturity_month, spec, cutoff_month):
+def _episode_table(
+    entity, month, episode_id, positive, maturity_date, spec, cutoff_month, cutoff_date,
+):
     rows = pd.DataFrame({"episode_id": episode_id[positive], "entity": entity[positive],
                          "m": month[positive]})
     if rows.empty:
@@ -298,9 +317,9 @@ def _episode_table(entity, month, episode_id, positive, maturity_month, spec, cu
     table = rows.groupby("episode_id", sort=False).agg(
         entity=("entity", "first"), start_m=("m", "min"), end_m=("m", "max"), n_rows=("m", "size"),
     ).reset_index()
-    if maturity_month is not None:
-        ready = pd.Series(maturity_month[positive]).groupby(rows["episode_id"].to_numpy()).max()
-        table["mature"] = table["episode_id"].map(ready).le(cutoff_month).fillna(False).to_numpy()
+    if maturity_date is not None:
+        ready = pd.Series(maturity_date[positive]).groupby(rows["episode_id"].to_numpy()).max()
+        table["mature"] = table["episode_id"].map(ready).le(cutoff_date).fillna(False).to_numpy()
     else:
         table["mature"] = (table["end_m"] + spec.maturity_lag_months) <= cutoff_month
     return table
@@ -336,6 +355,12 @@ def load_event_labels(
     cutoff = _parse_as_of(spec.as_of)
     cutoff_month = (int(cutoff.year * 12 + cutoff.month - 1) if cutoff is not None
                     else int(np.nanmax(panel_month)))
+    if cutoff is None:
+        cutoff_date = pd.Timestamp(_month_label(cutoff_month) + "-01") + pd.offsets.MonthEnd(0)
+    elif len(str(spec.as_of).strip()) == 6 and str(spec.as_of).strip().isdigit():
+        cutoff_date = cutoff + pd.offsets.MonthEnd(0)
+    else:
+        cutoff_date = cutoff.normalize()
 
     labels = pd.DataFrame({
         "ent": raw[c_ent].astype(str).str.strip(),
@@ -357,9 +382,14 @@ def load_event_labels(
         bad = ~status.isin(spec.usable_statuses) & labels["excluded"].eq("")
         labels.loc[bad, "excluded"] = "status:" + status[bad]
     if c_ava is not None:
-        avail = _month_index(pd.to_datetime(raw[c_ava], errors="coerce"))
-        late = (avail > cutoff_month) & labels["excluded"].eq("")
+        avail_ts = pd.to_datetime(raw[c_ava], errors="coerce")
+        late = (avail_ts > cutoff_date) & labels["excluded"].eq("")
         labels.loc[late, "excluded"] = "not_yet_available"
+        # A blank/unparseable availability date used to compare False against the
+        # cut-off and let the row through (fail-open): a label whose availability
+        # cannot be verified may not be used as of the cut-off.
+        unreadable = avail_ts.isna() & labels["excluded"].eq("")
+        labels.loc[unreadable, "excluded"] = "availability_unreadable"
     labels.loc[labels["target"].isna() & labels["excluded"].eq(""), "excluded"] = "no_decision"
     audit["excluded"] = labels.loc[labels["excluded"] != "", "excluded"].value_counts().to_dict()
     audit["status_column_present"] = c_sta is not None
@@ -369,11 +399,12 @@ def load_event_labels(
     if c_epi is not None:
         good["episode_src"] = raw.loc[keep, c_epi].astype("string").str.strip().to_numpy()
     if c_mat is not None:
-        good["maturity_m"] = _month_index(pd.to_datetime(raw.loc[keep, c_mat], errors="coerce"))
+        good["maturity_at"] = pd.to_datetime(raw.loc[keep, c_mat], errors="coerce").to_numpy()
     # One row per (entity, month): identical duplicates collapse, disagreeing ones
     # are a conflict and become unknown (never resolved by picking one).
     disagree = good.groupby(["ent", "m"])["target"].transform("nunique").gt(1)
     audit["conflicting_duplicate_rows"] = int(disagree.sum())
+    conflict_pairs = good.loc[disagree, ["ent", "m"]].drop_duplicates()
     good = good.loc[~disagree].drop_duplicates(["ent", "m"], keep="first")
 
     n = len(keys)
@@ -396,8 +427,10 @@ def load_event_labels(
         unlisted = ~known & ~np.isnan(panel_month)
         # Only rows the file says nothing about: a listed-but-excluded row
         # (pending, uncertain, ...) stays unknown even under this policy.
+        # Contradictory duplicates are listed too: unknown, never a negative.
         listed = frame.merge(
-            labels.loc[labels["excluded"] != "", ["ent", "m"]].drop_duplicates(), on=["ent", "m"],
+            pd.concat([labels.loc[labels["excluded"] != "", ["ent", "m"]], conflict_pairs]).drop_duplicates(),
+            on=["ent", "m"],
             how="left", indicator=True).sort_values("i")["_merge"].eq("both").to_numpy()
         target[unlisted & ~listed] = 0.0
         known = ~np.isnan(target)
@@ -414,13 +447,16 @@ def load_event_labels(
         if missing.any():
             provided = None  # incomplete column: derive for every row, and the gate vetoes
     if provided is not None:
-        episode_id[positive] = np.char.add(ent[positive].astype(str), "#" + provided[positive].astype(str))
+        episode_id[positive] = np.char.add(
+            _esc(ent[positive]).astype(str), np.char.add("#", _esc(provided[positive]).astype(str)))
         audit["episode_source"] = "file"
     else:
         episode_id[positive] = _derive_episodes(ent[positive], month[positive], spec.washout_months)
         audit["episode_source"] = "derived"
-    maturity_m = joined["maturity_m"].to_numpy() if c_mat is not None else None
-    episodes = _episode_table(ent, month, episode_id, positive, maturity_m, spec, cutoff_month)
+    maturity_at = joined["maturity_at"].to_numpy() if c_mat is not None else None
+    episodes = _episode_table(
+        ent, month, episode_id, positive, maturity_at, spec, cutoff_month, cutoff_date,
+    )
     mature_ids = set(episodes.loc[episodes["mature"], "episode_id"])
     episode_mature = positive & np.isin(episode_id, list(mature_ids))
     mature_neg = known & (target == 0.0) & (month + spec.maturity_lag_months <= cutoff_month)

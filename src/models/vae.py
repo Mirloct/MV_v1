@@ -41,10 +41,24 @@ identical to the iForest module. For the VAE the score is the per-row
 reconstruction error (see :meth:`VAEDetector.score_samples` for the exact
 formula), which naturally increases with anomalousness, so no sign flip is
 needed.
+
+Data sources / inputs: preprocessed dense/CSR feature matrices, optional
+reviewed labels and temporal validation masks; writes PyTorch checkpoints,
+Optuna SQLite, YAML and detector artifacts under configured paths.
+Created: 2026-08-22
+Last modified: 2026-09-26
+Changelog:
+- 2026-09-25: Hashed complete training data/label masks, preserved early-stop
+  resume state, ignored unknown labels, corrected label-free direction, and
+  made zero-complete-trial studies fail explicitly.
+- 2026-09-26: Fixed the non-tunable training schedule (15-epoch cap, 3-epoch
+  KL warmup, plateau patience 3 at 0.5% relative improvement), removed epochs
+  from Optuna, and persisted the actual training outcome.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import time
 from typing import Callable, Optional, Sequence, Union
@@ -58,6 +72,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
+from src.models.mixed_vae import (
+    MIXED_ARCHITECTURE,
+    MIXED_ARCHITECTURE_VERSION,
+    ONEHOT_ARCHITECTURE,
+    IncompatibleCheckpointError,
+    ContributionReference,
+    MixedVAEConfig,
+    MixedVAEModel,
+)
+from src.preprocessing.mixed_view import MixedLayout
 from src.utils import paths
 from src.utils.atomic_io import atomic_replace
 from src.utils.logging_config import log_phase, setup_logging
@@ -68,6 +92,7 @@ __all__ = [
     "vae_loss",
     "collapse_verdict",
     "VAEDetector",
+    "IncompatibleCheckpointError",
     "tune_vae",
     "plot_reconstruction_error",
     "plot_latent_space",
@@ -93,7 +118,8 @@ _DEFAULT_FIG_DIR = paths.FIGURES_DIR
 # fastest at the start when the decoder is still useless. Ramping the weight in
 # gives the decoder time to learn a real reconstruction first, so by the time
 # the full KL pressure arrives the latent code is already worth keeping.
-_DEFAULT_KL_ANNEAL_EPOCHS = 10
+_MAX_EPOCHS = 15
+_DEFAULT_KL_ANNEAL_EPOCHS = 3
 
 # Active-unit threshold delta: a latent dimension counts as "active" when the
 # variance of its encoder mean across the data exceeds this. 0.01 is the value
@@ -113,7 +139,8 @@ _COLLAPSE_ACTIVE_FRACTION = 1.0 / 3.0
 _COLLAPSE_KL_EPS = 0.01
 
 # Early stopping: epochs without validation improvement before halting.
-_DEFAULT_PATIENCE = 10
+_DEFAULT_PATIENCE = 3
+_DEFAULT_MIN_DELTA_REL = 0.005
 
 # Label-free objective names accepted by `tune_vae(objective_metric=...)`.
 _UNSUPERVISED_METRICS: tuple[str, ...] = ("recon_p50",)
@@ -430,7 +457,7 @@ class VAEDetector:
         lr: float = 1e-3,
         optimizer: str = "adam",
         batch_size: int = 256,
-        epochs: int = 30,
+        epochs: int = _MAX_EPOCHS,
         weight_decay: float = 0.0,
         activation: str = "relu",
         hidden_dims: Optional[Sequence[int]] = None,
@@ -439,7 +466,14 @@ class VAEDetector:
         early_stopping_patience: Optional[int] = _DEFAULT_PATIENCE,
         device: Optional[str] = None,
         random_state: int = 42,
+        layout: Optional[MixedLayout] = None,
+        mixed_config: Optional[MixedVAEConfig] = None,
     ):
+        # `layout=None` -> the original one-hot MLP VAE (kept only as the control / migration
+        # path); a layout -> the mixed-type VAE with embeddings and per-variable reconstruction.
+        self.layout = layout
+        self.mixed_config = (mixed_config or MixedVAEConfig()) if layout is not None else None
+        self.architecture = MIXED_ARCHITECTURE if layout is not None else ONEHOT_ARCHITECTURE
         self.latent_dim = int(latent_dim)
         self.hidden_dim = int(hidden_dim)
         self.n_layers = int(n_layers)
@@ -448,17 +482,19 @@ class VAEDetector:
         self.lr = float(lr)
         self.optimizer = str(optimizer).lower()
         self.batch_size = int(batch_size)
-        self.epochs = int(epochs)
+        self.epochs = min(int(epochs), _MAX_EPOCHS)
         self.weight_decay = float(weight_decay)
         self.activation = str(activation).lower()
         self.hidden_dims = None if hidden_dims is None else [int(h) for h in hidden_dims]
         # score_kl_weight adds `score_kl_weight * per-row KL` to the anomaly
         # score. Default 0.0 => the score is the pure reconstruction error.
         self.score_kl_weight = float(score_kl_weight)
-        self.kl_anneal_epochs = max(0, int(kl_anneal_epochs))
-        self.early_stopping_patience = (
-            None if early_stopping_patience is None else max(1, int(early_stopping_patience))
-        )
+        # These are training controls, not model-quality search dimensions.
+        # Constructor arguments remain accepted for old payload/API compatibility,
+        # but every new fit applies the single project-wide schedule.
+        self.kl_anneal_epochs = _DEFAULT_KL_ANNEAL_EPOCHS
+        self.early_stopping_patience = _DEFAULT_PATIENCE
+        self.early_stopping_min_delta_rel = _DEFAULT_MIN_DELTA_REL
         self.random_state = int(random_state)
 
         if self.optimizer not in _OPTIMIZERS:
@@ -475,6 +511,9 @@ class VAEDetector:
         # `best_val_loss_`, which is weighted by this fit's own `beta` and is
         # therefore only meaningful within a single fit.
         self.best_val_elbo_: float = float("inf")
+        self.best_epoch_: Optional[int] = None
+        self.epochs_trained_: int = 0
+        self.stopped_early_: bool = False
 
     # -- helpers ------------------------------------------------------------ #
     @staticmethod
@@ -507,9 +546,39 @@ class VAEDetector:
             "weight_decay": self.weight_decay,
             "score_kl_weight": self.score_kl_weight,
             "random_state": self.random_state,
+            # Training schedule: without these a reloaded detector (`load`) came
+            # back with epochs=0 / default KL ramp and every refit "cloned" from
+            # it silently trained a different (or no) model.
+            "epochs": self.epochs,
+            "kl_anneal_epochs": self.kl_anneal_epochs,
+            "early_stopping_patience": self.early_stopping_patience,
+            "early_stopping_min_delta_rel": self.early_stopping_min_delta_rel,
+            # Identity of the data this fit ran on (set by `fit`); lets a resume
+            # refuse a checkpoint trained on a different matrix / split.
+            "data_fingerprint": getattr(self, "data_fingerprint_", None),
+            # Which network this is. A checkpoint of another architecture (e.g. the one-hot MLP)
+            # or of another layout / embedding / loss configuration can never be resumed or loaded.
+            "architecture": self.architecture,
+            "architecture_version": MIXED_ARCHITECTURE_VERSION if self.layout is not None else "1",
+            "architecture_fingerprint": self.architecture_fingerprint(),
         }
 
-    def _build_model(self, input_dim: int) -> VAEModel:
+    def architecture_fingerprint(self) -> Optional[str]:
+        """Hash of the layout, embedding sizes, loss weights and token policy (``None`` for one-hot)."""
+        if self.layout is None:
+            return None
+        return self.mixed_config.fingerprint(self.layout)
+
+    def _build_model(self, input_dim: int):
+        if self.layout is not None:
+            if input_dim != self.layout.n_columns:
+                raise ValueError(f"the mixed layout describes {self.layout.n_columns} columns but the "
+                                 f"input has {input_dim}.")
+            return MixedVAEModel(
+                self.layout, self.mixed_config, self.latent_dim,
+                _resolve_hidden_dims(self.hidden_dims, self.n_layers, self.hidden_dim),
+                self.dropout, _ACTIVATIONS[self.activation],
+            ).to(self.device)
         return VAEModel(
             input_dim=input_dim,
             latent_dim=self.latent_dim,
@@ -591,14 +660,21 @@ class VAEDetector:
                 will be: later periods, never seen.
         """
         log = setup_logging()
+        if self.epochs < 1:
+            raise ValueError(
+                f"VAEDetector.fit needs epochs >= 1 (got {self.epochs}). A detector rebuilt "
+                "from an old payload without a stored schedule must be given its epochs "
+                "explicitly before refitting."
+            )
         self._seed_everything()
         os.makedirs(checkpoint_dir, exist_ok=True)
         ckpt_path = os.path.join(checkpoint_dir, "checkpoint.pth")
         best_path = os.path.join(checkpoint_dir, "best_model.pth")
 
-        Xd = _densify(X)
+        Xd = self._prepare(X)
         n_samples, n_features = Xd.shape
         self.input_dim_ = int(n_features)
+        self.data_fingerprint_ = _data_fingerprint(Xd, valid_mask, val_fraction)
 
         # Validation split: a caller-supplied temporal mask wins; otherwise a
         # deterministic shuffled split (see the `valid_mask` docstring for why
@@ -638,6 +714,10 @@ class VAEDetector:
         self.best_val_loss_ = float("inf")
         self.best_val_elbo_ = float("inf")
         self.history_ = []
+        epochs_without_improvement = 0
+        self.best_epoch_ = None
+        self.epochs_trained_ = 0
+        self.stopped_early_ = False
 
         # -- resume from a compatible checkpoint ---------------------------- #
         if resume and os.path.isfile(ckpt_path):
@@ -657,15 +737,22 @@ class VAEDetector:
                     self.best_val_loss_ = float(ckpt.get("best_val_loss", float("inf")))
                     self.best_val_elbo_ = float(ckpt.get("best_val_elbo", float("inf")))
                     self.history_ = list(ckpt.get("history", []))
+                    self.best_epoch_ = ckpt.get("best_epoch")
+                    self.epochs_trained_ = len(self.history_)
+                    epochs_without_improvement = int(ckpt.get("epochs_without_improvement", 0))
                     self._restore_rng_state(ckpt.get("rng_state"))
                     log.info(
                         "Resuming VAE training from %s at epoch %d (best_val_loss=%.6f).",
                         ckpt_path, start_epoch, self.best_val_loss_,
                     )
                 else:
+                    # Never overwrite it: another architecture/config's checkpoint is set aside so switching
+                    # `vae.categorical_representation` cannot destroy the other model's resume state.
+                    moved = _quarantine(ckpt_path, ckpt.get("config", {}).get("architecture", "legacy"))
+                    _quarantine(best_path, ckpt.get("config", {}).get("architecture", "legacy"))
                     log.warning(
-                        "Checkpoint %s is incompatible with the current config; "
-                        "starting fresh.", ckpt_path,
+                        "Checkpoint %s is incompatible with the current config; moved to %s and "
+                        "starting fresh.", ckpt_path, moved,
                     )
 
         if start_epoch >= self.epochs:
@@ -675,6 +762,9 @@ class VAEDetector:
                 start_epoch, self.epochs,
             )
             self._restore_best(best_path, log)
+            self.epochs_trained_ = len(self.history_)
+            self.stopped_early_ = self.epochs_trained_ < self.epochs
+            self._store_contribution_reference(Xd[train_idx])
             return self
 
         with log_phase("vae.fit", log):
@@ -689,7 +779,6 @@ class VAEDetector:
                 self.epochs, self.device, n_val, split_kind,
                 self.kl_anneal_epochs, self.early_stopping_patience,
             )
-            epochs_without_improvement = 0
             progress = Bar(
                 range(start_epoch, self.epochs),
                 total=self.epochs,
@@ -703,20 +792,21 @@ class VAEDetector:
                 # Linear KL ramp 0 -> beta over the first `kl_anneal_epochs`.
                 beta_epoch = self._annealed_beta(epoch)
                 run_total = run_recon = run_kl = 0.0
+                run_parts = None
                 n_seen = 0
                 for (xb,) in train_loader:
                     xb = xb.to(self.device)
                     optimizer.zero_grad()
                     x_recon, mu, logvar = self.model_(xb)
-                    total, recon, kl = vae_loss(
-                        xb, x_recon, mu, logvar, beta=beta_epoch, reduction="mean"
-                    )
+                    total, recon, kl, parts = self._loss(xb, x_recon, mu, logvar, beta_epoch)
                     total.backward()
                     optimizer.step()
                     bs = xb.size(0)
                     run_total += float(total.item()) * bs
                     run_recon += float(recon.item()) * bs
                     run_kl += float(kl.item()) * bs
+                    if parts is not None:
+                        run_parts = _accumulate_parts(run_parts, parts, bs)
                     n_seen += bs
                 train_loss = run_total / max(n_seen, 1)
                 train_recon = run_recon / max(n_seen, 1)
@@ -747,7 +837,13 @@ class VAEDetector:
                     "beta": beta_epoch,
                     "duration_s": duration,
                 }
+                if self.layout is not None:
+                    # Reconstruction reported by family and by original categorical variable
+                    # (numeric / boolean / categorical never mixed into one opaque number).
+                    record["train_parts"] = _finalize_parts(run_parts, n_seen)
+                    record["val_parts"] = getattr(self, "_last_val_parts", None) if val_loss is not None else None
                 self.history_.append(record)
+                self.epochs_trained_ = len(self.history_)
                 log.info(
                     "Epoch %d/%d | beta=%.3f | train_loss=%.6f (recon=%.6f, kl=%.6f) | "
                     "val_loss=%s | %.2fs",
@@ -759,7 +855,14 @@ class VAEDetector:
                     val="n/a" if val_loss is None else f"{val_loss:.4f}",
                 )
 
-                is_best = monitor < self.best_val_loss_
+                required_drop = (
+                    abs(self.best_val_loss_) * self.early_stopping_min_delta_rel
+                    if np.isfinite(self.best_val_loss_) else 0.0
+                )
+                is_best = (
+                    not np.isfinite(self.best_val_loss_)
+                    or monitor < self.best_val_loss_ - required_drop
+                )
                 if is_best:
                     self.best_val_loss_ = float(monitor)
                     # Captured at the SAME epoch the weights are saved from, so
@@ -769,10 +872,13 @@ class VAEDetector:
                     self.best_val_elbo_ = (
                         float(val_elbo) if val_elbo is not None else float(monitor)
                     )
-                    self._save_state(best_path, epoch, optimizer)
                     epochs_without_improvement = 0
+                    self.best_epoch_ = epoch + 1
+                    self.epochs_without_improvement_ = epochs_without_improvement
+                    self._save_state(best_path, epoch, optimizer)
                 else:
                     epochs_without_improvement += 1
+                    self.epochs_without_improvement_ = epochs_without_improvement
                 # Per-epoch crash-recovery checkpoint (atomic).
                 self._save_state(ckpt_path, epoch, optimizer)
 
@@ -792,12 +898,33 @@ class VAEDetector:
                         epoch + 1, self.epochs, epochs_without_improvement,
                         self.best_val_loss_,
                     )
+                    self.stopped_early_ = True
                     break
             progress.close()
 
         # Restore best-val weights before returning.
         self._restore_best(best_path, log)
+        self.epochs_trained_ = len(self.history_)
+        self._store_contribution_reference(Xd[train_idx])
         return self
+
+    def _store_contribution_reference(self, X_train: np.ndarray, max_rows: int = 50_000) -> None:
+        """Per-variable centre/scale of the contributions on the TRAIN rows of this fit (mixed architecture),
+        so any consumer that ranks variables (explanations, attribution charts) normalises with train-only
+        statistics."""
+        self.contribution_reference_ = None
+        if self.layout is None or len(X_train) == 0:
+            return
+        rows = X_train if len(X_train) <= max_rows else X_train[np.linspace(0, len(X_train) - 1, max_rows).astype(int)]
+        self.contribution_reference_ = ContributionReference.from_contributions(self.contributions(rows))
+
+    def normalized_contributions(self, X: ArrayLike) -> np.ndarray:
+        """Contributions in units of each variable's usual level (train reference): use THIS, not the raw
+        contributions, to rank variables against each other."""
+        ref = getattr(self, "contribution_reference_", None)
+        if ref is None:
+            raise RuntimeError("no train reference stored (fit the detector or load a mixed_v1 payload with one).")
+        return ref.normalize(self.contributions(X))
 
     def _annealed_beta(self, epoch: int) -> float:
         """KL weight for ``epoch``: linear 0 -> ``beta`` over the ramp, then flat.
@@ -815,12 +942,26 @@ class VAEDetector:
 
     # -- checkpoint helpers ------------------------------------------------- #
     def _checkpoint_compatible(self, ckpt: dict) -> bool:
+        """A checkpoint may be resumed only if it belongs to *this* training run.
+
+        Architecture alone is not enough: a checkpoint with the same layers but a
+        different ``beta``/``lr``/``batch_size``/KL ramp, seed or training matrix
+        would be resumed as if it were this run's own trajectory (and, when it is
+        already at the target epoch, returned as this fit's result without
+        training). ``epochs`` and ``early_stopping_patience`` are excluded on
+        purpose: extending the budget of the same run is a legitimate resume.
+        Checkpoints written before these keys existed lack them and therefore
+        start fresh.
+        """
         cfg = ckpt.get("config", {})
-        keys = ["input_dim", "latent_dim", "hidden_dim", "n_layers",
-                "hidden_dims", "dropout", "activation"]
+        keys = ["input_dim", "latent_dim", "hidden_dim", "n_layers", "hidden_dims",
+                "dropout", "activation", "beta", "lr", "optimizer", "batch_size",
+                "weight_decay", "score_kl_weight", "kl_anneal_epochs", "random_state",
+                "data_fingerprint", "architecture", "architecture_version",
+                "architecture_fingerprint"]
         cur = self._arch_config()
         for k in keys:
-            if cfg.get(k) != cur.get(k):
+            if k not in cfg or cfg.get(k) != cur.get(k):
                 return False
         return True
 
@@ -829,10 +970,17 @@ class VAEDetector:
             "epoch": int(epoch),
             "best_val_loss": float(self.best_val_loss_),
             "best_val_elbo": float(self.best_val_elbo_),
+            "epochs_without_improvement": int(getattr(self, "epochs_without_improvement_", 0)),
+            "best_epoch": self.best_epoch_,
             "model_state_dict": self.model_.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "config": self._arch_config(),
             "history": self.history_,
+            "training_outcome": {
+                "best_epoch": self.best_epoch_,
+                "epochs_trained": self.epochs_trained_,
+                "stopped_early": self.stopped_early_,
+            },
             "rng_state": {
                 "torch": torch.get_rng_state(),
                 "numpy": np.random.get_state(),
@@ -891,19 +1039,52 @@ class VAEDetector:
         with torch.no_grad():
             tot = rec = kld = 0.0
             n = 0
+            acc = None
             for start in range(0, val_tensor.size(0), self.batch_size):
                 xb = val_tensor[start:start + self.batch_size]
                 x_recon, mu, logvar = self.model_(xb)
-                loss, recon_t, kl_t = vae_loss(
-                    xb, x_recon, mu, logvar, beta=self.beta, reduction="mean"
-                )
+                loss, recon_t, kl_t, parts = self._loss(xb, x_recon, mu, logvar, self.beta)
                 bs = xb.size(0)
                 tot += float(loss.item()) * bs
                 rec += float(recon_t.item()) * bs
                 kld += float(kl_t.item()) * bs
+                if parts is not None:
+                    acc = _accumulate_parts(acc, parts, bs)
                 n += bs
         n = max(n, 1)
+        self._last_val_parts = _finalize_parts(acc, n) if acc is not None else None
         return tot / n, rec / n, kld / n
+
+    def _loss(self, xb, out, mu, logvar, beta: float):
+        """``(total, recon, kl, parts)``; ``parts`` is ``None`` for the one-hot architecture."""
+        if self.layout is not None:
+            return self.model_.loss_parts(xb, out, mu, logvar, beta)
+        total, recon, kl = vae_loss(xb, out, mu, logvar, beta=beta, reduction="mean")
+        return total, recon, kl, None
+
+    def _prepare(self, X: ArrayLike) -> np.ndarray:
+        """Dense float32 input; for a mixed detector also validates the layout and category indices."""
+        Xd = _densify(X)
+        if self.layout is None:
+            return Xd
+        if Xd.shape[1] != self.layout.n_columns:
+            raise ValueError(f"the mixed VAE expects {self.layout.n_columns} columns "
+                             f"({self.layout.fingerprint()}); got {Xd.shape[1]}.")
+        num_pos = np.concatenate([self.layout.positions("num"), self.layout.positions("bool"), self.layout.positions("flag")])
+        if len(num_pos) and not np.isfinite(Xd[:, num_pos]).all():
+            raise ValueError("the mixed VAE input holds NaN/inf in a numeric, binary or missing-flag column: impute "
+                             "before fitting/scoring (only categorical nulls are allowed, as the MISSING token).")
+        bpos = self.layout.positions("bool")
+        if len(bpos) and len(Xd) and not np.all(np.isin(np.unique(Xd[:, bpos]), (0.0, 1.0))):
+            raise ValueError("a binary column holds values other than 0/1 (the BCE head would silently clip them).")
+        for col, spec in self.layout.categoricals.items():
+            j = self.layout.columns.index(col)
+            v = Xd[:, j]
+            if len(v) and (not np.all(v == np.round(v)) or v.min() < 0 or v.max() > spec.cardinality - 1):
+                raise ValueError(f"categorical column {col!r} holds indices outside [0, {spec.cardinality - 1}]: "
+                                 "build the input with the MixedViewBuilder of this layout (unknown levels map "
+                                 "to the UNKNOWN token).")
+        return Xd
 
     def _check_fitted(self) -> VAEModel:
         if self.model_ is None:
@@ -929,7 +1110,7 @@ class VAEDetector:
         the score already increases with anomalousness -- no sign flip needed.
         """
         model = self._check_fitted()
-        Xd = _densify(X)
+        Xd = self._prepare(X)
         model.eval()
         scores = np.empty(Xd.shape[0], dtype=np.float64)
         with torch.no_grad():
@@ -938,7 +1119,10 @@ class VAEDetector:
                 xb = torch.from_numpy(chunk).to(self.device)
                 mu, logvar = model.encode(xb)
                 x_recon = model.decode(mu)
-                recon_err = torch.mean((xb - x_recon) ** 2, dim=1)
+                if self.layout is not None:
+                    recon_err = model.row_scores(xb, x_recon)   # weighted mean over ORIGINAL variables
+                else:
+                    recon_err = torch.mean((xb - x_recon) ** 2, dim=1)
                 if self.score_kl_weight != 0.0:
                     kl = -0.5 * torch.sum(
                         1 + logvar - mu.pow(2) - logvar.exp(), dim=1
@@ -953,10 +1137,71 @@ class VAEDetector:
         """Alias for :meth:`score_samples` (per-row reconstruction error)."""
         return self.score_samples(X)
 
+    # -- per-original-variable view (mixed architecture) ---------------------------- #
+    @property
+    def variable_names(self) -> Optional[list]:
+        """Names of the ORIGINAL variables scored (``None`` for the one-hot architecture, whose
+        reconstruction terms are the matrix columns)."""
+        return None if self.layout is None else self.layout.variables
+
+    def contributions(self, X: ArrayLike) -> np.ndarray:
+        """``(n_rows, n_variables)`` reconstruction contribution of each ORIGINAL variable:
+        Huber/MSE for numeric, BCE for binary, negative log-likelihood of the observed category for
+        categorical (MISSING / UNKNOWN tokens included as their own identifiable outcome). Exactly
+        one column per variable, whatever its encoding or cardinality."""
+        if self.layout is None:
+            raise RuntimeError("contributions() needs the mixed architecture (a MixedLayout).")
+        model = self._check_fitted()
+        Xd = self._prepare(X)
+        model.eval()
+        out = np.empty((Xd.shape[0], len(self.layout.variables)), dtype=np.float64)
+        with torch.no_grad():
+            for start in range(0, Xd.shape[0], self.batch_size):
+                xb = torch.from_numpy(Xd[start:start + self.batch_size]).to(self.device)
+                mu, _ = model.encode(xb)
+                out[start:start + xb.size(0)] = model.contributions(xb, model.decode(mu)).cpu().numpy()
+        return out
+
+    def variable_matrix(self, X: ArrayLike) -> np.ndarray:
+        """Observed value of every original variable (transformed number, 0/1, or category index)."""
+        Xd = self._prepare(X)
+        if self.layout is None:
+            return Xd
+        pos = {c: i for i, c in enumerate(self.layout.columns)}
+        return Xd[:, [pos[v] for v in self.layout.variables]]
+
+    def categorical_reconstruction(self, X: ArrayLike) -> dict:
+        """For each categorical variable: the observed category label and the probability the model
+        reconstructs for it (``{variable: {"observed": [...], "probability": array}}``) -- what an
+        analyst explanation needs ("segment = retail, reconstructed probability 0.03")."""
+        if self.layout is None:
+            raise RuntimeError("categorical_reconstruction() needs the mixed architecture.")
+        model = self._check_fitted()
+        Xd = self._prepare(X)
+        model.eval()
+        specs = self.layout.cat_specs()
+        probs = [np.empty(Xd.shape[0]) for _ in specs]
+        with torch.no_grad():
+            for start in range(0, Xd.shape[0], self.batch_size):
+                xb = torch.from_numpy(Xd[start:start + self.batch_size]).to(self.device)
+                mu, _ = model.encode(xb)
+                out = model.decode(mu)
+                cat = model._cat_indices(xb)
+                for j, logits in enumerate(out["cat"]):
+                    p = torch.softmax(logits, dim=1).gather(1, cat[:, j:j + 1]).squeeze(1)
+                    probs[j][start:start + xb.size(0)] = p.cpu().numpy()
+        pos = {c: i for i, c in enumerate(self.layout.columns)}
+        result = {}
+        for j, spec in enumerate(specs):
+            idx = Xd[:, pos[spec.column]].astype(int)
+            labels = spec.labels()
+            result[spec.name] = {"observed": [labels[i] for i in idx], "probability": probs[j]}
+        return result
+
     def encode(self, X: ArrayLike) -> np.ndarray:
         """Return latent means ``mu`` per row (for interpretability/plots)."""
         model = self._check_fitted()
-        Xd = _densify(X)
+        Xd = self._prepare(X)
         model.eval()
         out = np.empty((Xd.shape[0], model.latent_dim), dtype=np.float32)
         with torch.no_grad():
@@ -1010,7 +1255,7 @@ class VAEDetector:
             lists, and ``mean_mu_variance`` / ``max_activity`` summaries.
         """
         model = self._check_fitted()
-        Xd = _densify(X)
+        Xd = self._prepare(X)
         model.eval()
         n_rows, d = Xd.shape[0], model.latent_dim
 
@@ -1060,31 +1305,80 @@ class VAEDetector:
         _ensure_parent_dir(path)
         payload = {
             "format": "vae_detector",
-            "version": 1,
+            "version": 2,
+            "architecture": self.architecture,
+            "architecture_version": MIXED_ARCHITECTURE_VERSION if self.layout is not None else "1",
+            "layout": None if self.layout is None else self.layout.to_dict(),
+            "mixed_config": None if self.mixed_config is None else self.mixed_config.to_dict(),
+            "contribution_reference": (None if getattr(self, "contribution_reference_", None) is None
+                                       else self.contribution_reference_.to_dict()),
             "config": self._arch_config(),
             "input_dim": self.input_dim_,
             "model_state_dict": self.model_.state_dict(),
             "best_val_loss": float(self.best_val_loss_),
             "best_val_elbo": float(self.best_val_elbo_),
             "history": self.history_,
+            "training_outcome": {
+                "best_epoch": self.best_epoch_,
+                "epochs_trained": self.epochs_trained_,
+                "stopped_early": self.stopped_early_,
+            },
         }
         torch.save(payload, path)
         setup_logging().info("Saved VAEDetector to %s", path)
         return path
 
     @classmethod
-    def load(cls, path: str = _DEFAULT_DETECTOR_OUT, device: Optional[str] = None) -> "VAEDetector":
+    def load(cls, path: str = _DEFAULT_DETECTOR_OUT, device: Optional[str] = None,
+             expect_architecture: Optional[str] = None,
+             expect_fingerprint: Optional[str] = None) -> "VAEDetector":
         """Load a detector previously written by :meth:`save`.
 
         Loads with ``weights_only=False`` because the payload is a trusted
         project artifact carrying a config dict (not just tensors); PyTorch >=
         2.6's ``weights_only=True`` default would reject it.
+
+        Checkpoints of another architecture are **rejected, never loaded partially**: a one-hot
+        payload cannot become a mixed detector (or the reverse), a mixed payload written by another
+        architecture version is refused, and ``expect_architecture`` / ``expect_fingerprint`` let the
+        caller demand the architecture (and layout+loss+embedding fingerprint) it is configured for.
+        Raises :class:`IncompatibleCheckpointError`.
         """
         payload = torch.load(path, map_location="cpu", weights_only=False)
         if not isinstance(payload, dict) or payload.get("format") != "vae_detector":
             raise TypeError(f"{path} does not contain a VAEDetector payload.")
         cfg = payload["config"]
+        architecture = payload.get("architecture", ONEHOT_ARCHITECTURE)   # payloads before v2 = one-hot
+        if expect_architecture is not None and architecture != expect_architecture:
+            raise IncompatibleCheckpointError(
+                f"{path} holds a {architecture!r} VAE but {expect_architecture!r} was requested. "
+                "One-hot and embedding checkpoints are not interchangeable and are never loaded "
+                "partially: retrain (tuning writes a new model) or set vae.categorical_representation "
+                "to match the file."
+            )
+        layout = mixed_config = None
+        if architecture == MIXED_ARCHITECTURE:
+            if payload.get("architecture_version") != MIXED_ARCHITECTURE_VERSION:
+                raise IncompatibleCheckpointError(
+                    f"{path}: mixed-VAE architecture version {payload.get('architecture_version')!r} != "
+                    f"{MIXED_ARCHITECTURE_VERSION!r}; refusing to load an older/newer network.")
+            layout = MixedLayout.from_dict(payload["layout"])
+            try:
+                mixed_config = MixedVAEConfig.from_dict(payload["mixed_config"])
+            except ValueError as exc:
+                raise IncompatibleCheckpointError(f"{path}: {exc}; refusing a partial load.") from exc
+            if expect_fingerprint is not None and mixed_config.fingerprint(layout) != expect_fingerprint:
+                raise IncompatibleCheckpointError(
+                    f"{path}: layout/embedding/loss fingerprint {mixed_config.fingerprint(layout)} != "
+                    f"expected {expect_fingerprint} (different variables, vocabularies, sizes or loss weights).")
+        elif architecture != ONEHOT_ARCHITECTURE:
+            raise IncompatibleCheckpointError(f"{path}: unknown VAE architecture {architecture!r}.")
+        if expect_fingerprint is not None and architecture == ONEHOT_ARCHITECTURE:
+            raise IncompatibleCheckpointError(
+                f"{path}: a fingerprint was expected but the payload is a one-hot VAE (no layout / loss configuration)."
+            )
         det = cls(
+            layout=layout, mixed_config=mixed_config,
             latent_dim=cfg["latent_dim"],
             hidden_dim=cfg["hidden_dim"],
             n_layers=cfg["n_layers"],
@@ -1093,7 +1387,11 @@ class VAEDetector:
             lr=cfg["lr"],
             optimizer=cfg["optimizer"],
             batch_size=cfg["batch_size"],
-            epochs=0,
+            # Old payloads (before the schedule was stored) fall back to the
+            # length of the recorded history: the epochs the model really trained.
+            epochs=int(cfg.get("epochs") or max(1, len(payload.get("history", [])))),
+            kl_anneal_epochs=cfg.get("kl_anneal_epochs", _DEFAULT_KL_ANNEAL_EPOCHS),
+            early_stopping_patience=cfg.get("early_stopping_patience", _DEFAULT_PATIENCE),
             weight_decay=cfg.get("weight_decay", 0.0),
             activation=cfg.get("activation", "relu"),
             hidden_dims=cfg.get("hidden_dims"),
@@ -1103,17 +1401,73 @@ class VAEDetector:
         )
         det.input_dim_ = int(payload["input_dim"])
         det.model_ = det._build_model(det.input_dim_)
-        det.model_.load_state_dict(payload["model_state_dict"])
+        try:
+            det.model_.load_state_dict(payload["model_state_dict"])    # strict: no partial loads
+        except RuntimeError as exc:
+            raise IncompatibleCheckpointError(f"{path}: weights do not match the architecture ({exc})") from exc
         det.model_.eval()
         det.best_val_loss_ = float(payload.get("best_val_loss", float("inf")))
         det.best_val_elbo_ = float(payload.get("best_val_elbo", float("inf")))
         det.history_ = list(payload.get("history", []))
+        outcome = payload.get("training_outcome") or {}
+        det.best_epoch_ = outcome.get("best_epoch")
+        det.epochs_trained_ = int(outcome.get("epochs_trained", len(det.history_)))
+        det.stopped_early_ = bool(outcome.get("stopped_early", False))
+        det.data_fingerprint_ = cfg.get("data_fingerprint")
+        ref = payload.get("contribution_reference")
+        det.contribution_reference_ = None if ref is None else ContributionReference.from_dict(ref)
         return det
 
 
 # --------------------------------------------------------------------------- #
 # Optuna tuning helpers                                                        #
 # --------------------------------------------------------------------------- #
+def _quarantine(path: str, tag: str) -> Optional[str]:
+    """Rename ``path`` to ``<path>.incompatible-<tag>`` (replacing an older one); ``None`` if absent."""
+    if not os.path.isfile(path):
+        return None
+    dest = f"{path}.incompatible-{tag}"
+    try:
+        os.replace(path, dest)
+    except OSError:
+        return None
+    return dest
+
+
+def _accumulate_parts(acc: Optional[dict], parts: dict, batch_size: int) -> dict:
+    """Running batch-weighted sums of the family / per-categorical-variable reconstruction means."""
+    cur = {"numeric": float(parts["numeric"]), "boolean": float(parts["boolean"]),
+           "categorical": float(parts["categorical"]),
+           "by_categorical_variable": parts["by_categorical_variable"].cpu().numpy().astype(np.float64)}
+    if acc is None:
+        acc = {"numeric": 0.0, "boolean": 0.0, "categorical": 0.0,
+               "by_categorical_variable": np.zeros_like(cur["by_categorical_variable"])}
+    for k in ("numeric", "boolean", "categorical"):
+        acc[k] += cur[k] * batch_size
+    acc["by_categorical_variable"] = acc["by_categorical_variable"] + cur["by_categorical_variable"] * batch_size
+    return acc
+
+
+def _finalize_parts(acc: Optional[dict], n: int) -> Optional[dict]:
+    if acc is None:
+        return None
+    n = max(int(n), 1)
+    return {"numeric": acc["numeric"] / n, "boolean": acc["boolean"] / n,
+            "categorical": acc["categorical"] / n,
+            "by_categorical_variable": [float(v) / n for v in acc["by_categorical_variable"]]}
+
+
+def _data_fingerprint(Xd: np.ndarray, valid_mask: Optional[np.ndarray], val_fraction: float) -> str:
+    """Short hash of the complete matrix and validation split used by a fit."""
+    h = hashlib.sha1()
+    arr = np.ascontiguousarray(Xd)
+    h.update(f"{arr.shape[0]}x{arr.shape[1]}|{arr.dtype}|{val_fraction}".encode())
+    if valid_mask is not None:
+        h.update(np.ascontiguousarray(np.asarray(valid_mask, dtype=bool)).tobytes())
+    h.update(memoryview(arr).cast("B"))
+    return h.hexdigest()[:12]
+
+
 def _default_storage_uri(db_path: str = _DEFAULT_STORAGE_DB) -> str:
     """Build a SQLite RDBStorage URI, creating the parent directory.
 
@@ -1126,7 +1480,7 @@ def _default_storage_uri(db_path: str = _DEFAULT_STORAGE_DB) -> str:
 
 def _detector_kwargs_from_params(params: dict) -> dict:
     """Translate an Optuna trial's params into ``VAEDetector`` kwargs."""
-    return {
+    kwargs = {
         "latent_dim": int(params["latent_dim"]),
         "hidden_dim": int(params["hidden_dim"]),
         "n_layers": int(params["n_layers"]),
@@ -1136,6 +1490,7 @@ def _detector_kwargs_from_params(params: dict) -> dict:
         "optimizer": str(params["optimizer"]),
         "batch_size": int(params["batch_size"]),
     }
+    return kwargs
 
 
 def tune_vae(
@@ -1150,12 +1505,18 @@ def tune_vae(
     model_out: str = _DEFAULT_MODEL_OUT,
     checkpoint_dir: str = _DEFAULT_TUNING_CKPT_DIR,
     random_state: int = 42,
-    max_epochs: int = 20,
+    max_epochs: int = _MAX_EPOCHS,
     timeout: Optional[float] = None,
     valid_mask: Optional[np.ndarray] = None,
     early_stopping_patience: Optional[int] = 10,
     early_stopping_min_delta: float = 0.005,
     early_stopping_min_trials: int = 10,
+    feature_names: Optional[Sequence[str]] = None,
+    study_tag: Optional[str] = None,
+    layout: Optional[MixedLayout] = None,
+    mixed_config: Optional[MixedVAEConfig] = None,
+    min_eval_positives: int = 10,
+    label_source: str = "labels",
 ):
     """Tune :class:`VAEDetector` with Optuna and crash recovery.
 
@@ -1184,7 +1545,19 @@ def tune_vae(
     * ``dropout`` -- float in [0.1, 0.4]
     * ``n_layers`` -- int in [1, 3]
     * ``hidden_dim`` -- {32, 64, 128}
-    * ``epochs`` -- int in [1, max_epochs] (small budget for tuning speed)
+    ``epochs``, ``random_state``, anomaly threshold and KL warmup are fixed
+    controls and are deliberately absent from the search space.
+
+    Reliability
+    -----------
+    * The study name carries a fingerprint (matrix shape, feature names, validation
+      split, objective mode/direction, ``max_epochs``, label hash), so trials from a
+      different dataset, split or objective never mix into one study; the trial
+      checkpoint directory is per study (``checkpoint_dir/<study_name>/trial_<n>``),
+      and a checkpoint is only resumed when the whole training config (not just the
+      architecture) and the data match.
+    * Every trial and the deployed refit share the same capped training schedule.
+    * Trials a crash left ``RUNNING`` are closed as failed before resuming.
 
     Objective modes and direction handling
     ---------------------------------------
@@ -1203,10 +1576,22 @@ def tune_vae(
 
     Args:
         X: Preprocessed feature matrix (dense ndarray or scipy sparse).
-        n_trials: Number of *new* trials to run in this call.
+        n_trials: Total trial budget of the study: a resumed study runs only the
+            missing ``n_trials - completed`` (repeating a call does not grow it).
         y: Optional 0/1 anomaly labels aligned to ``X`` rows (supervised mode).
         storage: Optuna storage URI; defaults to the SQLite DB above.
-        study_name: Study name (reused for resume).
+        study_name: Study name *prefix*; a fingerprint of the data, split, objective
+            and search budget is appended (see "Reliability" below).
+        feature_names: Feature list folded into the study fingerprint.
+        study_tag: Explicit suffix replacing the fingerprint.
+        layout, mixed_config: The mixed-type input description (variables, vocabularies, token
+            policy) and its embedding / loss configuration. ``None`` = the one-hot architecture.
+            Both are part of the study fingerprint, every trial and the refit, so one-hot and
+            embedding studies (or two vocabularies) never share trials or checkpoints.
+        min_eval_positives: With ``y`` (``NaN`` = unknown row, ignored) the held-out block must hold
+            at least this many positives and one negative, otherwise the study falls back to the
+            label-free ELBO objective and says so.
+        label_source: Provenance tag of ``y`` (goes to the YAML).
         direction: 'maximize'/'minimize'; auto-set from mode when ``None``.
         objective_metric: Metric name or custom callable (see above).
         best_params_path: YAML path for the incremental best-params checkpoint.
@@ -1246,30 +1631,44 @@ def tune_vae(
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     log = setup_logging()
+    max_epochs = max(1, min(int(max_epochs), _MAX_EPOCHS))
     if storage is None:
         storage = _default_storage_uri()
     _ensure_parent_dir(best_params_path)
-    os.makedirs(checkpoint_dir, exist_ok=True)
 
-    y_arr = None if y is None else np.asarray(y).ravel()
+    y_arr = None if y is None else np.asarray(y, dtype=float).ravel()
     supervised = y_arr is not None
     custom_objective = objective_metric if callable(objective_metric) else None
+    metric_name = objective_metric if isinstance(objective_metric, str) else None
+    label_free = metric_name in _UNSUPERVISED_METRICS
+    use_supervised = supervised and not label_free
+    vm = None if valid_mask is None else np.asarray(valid_mask, dtype=bool).ravel()
+
+    # Labels may be partial (NaN = unknown, e.g. reviewed labels): only KNOWN held-out rows are scored,
+    # and only when there are enough positives; otherwise the label-free objective runs, visibly.
+    sup_idx = None
+    if use_supervised and custom_objective is None:
+        eval_rows = vm if vm is not None else np.ones(len(y_arr), dtype=bool)
+        sup_idx = np.flatnonzero(eval_rows & ~np.isnan(y_arr))
+        n_pos, n_neg = int((y_arr[sup_idx] == 1).sum()), int((y_arr[sup_idx] == 0).sum())
+        if n_pos < int(min_eval_positives) or n_neg < 1:
+            log.warning("tune_vae: the held-out block has %d labelled positive(s) and %d negative(s) "
+                        "(need >= %d positives and >= 1 negative); falling back to the label-free "
+                        "ELBO objective.", n_pos, n_neg, min_eval_positives)
+            use_supervised = supervised = False
+            sup_idx = None
 
     # Auto-select the optimization direction from the objective mode.
     if direction is None:
         if custom_objective is not None:
             direction = "maximize"
-        elif supervised:
+        elif label_free:
+            direction = "minimize"
+        elif use_supervised:
             direction = "maximize"  # PR-AUC / ROC-AUC: higher is better
         else:
             direction = "minimize"  # validation reconstruction loss: lower better
     resolved_direction = direction
-
-    metric_name = objective_metric if isinstance(objective_metric, str) else None
-    label_free = metric_name in _UNSUPERVISED_METRICS
-    use_supervised = supervised and not label_free
-    if direction is None and label_free:
-        resolved_direction = "minimize"  # both proxies are reconstruction errors
     mode = (
         "supervised(custom)" if (supervised and custom_objective is not None)
         else "custom" if custom_objective is not None
@@ -1278,7 +1677,6 @@ def tune_vae(
         else "unsupervised"
     )
 
-    vm = None if valid_mask is None else np.asarray(valid_mask, dtype=bool).ravel()
     if vm is not None:
         log.info(
             "tune_vae: temporal validation mask supplied (%d of %d rows held out)",
@@ -1305,22 +1703,6 @@ def tune_vae(
         dropout = trial.suggest_float("dropout", 0.1, 0.4)
         n_layers = trial.suggest_int("n_layers", 1, 3)
         hidden_dim = trial.suggest_categorical("hidden_dim", [32, 64, 128])
-        # Floor at 2, not 1. A single-epoch trial has not trained: its latent
-        # space is still at the prior, so its KL is ~0 and -- under the ELBO
-        # objective -- it can *win* on the numbers while being useless. Seen
-        # empirically: a 1-epoch trial was selected and produced a fully
-        # collapsed model (0 of 9 active units). The floor scales with the
-        # budget so a large `max_epochs` does not spend trials on stubs.
-        epoch_floor = min(2, int(max_epochs)) if max_epochs >= 2 else 1
-        epochs = trial.suggest_int(
-            "epochs", max(epoch_floor, int(max_epochs) // 4), max(1, int(max_epochs))
-        )
-        # The KL ramp must fit inside this trial's own budget. The detector's
-        # default ramp is 10 epochs; a trial that trains for 5 would spend its
-        # entire life at a partial KL weight and never see the beta it is
-        # being evaluated on -- making the trial's `beta` largely fictional.
-        kl_anneal = min(_DEFAULT_KL_ANNEAL_EPOCHS, max(1, epochs // 2))
-
         detector = VAEDetector(
             latent_dim=latent_dim,
             hidden_dim=hidden_dim,
@@ -1330,9 +1712,9 @@ def tune_vae(
             lr=lr,
             optimizer=optimizer,
             batch_size=batch_size,
-            epochs=epochs,
-            kl_anneal_epochs=kl_anneal,
+            epochs=max_epochs,
             random_state=random_state,
+            layout=layout, mixed_config=mixed_config,
         )
         trial_ckpt = os.path.join(checkpoint_dir, f"trial_{trial.number}")
         detector.fit(
@@ -1345,6 +1727,8 @@ def tune_vae(
             # Score the held-out block only. Scoring all of X would compare the
             # labels against rows the VAE was trained to reconstruct, which
             # measures memorisation rather than generalisation.
+            if sup_idx is not None:
+                return _supervised_score(y_arr[sup_idx], detector.score_samples(X[sup_idx]), metric_name)
             if vm is not None:
                 return _supervised_score(y_arr[vm], detector.score_samples(X[vm]), metric_name)
             return _supervised_score(y_arr, detector.score_samples(X), metric_name)
@@ -1383,6 +1767,33 @@ def tune_vae(
 
     from src.models._tuning_budget import tpe_startup_trials
 
+    # Everything that changes what a trial value means goes into the study name:
+    # the previous fixed name "vae" pooled trials from different datasets, splits
+    # and objectives (and `load_if_exists` silently resumed them).
+    n_rows, n_cols = X.shape[0], X.shape[1]
+    data_hash = _data_fingerprint(_densify(X), vm, 0.1)
+    if y_arr is None:
+        label_hash = ""
+    else:
+        yh = hashlib.sha1()
+        known = np.isfinite(y_arr)
+        yh.update(np.ascontiguousarray(known, dtype=bool).tobytes())
+        yh.update(np.ascontiguousarray(y_arr[known], dtype=float).tobytes())
+        label_hash = yh.hexdigest()[:8]
+    fp = hashlib.sha1("|".join([
+        f"{n_rows}x{n_cols}", data_hash, ",".join(map(str, feature_names or ())), mode,
+        str(resolved_direction), f"maxep={int(max_epochs)}", f"seed={random_state}",
+        "" if vm is None else hashlib.sha1(np.ascontiguousarray(vm).tobytes()).hexdigest()[:8],
+        label_hash,
+        "space=v2",
+        "arch=" + (ONEHOT_ARCHITECTURE if layout is None else
+                   f"{MIXED_ARCHITECTURE}:{MIXED_ARCHITECTURE_VERSION}:{(mixed_config or MixedVAEConfig()).fingerprint(layout)}"),
+    ]).encode("utf-8")).hexdigest()[:10]
+    study_name = f"{study_name}_{study_tag or fp}"
+    # Per-study checkpoints: `trial_<n>` dirs of two studies must never collide.
+    checkpoint_dir = os.path.join(checkpoint_dir, study_name)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     # Scaled to the budget: Optuna's fixed default of 10 would spend this
     # study's entire 10-trial default allowance on random exploration and
     # never actually optimise. See `_tuning_budget` for the numbers.
@@ -1399,13 +1810,21 @@ def tune_vae(
         load_if_exists=True,  # <-- crash-recovery / resume switch
     )
 
+    # Trials a crash left RUNNING would otherwise stay unresolved forever.
+    for stale in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
+        try:
+            study.tell(stale.number, state=optuna.trial.TrialState.FAIL)
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+    n_done = sum(tr.state == optuna.trial.TrialState.COMPLETE for tr in study.trials)
+    to_run = max(0, int(n_trials) - n_done)
     log.info(
         "Optuna VAE tuning: study=%r storage=%r mode=%s direction=%s "
-        "new_trials=%d existing_trials=%d",
-        study_name, storage, mode, resolved_direction, n_trials, len(study.trials),
+        "budget=%d completed=%d -> running %d",
+        study_name, storage, mode, resolved_direction, n_trials, n_done, to_run,
     )
 
-    progress = Bar(desc=f"optuna[{study_name}]", total=n_trials, unit="trial")
+    progress = Bar(desc=f"optuna[{study_name}]", total=to_run, unit="trial")
 
     def _progress_callback(study_, trial) -> None:
         progress.update(1)
@@ -1428,7 +1847,21 @@ def tune_vae(
             "objective_mode": mode,
             "random_state": random_state,
             "best_params": _detector_kwargs_from_params(best.params),
-            "epochs": int(best.params.get("epochs", max_epochs)),
+            # Legacy top-level schedule fields are retained for report readers;
+            # neither one is an Optuna parameter.
+            "epochs": max_epochs,
+            "kl_anneal_epochs": _DEFAULT_KL_ANNEAL_EPOCHS,
+            "fixed_training": {
+                "max_epochs": max_epochs,
+                "kl_warmup_epochs": _DEFAULT_KL_ANNEAL_EPOCHS,
+                "early_stopping_patience": _DEFAULT_PATIENCE,
+                "min_delta_relative": _DEFAULT_MIN_DELTA_REL,
+                "random_state": random_state,
+            },
+            "architecture": ONEHOT_ARCHITECTURE if layout is None else MIXED_ARCHITECTURE,
+            "architecture_fingerprint": None if layout is None else (mixed_config or MixedVAEConfig()).fingerprint(layout),
+            "label_source": label_source if use_supervised else None,
+            "status": "in_progress_best_so_far",
             "raw_optuna_params": dict(best.params),
         }
         tmp_path = best_params_path + ".tmp"
@@ -1443,12 +1876,12 @@ def tune_vae(
 
     callbacks = [_progress_callback, _persist_best_callback]
     stopper = None
-    if early_stopping_patience is not None:
+    if early_stopping_patience is not None and to_run > 0:
         from src.models._tuning_stop import TrialPatienceStopper
 
         stopper = TrialPatienceStopper(
             direction=resolved_direction, model_name="vae",
-            n_trials_requested=n_trials + len(study.trials),
+            n_trials_requested=to_run + len(study.trials),
             patience=early_stopping_patience, min_delta=early_stopping_min_delta,
             min_trials=early_stopping_min_trials,
         )
@@ -1456,13 +1889,14 @@ def tune_vae(
 
     with log_phase("vae.tune (optuna)", log):
         try:
-            study.optimize(
-                objective,
-                n_trials=n_trials,
-                timeout=timeout,
-                callbacks=callbacks,
-                gc_after_trial=True,
-            )
+            if to_run > 0:
+                study.optimize(
+                    objective,
+                    n_trials=to_run,
+                    timeout=timeout,
+                    callbacks=callbacks,
+                    gc_after_trial=True,
+                )
         finally:
             progress.close()
         if stopper is not None and stopper.stopped:
@@ -1473,18 +1907,21 @@ def tune_vae(
 
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if not completed:
-        log.warning("No completed VAE trials; skipping final refit/save.")
-        return study
+        raise RuntimeError(
+            f"VAE tuning study {study_name!r} has no completed trials; "
+            "no model or final parameter file was produced."
+        )
 
     best_kwargs = _detector_kwargs_from_params(study.best_params)
-    best_epochs = int(study.best_params.get("epochs", max_epochs))
+    best_epochs = max_epochs
     log.info(
         "Best VAE trial %d value=%.6f params=%s epochs=%d",
         study.best_trial.number, study.best_value, best_kwargs, best_epochs,
     )
     with log_phase("vae.refit_best", log):
         best_detector = VAEDetector(
-            random_state=random_state, epochs=best_epochs, **best_kwargs
+            random_state=random_state, epochs=best_epochs, layout=layout, mixed_config=mixed_config,
+            **best_kwargs
         )
         best_detector.fit(
             X,
@@ -1495,6 +1932,28 @@ def tune_vae(
         )
         best_detector.save(model_out)
 
+    # The per-trial checkpoint wrote `in_progress_best_so_far`; close it out so the
+    # YAML says which model it describes and that the refit finished.
+    try:
+        with open(best_params_path, "r", encoding="utf-8") as fh:
+            final_payload = yaml.safe_load(fh) or {}
+        final_payload.update({
+            "status": "final",
+            "refit_kl_anneal_epochs": int(best_detector.kl_anneal_epochs),
+            "refit_epochs": int(best_detector.epochs),
+            "training_outcome": {
+                "best_epoch": best_detector.best_epoch_,
+                "epochs_trained": best_detector.epochs_trained_,
+                "stopped_early": best_detector.stopped_early_,
+            },
+        })
+        tmp_path = best_params_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(final_payload, fh, sort_keys=False)
+        atomic_replace(tmp_path, best_params_path)
+    except Exception as exc:  # noqa: BLE001 - metadata only
+        log.warning("Could not finalise %s (%s)", best_params_path, exc)
+
     return study
 
 
@@ -1504,6 +1963,12 @@ def _supervised_score(
     """PR-AUC (default) or ROC-AUC of anomaly scores against binary labels."""
     from sklearn.metrics import average_precision_score, roc_auc_score
 
+    y = np.asarray(y, dtype=float).ravel()
+    scores = np.asarray(scores, dtype=float).ravel()
+    known = np.isfinite(y) & np.isfinite(scores)
+    y, scores = y[known], scores[known]
+    if not len(y):
+        raise ValueError("No known finite labels are available for the supervised VAE objective.")
     metric = (objective_metric or "average_precision").lower()
     if metric in ("average_precision", "pr_auc", "prauc", "ap"):
         return float(average_precision_score(y, scores))

@@ -302,20 +302,32 @@ def reconstruction_error_by_feature(
         batch_size = int(getattr(detector, "batch_size", 256) or 256)
         _checkpoint("started", n_rows=int(n_rows), n_features=int(n_features))
 
-        sq_err_sum = np.zeros(n_features, dtype=np.float64)
-        model.eval()
-        with torch.no_grad():
-            batches = track(range(0, n_rows, batch_size), desc="vae_recon_by_feature[batches]",
-                            unit="batch")
-            for start in batches:
-                chunk = Xd[start:start + batch_size]
-                xb = torch.from_numpy(chunk).to(device)
-                mu, _ = model.encode(xb)
-                x_recon = model.decode(mu)
-                sq = (xb - x_recon) ** 2  # (batch, n_features)
-                sq_err_sum += sq.sum(dim=0).cpu().numpy().astype(np.float64)
+        mixed = getattr(detector, "layout", None) is not None
+        if mixed:
+            # Mixed-type VAE: exactly one contribution per ORIGINAL variable (Huber/BCE/NLL); embeddings
+            # and logits are internal and never appear as features.
+            # Ranked by the mean NORMALISED contribution (excess over each variable's usual level, in units
+            # of its robust scale, train reference): a raw NLL (log 40 for a uniform 40-level variable)
+            # is not comparable with a Huber term, and ranking raw values would let the categorical terms
+            # dominate the chart exactly as the one-hot columns did.
+            mean_err = detector.normalized_contributions(Xd).mean(axis=0)
+            n_features = int(mean_err.shape[0])
+            feature_names = detector.variable_names
+        else:
+            sq_err_sum = np.zeros(n_features, dtype=np.float64)
+            model.eval()
+            with torch.no_grad():
+                batches = track(range(0, n_rows, batch_size), desc="vae_recon_by_feature[batches]",
+                                unit="batch")
+                for start in batches:
+                    chunk = Xd[start:start + batch_size]
+                    xb = torch.from_numpy(chunk).to(device)
+                    mu, _ = model.encode(xb)
+                    x_recon = model.decode(mu)
+                    sq = (xb - x_recon) ** 2  # (batch, n_features)
+                    sq_err_sum += sq.sum(dim=0).cpu().numpy().astype(np.float64)
 
-        mean_err = sq_err_sum / max(n_rows, 1)
+            mean_err = sq_err_sum / max(n_rows, 1)
         _checkpoint("batches_done", n_rows=int(n_rows))
 
         if feature_names is not None and len(feature_names) == n_features:
@@ -381,7 +393,8 @@ def reconstruction_error_by_feature(
         ax.set_yticks(y_pos)
         ax.set_yticklabels(sel_names)
         ax.invert_yaxis()
-        ax.set_xlabel("mean squared reconstruction error")
+        ax.set_xlabel("mean normalised contribution per original variable (units of its usual level)" if mixed
+                      else "mean squared reconstruction error")
         ax.set_title(chart_title)
         fig.tight_layout()
         fig.savefig(out_path, dpi=120)
@@ -439,6 +452,28 @@ def explain_rows_vae(
     n_rows_requested = int(np.asarray(X).shape[0]) if hasattr(X, "shape") else len(X)
     if model is None or n_rows_requested == 0:
         return [None] * n_rows_requested
+
+    if getattr(detector, "layout", None) is not None:
+        # Mixed-type VAE: top-k ORIGINAL variables by their own contribution; categorical ones are
+        # reported with the observed category and the probability the model reconstructs for it.
+        contrib = detector.normalized_contributions(X)        # comparable across variables (train reference)
+        var_names = detector.variable_names
+        cats = detector.categorical_reconstruction(X)
+        display = [v[len("cat__"):] if v.startswith("cat__") else v for v in var_names]
+        k = max(1, min(top_k, len(var_names)))
+        out = []
+        for i in range(contrib.shape[0]):
+            parts = []
+            for j in np.argsort(-contrib[i])[:k]:
+                v = var_names[j]
+                if v.startswith("cat__"):
+                    info = cats[display[j]]
+                    label = str(info["observed"][i]).replace(",", ";")      # the dashboard splits on commas
+                    parts.append(f"{display[j]}={label} (p={info['probability'][i]:.3f})")
+                else:
+                    parts.append(v)
+            out.append(", ".join(parts))
+        return out
 
     _checkpoint("explain_rows_started", n_rows=n_rows_requested)
 

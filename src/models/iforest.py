@@ -38,6 +38,17 @@ returns ``-clf.score_samples(X)`` so the exposed score increases with
 anomalousness; :meth:`decision_function` is passed through unchanged (raw
 scikit-learn semantics: negative = outlier) for callers that want the
 threshold-centered value.
+
+Data sources / inputs: preprocessed dense/CSR feature matrices, optional
+reviewed labels and temporal validation masks; writes Optuna SQLite, YAML and
+joblib artifacts under the configured paths.
+Created: 2026-08-22
+Last modified: 2026-09-26
+Changelog:
+- 2026-09-25: Bound resumed studies to complete matrix/label contents and made
+  a study with no completed trials fail explicitly instead of exposing stale outputs.
+- 2026-09-26: Fixed the production operating point at contamination 0.005;
+  tuning remains restricted to max_samples and max_features.
 """
 
 from __future__ import annotations
@@ -69,10 +80,19 @@ __all__ = [
 # objective is never scored in-sample. See `_blocked_split`.
 _DEFAULT_HOLDOUT_FRAC = 0.3
 
-# Operating point used for the final refit and for the top-k overlap term of
-# the unsupervised objective: the report's headline deliverable is the OOT top
-# decile, so 0.10 is the alert budget the model is actually judged on.
-_DEFAULT_CONTAMINATION = 0.10
+# Production operating point is a review-capacity decision, never a search
+# dimension. Alternative values remain descriptive score-cut sweeps only.
+_DEFAULT_CONTAMINATION = 0.005
+
+# Tuner design constants (see `tune_iforest`). psi = rows per tree, ABSOLUTE.
+_DEFAULT_N_ESTIMATORS = 300            # fixed: searching it only inflated the old objective
+_DEFAULT_PSI_RANGE = (1024, 32768)     # absolute max_samples range, capped to the fit rows
+_DEFAULT_MF_RANGE = (0.5, 1.0)
+_REFERENCE_MAX_SAMPLES = 256           # Liu et al. (2008) paper default = the reference
+_PSI_ANCHORS = (1024, 4096, 16384, 32768)
+_DEFAULT_TAIL_FRACS = (0.005, 0.01, 0.02)
+_DEFAULT_NOISE_SEEDS = 3
+_MIN_EVAL_POSITIVES = 10
 
 # Label-free objective names accepted by `objective_metric`. Passing one of
 # these selects it even when labels are available, so an unlabelled deployment
@@ -118,7 +138,7 @@ class IsolationForestDetector:
 
     def __init__(
         self,
-        n_estimators: int = 200,
+        n_estimators: int = _DEFAULT_N_ESTIMATORS,
         max_samples: Union[str, int, float] = "auto",
         max_features: float = 1.0,
         contamination: Union[str, float] = "auto",
@@ -263,19 +283,22 @@ def _detector_kwargs_from_params(
     an objective value. Searching it burns TPE budget on a dimension with a flat
     response surface and persists an arbitrary "best" value.
     """
-    ms_mode = params.get("max_samples_mode", "float")
-    if ms_mode == "auto":
-        max_samples: Union[str, int, float] = "auto"
-    elif ms_mode == "int":
-        max_samples = int(params.get("max_samples_int", 256))
-    else:
-        max_samples = float(params.get("max_samples", 1.0))
+    if "max_samples_mode" in params:  # legacy layout (studies/YAML written before the redesign)
+        ms_mode = params["max_samples_mode"]
+        if ms_mode == "auto":
+            max_samples: Union[str, int, float] = "auto"
+        elif ms_mode == "int":
+            max_samples = int(params.get("max_samples_int", 256))
+        else:
+            max_samples = float(params.get("max_samples", 1.0))
+    else:  # current layout: max_samples is an absolute integer (rows per tree)
+        max_samples = int(params["max_samples"])
     return {
-        "n_estimators": int(params["n_estimators"]),
+        "n_estimators": int(params.get("n_estimators", _DEFAULT_N_ESTIMATORS)),
         "max_samples": max_samples,
         "max_features": float(params["max_features"]),
         "contamination": float(params.get("contamination", contamination)),
-        "bootstrap": bool(params["bootstrap"]),
+        "bootstrap": bool(params.get("bootstrap", False)),
     }
 
 
@@ -331,7 +354,7 @@ def _rank_agreement(
     fit_idx: np.ndarray,
     ref_idx: np.ndarray,
     random_state: int,
-    contamination: float = _DEFAULT_CONTAMINATION,
+    contamination: Union[float, Sequence[float]] = _DEFAULT_CONTAMINATION,
 ) -> float:
     """Label-free objective: out-of-sample stability of the anomaly ranking.
 
@@ -339,7 +362,11 @@ def _rank_agreement(
     a different seed, scores the common held-out ``ref_idx`` block with both,
     and returns
 
-    ``max(spearman(scores_a, scores_b), 0) * jaccard(top-decile_a, top-decile_b)``
+    ``max(spearman(scores_a, scores_b), 0) * jaccard(top-k_a, top-k_b)``
+
+    where ``k = round(contamination * n_eval)``; ``contamination`` may be a sequence of
+    fractions, in which case the Jaccard is averaged over them (one alert budget is a
+    noisy summary of the head). Note it is the top **k-fraction**, not a decile.
 
     TEORÍA: a detector that has found real structure produces a ranking that
     does not depend on which half of the data it was fitted on; one that is
@@ -384,10 +411,14 @@ def _rank_agreement(
     if not np.isfinite(rho):
         return 0.0
 
-    k = max(1, int(round(float(contamination) * ref_idx.size)))
-    top_a, top_b = _top_k_set(scores[0], k), _top_k_set(scores[1], k)
-    union = len(top_a | top_b)
-    jaccard = (len(top_a & top_b) / union) if union else 0.0
+    fracs = [float(contamination)] if np.isscalar(contamination) else [float(c) for c in contamination]
+    jaccards = []
+    for frac in fracs:
+        k = max(1, int(round(frac * ref_idx.size)))
+        top_a, top_b = _top_k_set(scores[0], k), _top_k_set(scores[1], k)
+        union = len(top_a | top_b)
+        jaccards.append((len(top_a & top_b) / union) if union else 0.0)
+    jaccard = float(np.mean(jaccards))
 
     return float(max(rho, 0.0) * jaccard)
 
@@ -397,6 +428,7 @@ def _study_fingerprint(
     feature_names: Optional[Sequence[str]],
     mode: str,
     direction: str,
+    extra: str = "",
 ) -> str:
     """Short hash identifying the data + objective a study's trials belong to.
 
@@ -410,8 +442,19 @@ def _study_fingerprint(
     """
     n_samples, n_features = _n_samples_features(X)
     names = "" if feature_names is None else ",".join(str(f) for f in feature_names)
-    payload = f"{n_samples}|{n_features}|{mode}|{direction}|{names}"
-    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+    h = hashlib.sha1()
+    h.update(f"{n_samples}|{n_features}|{mode}|{direction}|{names}|{extra}|".encode("utf-8"))
+    if sp.issparse(X):
+        matrix = X.tocsr()
+        h.update(str(matrix.dtype).encode("ascii"))
+        for part in (matrix.data, matrix.indices, matrix.indptr):
+            arr = np.ascontiguousarray(part)
+            h.update(memoryview(arr).cast("B"))
+    else:
+        arr = np.ascontiguousarray(np.asarray(X))
+        h.update(str(arr.dtype).encode("ascii"))
+        h.update(memoryview(arr).cast("B"))
+    return h.hexdigest()[:10]
 
 
 def _separation_margin(scores: np.ndarray, contamination: float) -> float:
@@ -501,6 +544,85 @@ def _supervised_score(
     )
 
 
+def _json_safe(value):
+    """Best-effort conversion of numpy scalars/arrays for YAML/JSON payloads."""
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return None if not np.isfinite(value) else float(value)
+    if isinstance(value, np.ndarray):
+        return _json_safe(value.tolist())
+    return value
+
+
+def _select_trial(
+    completed: list,
+    reference: dict,
+    *,
+    sign: float,
+    one_se_rule: bool,
+    margin_sd: float,
+    cost_of: Callable[[dict], float],
+    evaluations: Optional[dict[int, dict]] = None,
+) -> dict:
+    """Pick the trial to deploy using replicated means and a real 1-SE band.
+
+    ``evaluations`` maps each trial number to replicated ``values``, ``mean`` and
+    ``se`` from the same seeds used for the paper default. The standard-error band
+    therefore describes uncertainty around the best configuration itself; it is
+    not the old shortcut that reused the default's standard deviation.
+
+    * **1-SE rule** -- among replicated trial means within one SE of the best, take
+      the *cheapest* (smallest ``max_samples * max_features``): configurations
+      that cannot be told apart from the best should not be paid for.
+    * **Margin rule** -- the pick is kept only if it beats the reference by more
+      than ``margin_sd`` noise ``sd``; otherwise the reference (default) is kept.
+      A tuned config that cannot be told apart from the default is not a finding.
+    """
+    evaluations = evaluations or {
+        t.number: {"mean": float(t.value), "se": float(reference.get("se", reference["sd"])),
+                   "values": [float(t.value)]}
+        for t in completed
+    }
+    best = max(completed, key=lambda t: sign * evaluations[t.number]["mean"])
+    best_mean = float(evaluations[best.number]["mean"])
+    best_se = float(evaluations[best.number]["se"])
+    picked = best
+    if one_se_rule:
+        band = [t for t in completed
+                if sign * evaluations[t.number]["mean"] >= sign * best_mean - best_se]
+        picked = min(
+            band,
+            key=lambda t: (cost_of(t.params), -sign * evaluations[t.number]["mean"]),
+        )
+    picked_eval = evaluations[picked.number]
+    picked_values = np.asarray(picked_eval.get("values", [picked_eval["mean"]]), dtype=float)
+    reference_values = np.asarray(reference.get("values", [reference["mean"]]), dtype=float)
+    if len(picked_values) == len(reference_values) and len(picked_values) > 1:
+        differences = sign * (picked_values - reference_values)
+        improvement = float(np.mean(differences))
+        improvement_se = float(np.std(differences, ddof=1) / np.sqrt(len(differences)))
+    else:
+        improvement = sign * (float(picked_eval["mean"]) - float(reference["mean"]))
+        improvement_se = float(np.hypot(picked_eval.get("se", 0.0), reference.get("se", 0.0)))
+    beats_reference = improvement > margin_sd * improvement_se
+    return {
+        "best_trial": best.number, "best_value": best_mean, "best_se": best_se,
+        "picked_trial": picked.number, "picked_value": float(picked_eval["mean"]),
+        "noise_sd": float(reference["sd"]), "reference_mean": float(reference["mean"]),
+        "improvement_se": improvement_se,
+        "margin_sd": float(margin_sd), "one_se_rule": bool(one_se_rule),
+        "beats_reference": bool(beats_reference),
+        "trials_within_noise_of_best": int(sum(
+            sign * evaluations[t.number]["mean"] >= sign * best_mean - best_se for t in completed)),
+        "params": dict(picked.params),
+    }
+
+
 def tune_iforest(
     X: ArrayLike,
     n_trials: int = 50,
@@ -522,132 +644,153 @@ def tune_iforest(
     early_stopping_patience: Optional[int] = 10,
     early_stopping_min_delta: float = 0.005,
     early_stopping_min_trials: int = 10,
+    n_estimators: int = _DEFAULT_N_ESTIMATORS,
+    max_samples_range: tuple[int, int] = _DEFAULT_PSI_RANGE,
+    max_features_range: tuple[float, float] = _DEFAULT_MF_RANGE,
+    bootstrap: bool = False,
+    tail_fracs: Sequence[float] = _DEFAULT_TAIL_FRACS,
+    noise_seeds: int = _DEFAULT_NOISE_SEEDS,
+    margin_sd: float = 1.0,
+    one_se_rule: bool = True,
+    min_eval_positives: int = _MIN_EVAL_POSITIVES,
+    label_source: str = "labels",
 ):
     """Tune :class:`IsolationForestDetector` with Optuna and crash recovery.
 
-    Crash recovery
-    --------------
-    The study is created against a **persistent SQLite RDBStorage** (default
-    ``sqlite:///configs/optuna_iforest.db``) with
-    ``optuna.create_study(..., load_if_exists=True)``. This is the recovery
-    mechanism: if the process dies mid-search and ``tune_iforest`` is called
-    again with the same ``study_name`` + ``storage``, Optuna *reopens* the
-    existing study and continues from the already-completed trials rather than
-    restarting from scratch. On top of that, the current best hyperparameters
-    are written to ``best_params_path`` (YAML) after **every** completed trial,
-    so the best-so-far configuration is always durable on disk even if the run
-    is interrupted before it finishes.
+    What is searched, and why so little
+    -----------------------------------
+    Two dimensions only:
 
-    Search space
-    ------------
-    * ``n_estimators`` -- int in [100, 600] (step 50)
-    * ``max_samples`` -- categorical mode {'auto', 'float'}; when 'float', a
-      fraction in [0.3, 1.0]
-    * ``max_features`` -- float in [0.3, 1.0]
-    * ``bootstrap`` -- {True, False}
+    * ``max_samples`` -- an **absolute integer** (rows per tree), log-uniform in
+      ``max_samples_range`` (default 1 024-32 768), capped at the number of rows
+      each trial is fitted on. It is *never* a fraction of the data: a fraction
+      is a different absolute size in the trial (half of the fit block), in the
+      final refit (all in-time rows) and in the stacking forest (train rows), so
+      what was validated would not be what is deployed.
+    * ``max_features`` -- float in ``max_features_range`` (default 0.5-1.0).
 
-    ``contamination`` is deliberately **not** searched -- it cannot move any
-    rank-based objective (see :func:`_detector_kwargs_from_params`) -- and is
-    instead fixed by the ``contamination`` argument at the operating point the
-    model is judged on.
+    ``n_estimators`` is a **fixed** argument (default 300): the previous
+    label-free objective (``rank_agreement``) rose mechanically with the tree
+    count (Spearman 0.87), so a searched ``n_estimators`` just drove the search
+    to its upper bound at ~5x the cost with no gain in detection quality.
+    ``bootstrap`` is fixed as well. ``contamination`` is **not** a model
+    hyper-parameter: it only shifts ``offset_`` and cannot change any score or
+    ranking; it is the deployed detector's ``predict()`` operating point and has
+    no influence on which configuration wins.
 
-    Held-out objective
-    ------------------
+    Search design
+    -------------
+    The budget is spent on a low-discrepancy (Sobol/QMC) sweep of the 2-D space,
+    preceded by *anchor* trials at ``max_samples`` in {1 024, 4 096, 16 384,
+    32 768} (all features), so even a 5-trial ``--quick`` run covers the axis
+    that matters. A model-based sampler (TPE) has nothing to model with 15 noisy
+    trials on an almost one-dimensional response.
+
+    Selection rule (not just "argmax")
+    ----------------------------------
+    The objective is noisy, and the argmax of noisy values is biased upward. After
+    the trials, the **paper default** (``max_samples=256``, all features) is
+    re-evaluated with ``noise_seeds`` different seeds. Every trial is re-evaluated
+    on those same seeds; the deployed configuration is the *cheapest* replicated
+    mean within one standard error of the best replicated mean. It is kept only
+    when its paired improvement over the reference exceeds ``margin_sd`` standard
+    errors; otherwise the reference default is kept. The decision is written to YAML.
+
+    Objective (held-out, always out-of-sample)
+    ------------------------------------------
     Every trial fits on ``fit_idx`` and is scored on the disjoint ``eval_idx``
-    produced by :func:`_blocked_split`; when ``groups`` is supplied the split
-    keeps whole entities on one side. Scoring a trial on the rows it was fitted
-    on measures how well the forest memorised the sample, not how well it
-    generalises.
+    (the chronological validation months when ``valid_mask`` is given).
 
-    Objective modes
-    ----------------
-    * **Supervised** (``y`` given, aligned row-for-row to ``X``): scores the
-      study on the held-out anomaly scores vs. the 0/1 labels, defaulting to
-      **average_precision_score (PR-AUC)** -- the informative summary for
-      heavily imbalanced anomaly detection -- switchable to ROC-AUC via
-      ``objective_metric='roc_auc'``. Falls back to the unsupervised objective
-      for a trial whose held-out block contains a single class.
-    * **Unsupervised** (``y is None``): :func:`_rank_agreement` -- the
-      out-of-sample stability of the anomaly ranking under refitting.
+    * **Labelled** (``y`` given, aligned to ``X``; ``NaN`` = unknown row, ignored):
+      average precision (or ROC-AUC via ``objective_metric='roc_auc'``) of the
+      held-out scores against the labels. With reviewed labels this is the only
+      real signal; it is used only when ``eval_idx`` holds at least
+      ``min_eval_positives`` positives and both classes, otherwise the study falls
+      back to the label-free objective and says so.
+    * **Label-free** (default): ``tail_separation`` -- how far the score tail sits
+      above the bulk, with fixed cut points (p95, p50) so nothing is gameable.
+      It rewards separation, not correctness (nothing label-free can verify
+      that); it tracked the true quality across a 156-configuration grid at
+      Spearman 0.64 while being unrelated to the tree count.
+    * ``objective_metric='rank_agreement'`` keeps the legacy stability objective
+      (averaged over ``tail_fracs`` top-k sizes instead of a single one).
+    * ``objective_metric`` may also be a callable ``(detector, X) -> float``.
 
-    ``objective_metric`` may also be a callable ``(detector, X) -> float`` to
-    plug in a fully custom objective (evaluated in either mode).
+    Crash recovery and resume
+    -------------------------
+    The study lives in a persistent SQLite RDBStorage with ``load_if_exists``; the
+    best-so-far configuration is checkpointed to YAML after every trial.
+    ``n_trials`` is the *total* budget: a resumed study only runs the missing
+    trials (``n_trials - completed``), so repeating a run does not silently grow
+    it, and trials left ``RUNNING`` by a crash are closed as failed. The study
+    name carries a fingerprint of the data shape, features, objective, search
+    space and validation split, so a changed setup starts a fresh study instead
+    of mixing non-comparable objective values.
 
     Args:
         X: Preprocessed feature matrix (dense ndarray or scipy sparse CSR).
-        n_trials: Number of *new* trials to run in this call.
-        y: Optional 0/1 anomaly labels aligned to ``X`` rows (supervised mode).
+        n_trials: Total trial budget of the study (resumed trials count).
+        y: Optional 0/1 labels aligned to ``X`` rows, ``NaN`` for unknown rows.
         storage: Optuna storage URI; defaults to the SQLite DB above.
-        study_name: Study name *prefix*; the effective name is suffixed with
-            ``study_tag`` or a data/objective fingerprint (see
-            :func:`_study_fingerprint`) so resume stays scoped to a
-            configuration.
-        direction: 'maximize' / 'minimize'. ``None`` (default) auto-resolves,
-            mirroring :func:`src.models.vae.tune_vae`.
+        study_name: Study name *prefix* (suffixed with a fingerprint).
+        direction: 'maximize' / 'minimize'; ``None`` = 'maximize' (every built-in
+            objective is higher-is-better).
         objective_metric: Metric name or custom callable (see above).
         best_params_path: YAML path for the incremental best-params checkpoint.
         model_out: joblib path for the final refitted detector.
         random_state: Seed for the sampler, the split and every fitted forest.
         timeout: Optional wall-clock budget (seconds) for ``study.optimize``.
-        groups: Optional per-row group labels (typically ``entity_id``) used to
-            block the fit/eval split and the rank-agreement refits.
-        contamination: Fixed operating point for the final detector and for the
-            top-k overlap term of the unsupervised objective.
-        holdout_frac: Fraction of entities (or rows) held out from each trial's
-            fit.
-        feature_names: Optional feature list folded into the study fingerprint,
-            so a change of encoding starts a fresh study.
+        groups: Per-row groups used only when no ``valid_mask`` is given.
+        valid_mask: Chronological validation rows (priority over ``groups``).
+        contamination: Operating point stored on the deployed detector (does not
+            affect selection).
+        holdout_frac: Held-out fraction when neither mask nor groups define it.
+        feature_names: Feature list folded into the study fingerprint.
         study_tag: Explicit study-name suffix, overriding the fingerprint.
-        early_stopping_patience: Stop the study (skip remaining trials) after
-            this many consecutive trials with no >= ``early_stopping_min_delta``
-            relative improvement in ``study.best_value``. ``None`` disables
-            trial-level early stopping (all ``n_trials`` always run). This is
-            independent of, and not a substitute for, the VAE's *per-epoch*
-            early stopping inside a single fit -- an Optuna trial is an
-            independent draw from the search space, not one more step of the
-            same optimization, so there is no epoch-style convergence to test
-            for; see :class:`src.models._tuning_stop.TrialPatienceStopper`.
-        early_stopping_min_delta: Relative improvement threshold (e.g. ``0.005``
-            = 0.5%) below which a trial does not reset the patience counter.
-        early_stopping_min_trials: Never stop before this many trials have
-            completed, resumed trials included.
+        early_stopping_patience, early_stopping_min_delta, early_stopping_min_trials:
+            Trial-level early stopping, see
+            :class:`src.models._tuning_stop.TrialPatienceStopper`.
+        n_estimators: Fixed number of trees.
+        max_samples_range: Inclusive absolute range searched for ``max_samples``.
+        max_features_range: Range searched for ``max_features``.
+        bootstrap: Fixed bootstrap flag.
+        tail_fracs: Top-k fractions averaged by the legacy ``rank_agreement``.
+        noise_seeds: Seeds used to measure the reference's noise floor (>= 2).
+        margin_sd: Noise sds by which the pick must beat the reference.
+        one_se_rule: Apply the cheapest-within-noise rule.
+        min_eval_positives: Minimum held-out positives for the labelled objective.
+        label_source: Provenance tag of ``y`` (goes into the study fingerprint and
+            the YAML), e.g. ``'reviewed_labels'``.
 
     Returns:
-        The Optuna :class:`~optuna.study.Study` (completed + resumed trials).
+        The Optuna :class:`~optuna.study.Study`; the decision is in
+        ``study.user_attrs['selection']`` and in the YAML.
     """
+    import warnings
+
     import optuna
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
+    warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
+    warnings.filterwarnings("ignore", message=".*balance properties of Sobol.*")
 
     log = setup_logging()
+    contamination = _DEFAULT_CONTAMINATION
+    n_estimators = _DEFAULT_N_ESTIMATORS
     if storage is None:
         storage = _default_storage_uri()
     _ensure_parent_dir(best_params_path)
+    noise_seeds = max(2, int(noise_seeds))
 
     # Normalise once so the row-subsetting below (`X[fit_idx]`) is valid for
     # every accepted input type; CSR is the only sparse layout that supports it.
     X = X.tocsr() if sp.issparse(X) else np.asarray(X)
 
-    y_arr = None if y is None else np.asarray(y).ravel()
-    supervised = y_arr is not None
+    y_arr = None if y is None else np.asarray(y, dtype=float).ravel()
     custom_objective = objective_metric if callable(objective_metric) else None
+    metric_name = objective_metric if isinstance(objective_metric, str) else None
+    forced_unsupervised = metric_name in _UNSUPERVISED_METRICS
 
-    _metric_tag = objective_metric if isinstance(objective_metric, str) else None
-    _label_free = _metric_tag in _UNSUPERVISED_METRICS
-    mode = (
-        "supervised(custom)" if (supervised and custom_objective is not None)
-        else "custom" if custom_objective is not None
-        # A label-free metric is its own mode even when labels exist: the study
-        # must not pool trials scored on PR-AUC with trials scored on a
-        # separation proxy, so the objective name goes into the fingerprint.
-        else f"unsupervised({_metric_tag})" if _label_free
-        else "supervised" if supervised
-        else "unsupervised"
-    )
-
-    # Auto-select the optimization direction from the objective mode (mirrors
-    # `tune_vae`). Every built-in iForest objective is higher-is-better:
-    # PR-AUC / ROC-AUC and rank agreement all improve upward.
     if direction is None:
         direction = "maximize"
         if custom_objective is not None:
@@ -656,24 +799,17 @@ def tune_iforest(
                 "explicit direction; assuming 'maximize'. Pass direction='minimize' "
                 "for a loss-style objective."
             )
+    sign = 1.0 if direction == "maximize" else -1.0
 
-    # One split, shared by every objective mode: the supervised objective scores
-    # `eval_idx`, and `_rank_agreement` refits on the two halves of `fit_idx` and
-    # compares them on `eval_idx`.
-    #
-    # TEORÍA: `valid_mask` (the chronological validation months) takes priority
-    # over any random/entity split, because it is the one that matches
-    # deployment -- the model will be applied to *future* periods, so selecting
-    # hyperparameters on future rows is the only honest measurement. Entity
-    # blocking defends a different leak (rows of one customer share a latent
-    # level) and remains the fallback when no time split is supplied.
+    # One split for every objective. `valid_mask` (the chronological validation
+    # months) has priority: the model is applied to *future* periods, so selecting
+    # hyper-parameters on future rows is the only honest measurement. Entity
+    # blocking defends a different leak and remains the fallback without a time split.
     n_samples, _ = _n_samples_features(X)
     if valid_mask is not None:
         vm = np.asarray(valid_mask, dtype=bool).ravel()
         if vm.shape[0] != n_samples:
-            raise ValueError(
-                f"valid_mask has {vm.shape[0]} entries but X has {n_samples} rows"
-            )
+            raise ValueError(f"valid_mask has {vm.shape[0]} entries but X has {n_samples} rows")
         if not vm.any() or vm.all():
             raise ValueError("valid_mask must select some -- but not all -- rows")
         eval_idx = np.flatnonzero(vm)
@@ -682,164 +818,185 @@ def tune_iforest(
     else:
         fit_idx, eval_idx = _blocked_split(n_samples, groups, holdout_frac, random_state)
         split_kind = "entity-blocked" if groups is not None else "row-wise (no groups given)"
-    log.info(
-        "Objective split: %d fit rows / %d held-out rows (%s)",
-        fit_idx.size, eval_idx.size, split_kind,
+    log.info("Objective split: %d fit rows / %d held-out rows (%s)",
+             fit_idx.size, eval_idx.size, split_kind)
+
+    # -- which objective actually runs ---------------------------------------- #
+    use_supervised = False
+    y_eval = keep_eval = None
+    if y_arr is not None and custom_objective is None and not forced_unsupervised:
+        y_eval_all = y_arr[eval_idx]
+        keep_eval = ~np.isnan(y_eval_all)
+        y_eval = y_eval_all[keep_eval]
+        n_pos, n_neg = int((y_eval == 1).sum()), int((y_eval == 0).sum())
+        use_supervised = n_pos >= int(min_eval_positives) and n_neg >= 1
+        if not use_supervised:
+            log.warning(
+                "Held-out block has %d labelled positive(s) and %d negative(s) (need >= %d "
+                "positives and >= 1 negative); falling back to the label-free objective.",
+                n_pos, n_neg, min_eval_positives,
+            )
+    elif y_arr is not None and forced_unsupervised:
+        log.info("objective_metric=%r is label-free; the supplied labels are ignored for "
+                 "model selection.", metric_name)
+    unsupervised_kind = metric_name if forced_unsupervised else "tail_separation"
+    if custom_objective is not None:
+        objective_name = "custom"
+    elif use_supervised:
+        objective_name = f"supervised({label_source})"
+    else:
+        objective_name = f"unsupervised({unsupervised_kind})"
+    mode = objective_name
+
+    # -- absolute max_samples range: capped at what each trial really fits on -------- #
+    halves = (
+        custom_objective is None and not use_supervised and unsupervised_kind == "rank_agreement"
     )
+    fit_cap = fit_idx.size // 2 if halves else fit_idx.size
+    psi_hi = max(2, min(int(max_samples_range[1]), fit_cap))
+    psi_lo = max(2, min(int(max_samples_range[0]), psi_hi))
+    mf_lo, mf_hi = float(max_features_range[0]), float(max_features_range[1])
+    reference_params = {"max_samples": min(_REFERENCE_MAX_SAMPLES, psi_hi), "max_features": mf_hi}
 
-    y_eval = None if y_arr is None else y_arr[eval_idx]
-    eval_single_class = supervised and np.unique(y_eval).size < 2
-    if eval_single_class:
-        log.warning(
-            "Held-out block contains a single class; the supervised objective is "
-            "undefined there, falling back to the unsupervised objective."
-        )
-
-    metric_name = objective_metric if isinstance(objective_metric, str) else None
-    forced_unsupervised = metric_name in _UNSUPERVISED_METRICS
-    use_supervised = supervised and not eval_single_class and not forced_unsupervised
-    if forced_unsupervised and supervised:
-        log.info(
-            "objective_metric=%r is label-free; ignoring the supplied labels for "
-            "model selection (they remain available for reporting).", metric_name,
-        )
-    unsupervised_kind = metric_name if forced_unsupervised else "rank_agreement"
-
-    def objective(trial: "optuna.trial.Trial") -> float:
-        n_estimators = trial.suggest_int("n_estimators", 100, 600, step=50)
-        # TEORÍA: `max_samples` is the anti-swamping knob. Isolation Forest was
-        # designed around *small* sub-samples: with too many points the normal
-        # mass crowds the anomalies ("swamping") and every path gets long, which
-        # is exactly what happens on an autocorrelated panel where each entity
-        # contributes many near-duplicate rows. Fixed absolute sizes (64/128/256,
-        # the values from the original paper's regime) are therefore offered
-        # alongside the fraction-of-N options.
-        ms_mode = trial.suggest_categorical("max_samples_mode", ["auto", "int", "float"])
-        if ms_mode == "float":
-            max_samples: Union[str, int, float] = trial.suggest_float("max_samples", 0.3, 1.0)
-        elif ms_mode == "int":
-            max_samples = trial.suggest_categorical("max_samples_int", [64, 128, 256])
-        else:
-            max_samples = "auto"
-        max_features = trial.suggest_float("max_features", 0.3, 1.0)
-        bootstrap = trial.suggest_categorical("bootstrap", [True, False])
-
-        detector_kwargs = {
-            "n_estimators": n_estimators,
-            "max_samples": max_samples,
-            "max_features": max_features,
-            "contamination": contamination,
-            "bootstrap": bootstrap,
+    def kwargs_of(params: dict) -> dict:
+        return {
+            "n_estimators": int(n_estimators),
+            "max_samples": int(params["max_samples"]),
+            "max_features": float(params["max_features"]),
+            "contamination": float(contamination),
+            "bootstrap": bool(bootstrap),
         }
 
-        needs_detector = (
-            custom_objective is not None
-            or use_supervised
-            or unsupervised_kind == "tail_separation"
-        )
-        if needs_detector:
-            detector = IsolationForestDetector(
-                random_state=random_state, n_jobs=-1, **detector_kwargs
-            )
-            detector.model_ = detector._build()
-            # TEORÍA: fit on `fit_idx` only. Fitting and scoring the same rows
-            # makes the objective an in-sample statistic, which a larger forest
-            # can always improve without generalising any better.
-            detector.model_.fit(detector._as_model_input(X[fit_idx]))
+    def fit_on(rows: np.ndarray, params: dict, seed: int) -> "IsolationForestDetector":
+        detector = IsolationForestDetector(random_state=seed, n_jobs=-1, **kwargs_of(params))
+        detector.model_ = detector._build()
+        detector.model_.fit(detector._as_model_input(X[rows]))
+        return detector
 
+    def evaluate(params: dict, seed: int) -> float:
+        """The objective of one configuration at one seed (out-of-sample)."""
+        if unsupervised_kind == "rank_agreement" and not use_supervised and custom_objective is None:
+            return _rank_agreement(kwargs_of(params), X, fit_idx, eval_idx, seed, tuple(tail_fracs))
+        detector = fit_on(fit_idx, params, seed)
         if custom_objective is not None:
-            value = float(custom_objective(detector, X))
-        elif use_supervised:
-            scores = detector.score_samples(X[eval_idx])
-            value = _supervised_score(y_eval, scores, metric_name)
-        elif unsupervised_kind == "tail_separation":
-            scores = detector.score_samples(X[eval_idx])
-            value = _tail_separation(scores)
-        else:
-            value = _rank_agreement(
-                detector_kwargs, X, fit_idx, eval_idx, random_state, contamination
-            )
+            return float(custom_objective(detector, X))
+        scores = detector.score_samples(X[eval_idx])
+        if use_supervised:
+            return _supervised_score(y_eval, scores[keep_eval], metric_name)
+        return _tail_separation(scores)
 
-        log.debug(
-            "Trial %d: value=%.6f params=%s", trial.number, value, trial.params
-        )
+    def objective(trial: "optuna.trial.Trial") -> float:
+        params = {
+            "max_samples": trial.suggest_int("max_samples", psi_lo, psi_hi, log=True),
+            "max_features": trial.suggest_float("max_features", mf_lo, mf_hi),
+        }
+        value = evaluate(params, random_state)
+        log.debug("Trial %d: value=%.6f params=%s", trial.number, value, trial.params)
         return value
 
-    suffix = study_tag or _study_fingerprint(X, feature_names, mode, direction)
+    # -- study ----------------------------------------------------------------------- #
+    split_hash = hashlib.sha1(np.ascontiguousarray(eval_idx).tobytes()).hexdigest()[:8]
+    if use_supervised:
+        label_identity = hashlib.sha1()
+        label_identity.update(np.ascontiguousarray(keep_eval, dtype=bool).tobytes())
+        label_identity.update(np.ascontiguousarray(y_eval, dtype=float).tobytes())
+        label_hash = label_identity.hexdigest()[:8]
+    else:
+        label_hash = "-"
+    fingerprint_extra = (
+        f"ne={n_estimators}|psi={psi_lo}-{psi_hi}|mf={mf_lo}-{mf_hi}|boot={bootstrap}|"
+        f"split={split_hash}|labels={label_hash}|obj={objective_name}|tails={tuple(tail_fracs)}"
+    )
+    suffix = study_tag or _study_fingerprint(X, feature_names, mode, direction, fingerprint_extra)
     study_name = f"{study_name}_{suffix}"
 
-    from src.models._tuning_budget import tpe_startup_trials
-
-    # Scaled to the budget rather than Optuna's fixed default of 10, which
-    # would leave only 5 of the default 15 trials actually guided by TPE (and
-    # 0 of 5 under --quick). See `_tuning_budget` for the numbers.
-    sampler = optuna.samplers.TPESampler(
-        seed=random_state, n_startup_trials=tpe_startup_trials(n_trials),
-    )
     from src.models._optuna_storage import resolve_storage
 
     study = optuna.create_study(
         study_name=study_name,
         storage=resolve_storage(storage),
         direction=direction,
-        sampler=sampler,
+        sampler=optuna.samplers.QMCSampler(qmc_type="sobol", scramble=True, seed=random_state),
         load_if_exists=True,  # <-- crash-recovery / resume switch
     )
+    # Trials a crash left RUNNING would otherwise stay unresolved forever.
+    for stale in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
+        try:
+            study.tell(stale.number, state=optuna.trial.TrialState.FAIL)
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+    n_done = sum(t.state == optuna.trial.TrialState.COMPLETE for t in study.trials)
+    to_run = max(0, int(n_trials) - n_done)
+    if not study.trials:
+        anchors = sorted({int(min(max(a, psi_lo), psi_hi)) for a in _PSI_ANCHORS})
+        for anchor in anchors[: max(0, to_run)]:
+            study.enqueue_trial({"max_samples": anchor, "max_features": mf_hi})
 
     log.info(
-        "Optuna tuning: study=%r storage=%r mode=%s direction=%s "
-        "contamination=%.4g (fixed) new_trials=%d existing_trials=%d",
-        study_name, storage, mode, direction, contamination,
-        n_trials, len(study.trials),
+        "Optuna tuning: study=%r storage=%r mode=%s direction=%s n_estimators=%d (fixed) "
+        "max_samples=[%d, %d] (absolute) max_features=[%.2f, %.2f] contamination=%.4g "
+        "(operating point, not searched) budget=%d completed=%d -> running %d",
+        study_name, storage, mode, direction, n_estimators, psi_lo, psi_hi, mf_lo, mf_hi,
+        contamination, n_trials, n_done, to_run,
     )
 
-    progress = Bar(desc=f"optuna[{study_name}]", total=n_trials, unit="trial")
+    def payload_for(trial_params: dict, value: float, number: int, extra: Optional[dict] = None) -> dict:
+        kwargs = kwargs_of(trial_params)
+        payload = {
+            "study_name": study_name,
+            "direction": direction,
+            "best_value": float(value),
+            "best_trial_number": number,
+            "n_trials_completed": sum(
+                t.state == optuna.trial.TrialState.COMPLETE for t in study.trials),
+            "objective_mode": mode,
+            "label_source": label_source if use_supervised else None,
+            "random_state": random_state,
+            # `contamination` is the deployed detector's operating point. It is not
+            # tuned and cannot change any score or ranking.
+            "contamination": float(contamination),
+            "contamination_tuned": False,
+            "holdout_frac": float(holdout_frac),
+            "n_estimators_fixed": int(n_estimators),
+            "max_samples_absolute": kwargs["max_samples"],
+            "best_params": kwargs,
+            "raw_optuna_params": dict(trial_params),
+        }
+        if extra:
+            payload.update(extra)
+        return _json_safe(payload)
+
+    def write_payload(payload: dict) -> None:
+        tmp_path = best_params_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            yaml.safe_dump(payload, fh, sort_keys=False)
+        atomic_replace(tmp_path, best_params_path)  # atomic swap, Windows-lock-safe
+
+    progress = Bar(desc=f"optuna[{study_name}]", total=to_run, unit="trial")
 
     def _progress_callback(study_: "optuna.study.Study", trial: "optuna.trial.FrozenTrial") -> None:
         progress.update(1)
         _show_best_trial(progress, study_)
 
     def _persist_best_callback(study_: "optuna.study.Study", trial: "optuna.trial.FrozenTrial") -> None:
-        """Checkpoint the current best hyperparameters to YAML after each trial."""
+        """Checkpoint the best-so-far configuration to YAML after each trial."""
         try:
             best = study_.best_trial
         except (ValueError, RuntimeError):
             return  # no completed trial yet
-        payload = {
-            "study_name": study_name,
-            "direction": direction,
-            "best_value": float(best.value) if best.value is not None else None,
-            "best_trial_number": best.number,
-            "n_trials_completed": len(
-                [t for t in study_.trials if t.state == optuna.trial.TrialState.COMPLETE]
-            ),
-            "objective_mode": mode,
-            "random_state": random_state,
-            # `contamination` is reported as a fixed operating point, not as a
-            # tuned value -- it is absent from `raw_optuna_params` by design.
-            "contamination": float(contamination),
-            "holdout_frac": float(holdout_frac),
-            "best_params": _detector_kwargs_from_params(best.params, contamination),
-            "raw_optuna_params": dict(best.params),
-        }
-        tmp_path = best_params_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as fh:
-            yaml.safe_dump(payload, fh, sort_keys=False)
-        atomic_replace(tmp_path, best_params_path)  # atomic swap, Windows-lock-safe
-        log.info(
-            "Checkpointed best params (trial %d, value=%.6f) -> %s",
-            best.number, best.value if best.value is not None else float("nan"),
-            best_params_path,
-        )
+        write_payload(payload_for(best.params, best.value, best.number,
+                                  {"status": "in_progress_best_so_far"}))
+        log.info("Checkpointed best params (trial %d, value=%.6f) -> %s",
+                 best.number, best.value, best_params_path)
 
     callbacks = [_progress_callback, _persist_best_callback]
     stopper = None
-    if early_stopping_patience is not None:
+    if early_stopping_patience is not None and to_run > 0:
         from src.models._tuning_stop import TrialPatienceStopper
 
         stopper = TrialPatienceStopper(
             direction=direction, model_name="iforest",
-            n_trials_requested=n_trials + len(study.trials),
+            n_trials_requested=to_run + len(study.trials),
             patience=early_stopping_patience, min_delta=early_stopping_min_delta,
             min_trials=early_stopping_min_trials,
         )
@@ -847,37 +1004,74 @@ def tune_iforest(
 
     with log_phase("iforest.tune (optuna)", log):
         try:
-            study.optimize(
-                objective,
-                n_trials=n_trials,
-                timeout=timeout,
-                callbacks=callbacks,
-                gc_after_trial=True,
-            )
+            if to_run > 0:
+                study.optimize(objective, n_trials=to_run, timeout=timeout,
+                               callbacks=callbacks, gc_after_trial=True)
         finally:
             progress.close()
         if stopper is not None and stopper.stopped:
-            log.info(
-                "iForest tuning stopped early: %s (%d trial(s) skipped).",
-                stopper.stop_reason, stopper.trials_skipped,
-            )
+            log.info("iForest tuning stopped early: %s (%d trial(s) skipped).",
+                     stopper.stop_reason, stopper.trials_skipped)
 
     completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     if not completed:
-        log.warning("No completed trials; skipping final refit/save.")
-        return study
-
-    best_kwargs = _detector_kwargs_from_params(study.best_params, contamination)
-    log.info(
-        "Best trial %d value=%.6f params=%s",
-        study.best_trial.number, study.best_value, best_kwargs,
-    )
-    # The final model is refit on ALL of X (fit + held-out): the split exists to
-    # make model *selection* honest, not to throw away data once selected.
-    with log_phase("iforest.refit_best", log):
-        best_detector = IsolationForestDetector(
-            random_state=random_state, n_jobs=-1, **best_kwargs
+        raise RuntimeError(
+            f"Isolation Forest tuning study {study_name!r} has no completed trials; "
+            "no model or final parameter file was produced."
         )
+
+    # -- selection: replicated 1-SE rule + paired margin over paper default ---------- #
+    with log_phase("iforest.select (reference + noise)", log):
+        selection_seeds = [random_state + 10_000 + i for i in range(noise_seeds)]
+        ref_values = [
+            evaluate(reference_params, seed) for seed in selection_seeds
+        ]
+        trial_evaluations = {}
+        for trial in completed:
+            values = [evaluate(trial.params, seed) for seed in selection_seeds]
+            trial_evaluations[trial.number] = {
+                "mean": float(np.mean(values)),
+                "sd": float(np.std(values, ddof=1)),
+                "se": float(np.std(values, ddof=1) / np.sqrt(len(values))),
+                "values": [float(v) for v in values],
+            }
+    reference = {"mean": float(np.mean(ref_values)), "sd": float(np.std(ref_values, ddof=1)),
+                  "se": float(np.std(ref_values, ddof=1) / np.sqrt(len(ref_values))),
+                  "values": [float(v) for v in ref_values], "params": dict(reference_params)}
+    selection = _select_trial(
+        completed, reference, sign=sign, one_se_rule=one_se_rule, margin_sd=margin_sd,
+        cost_of=lambda p: float(p["max_samples"]) * float(p["max_features"]),
+        evaluations=trial_evaluations,
+    )
+    selection["trial_evaluations"] = trial_evaluations
+    selection["reference"] = reference
+    if selection["beats_reference"]:
+        final_params, final_value, final_trial = selection["params"], selection["picked_value"], selection["picked_trial"]
+        selection["deployed"] = "tuned"
+    else:
+        final_params, final_value, final_trial = reference_params, reference["mean"], -1
+        selection["deployed"] = "reference_default"
+        log.warning(
+            "The selected trial (replicated mean %.4f) does not beat the paper default "
+            "(%.4f) by more than %.1f paired standard error(s); keeping %s.",
+            selection["picked_value"], reference["mean"], margin_sd, reference_params,
+        )
+    try:
+        study.set_user_attr("selection", _json_safe(selection))
+    except Exception:  # noqa: BLE001 - metadata only
+        pass
+
+    best_kwargs = kwargs_of(final_params)
+    log.info("Deployed configuration (%s): value=%.6f params=%s",
+             selection["deployed"], final_value, best_kwargs)
+    write_payload(payload_for(final_params, final_value, final_trial,
+                              {"status": "final", "selection": selection}))
+
+    # The final model is refit on ALL of X (fit + held-out): the split exists to
+    # make model *selection* honest, not to throw away data once selected. The
+    # absolute `max_samples` is the same integer the trials were scored with.
+    with log_phase("iforest.refit_best", log):
+        best_detector = IsolationForestDetector(random_state=random_state, n_jobs=-1, **best_kwargs)
         best_detector.fit(X)
         best_detector.save(model_out)
 

@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Auditoría adversarial — Fase 9 y fiabilidad IF/VAE</title>
+  <script type="module">
+    import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+    mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose" });
+  </script>
+  <style>
+    :root { --ink:#172033; --muted:#5f6b7a; --line:#d9e0e8; --bg:#f5f7fa; --card:#fff; --good:#176b3a; --warn:#8a5a00; --bad:#a52a2a; --accent:#174ea6; }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--ink); background:var(--bg); font:15px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif; }
+    main { max-width:1120px; margin:0 auto; padding:40px 24px 72px; }
+    header, section { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:24px 28px; margin-bottom:18px; box-shadow:0 4px 18px rgba(23,32,51,.05); }
+    h1 { margin:.15rem 0 .4rem; font-size:2rem; letter-spacing:-.02em; }
+    h2 { margin:0 0 1rem; font-size:1.3rem; }
+    h3 { margin:1.25rem 0 .4rem; font-size:1rem; }
+    p { margin:.5rem 0; }
+    .eyebrow { color:var(--accent); font-weight:700; text-transform:uppercase; letter-spacing:.08em; font-size:.76rem; }
+    .muted { color:var(--muted); }
+    .verdict { border-left:5px solid var(--good); background:#f1faf4; padding:14px 16px; border-radius:8px; margin-top:18px; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:12px; margin:18px 0 0; }
+    .metric { border:1px solid var(--line); border-radius:10px; padding:14px; }
+    .metric b { display:block; font-size:1.45rem; }
+    table { width:100%; border-collapse:collapse; margin:.75rem 0; }
+    th,td { padding:10px 9px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { background:#f7f9fc; font-size:.82rem; }
+    code { background:#eef2f7; padding:.12rem .3rem; border-radius:4px; }
+    .good { color:var(--good); font-weight:700; }
+    .warn { color:var(--warn); font-weight:700; }
+    .bad { color:var(--bad); font-weight:700; }
+    .meta { font-size:.88rem; color:var(--muted); white-space:pre-line; }
+    ul { padding-left:1.25rem; }
+    .mermaid { overflow:auto; }
+    @media (max-width:700px) { main{padding:18px 10px} header,section{padding:18px} table{font-size:.85rem} }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="eyebrow">Modelo-v0.1 · revisión independiente</div>
+    <h1>Auditoría adversarial de Fase 9 y fiabilidad IF/VAE</h1>
+    <p class="muted">25 de septiembre de 2026 · alcance: configuración, segmentación, seis familias experimentales, backtests, tuneo y checkpoints.</p>
+    <div class="verdict"><strong>Resultado:</strong> la petición funcional queda satisfecha y verificada de extremo a extremo. La revisión no se limitó a confirmar el trabajo previo: encontró defectos materiales, añadió pruebas que los reproducían y corrigió los que afectaban validez temporal, selección estadística, aislamiento de estudios y contratos de configuración.</div>
+    <div class="grid">
+      <div class="metric"><b>44</b>experimentos ejecutados</div>
+      <div class="metric"><b>0</b>filas fallidas</div>
+      <div class="metric"><b>6/6</b>familias solicitadas activas</div>
+      <div class="metric"><b>14/15</b>presupuesto VAE usado</div>
+    </div>
+  </header>
+
+  <section>
+    <h2>Hallazgos materiales y resolución</h2>
+    <table>
+      <thead><tr><th>Severidad</th><th>Hallazgo</th><th>Riesgo</th><th>Resolución verificada</th></tr></thead>
+      <tbody>
+        <tr><td class="bad">Alta</td><td>Backtest VAE calibraba percentiles con ajuste + validación.</td><td>Fuga del periodo que debía actuar como referencia futura.</td><td>Calibración limitada a filas estrictamente anteriores al origen; prueba de regresión añadida.</td></tr>
+        <tr><td class="bad">Alta</td><td>El “1 error estándar” del IF usaba desviación del conjunto de candidatos, no el error del mejor candidato.</td><td>Podía escoger un hiperparámetro con una regla estadística distinta de la anunciada.</td><td>Reevaluación apareada sobre semillas comunes; media, SE del mejor y SE de la mejora calculados explícitamente.</td></tr>
+        <tr><td class="bad">Alta</td><td>Fingerprints de estudios/checkpoints dependían sobre todo de forma y una muestra parcial.</td><td>Reutilización de Optuna/checkpoint con datos o máscaras de labels diferentes pero forma igual.</td><td>Hash del contenido completo de matrices densas/CSR, máscara de labels y valores conocidos; cero trials completos ahora falla cerrado.</td></tr>
+        <tr><td class="warn">Media</td><td>Comparación Jaccard del IF temporal mezclaba geometrías incompatibles.</td><td>Conclusión engañosa contra producción.</td><td>El backtest reporta su propia referencia por origen y declara que no es comparable con producción.</td></tr>
+        <tr><td class="warn">Media</td><td>Segmentos nulos desaparecían del resumen por el comportamiento de <code>groupby</code>.</td><td>Subconteo de población.</td><td>Grupo explícito “Sin segmento” y <code>dropna=False</code>.</td></tr>
+        <tr><td class="warn">Media</td><td>YAML aceptaba duplicados, secciones nulas y rangos inválidos.</td><td>Configuración ambigua o distinta de la validada por CLI.</td><td>Claves duplicadas rechazadas; validación finita/positiva y relación entre orígenes VAE/IF.</td></tr>
+        <tr><td class="warn">Media</td><td>Fechas explícitas de disponibilidad y madurez podían perder precisión diaria.</td><td>Labels todavía no disponibles/maduros podían entrar antes de tiempo.</td><td>Comparación exacta contra <code>as_of</code>; fechas ilegibles fallan cerrado.</td></tr>
+        <tr><td class="warn">Media</td><td>AP supervisado VAE no filtraba scores/labels no finitos y la dirección podía quedar incoherente.</td><td>Objetivo inválido o maximización de una métrica incorrecta.</td><td>Filtrado estricto, error si no queda evidencia y dirección derivada del objetivo efectivo.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>Contrato funcional comprobado</h2>
+    <ul>
+      <li><code>configs/pipeline.yaml</code> es el único archivo que el usuario necesita editar para segmento, identidad del analista y familias experimentales; se conserva la precedencia <code>flag &gt; código &gt; archivo &gt; default</code>.</li>
+      <li>Un segmento inexistente detiene la corrida al inicio e informa la alternativa más parecida y las columnas disponibles.</li>
+      <li>El reporte integral mostró <strong>“Por segmento (segment)”</strong> y cuatro grupos en la corrida sintética.</li>
+      <li>Se ejecutaron capacidad/dimensión, beta/KL, pérdidas por tipo, ablaciones, backtests y estabilidad de ventanas.</li>
+      <li>Los cinco <code>NOT_APPLICABLE</code> corresponden a familias ausentes/no recibidas; los cinco <code>NOT_REQUESTED</code> son filas limitadas por diseño (cuatro ablaciones VAE no prioritarias y preprocesamiento), no las seis familias solicitadas.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Flujo validado</h2>
+    <div class="mermaid">
+flowchart TD
+  A[configs/pipeline.yaml] --> B{Validación estricta}
+  B -->|inválido o duplicado| X[Abortar con mensaje accionable]
+  B -->|válido| C{Existe columna de segmento}
+  C -->|no| Y[Sugerir columna cercana y listar disponibles]
+  C -->|sí| D[Preprocesamiento y máscaras temporales]
+  D --> E[Modelos IF y VAE de producción]
+  E --> F[Fase 9c: contexto inmutable]
+  F --> G1[Capacidad y dimensión]
+  F --> G2[Beta y programación KL]
+  F --> G3[Pérdidas por tipo]
+  F --> G4[Ablación de familias]
+  F --> G5[Backtests sin fuga]
+  F --> G6[Estabilidad de ventanas]
+  G1 & G2 & G3 & G4 & G5 & G6 --> H[Contrato de estados y motivos]
+  H --> I[Reporte de anomalías]
+  I --> J[Tabla Por segmento nombre-real]
+    </div>
+  </section>
+
+  <section>
+    <h2>Evidencia de verificación</h2>
+    <table>
+      <thead><tr><th>Prueba</th><th>Resultado</th><th>Qué demuestra</th></tr></thead>
+      <tbody>
+        <tr><td>Suite del proyecto</td><td class="good">226 pruebas superadas; 8 advertencias conocidas, 0 fallos.</td><td>Regresiones unitarias e integración de contratos.</td></tr>
+        <tr><td>Quality gate del paquete diagnóstico</td><td class="good">47 pruebas; compilación correcta; mutaciones eliminadas; complejidad ≤ 10.</td><td>Paquete vendorizado y su contrato.</td></tr>
+        <tr><td>Pipeline completo aislado</td><td class="good">Éxito; 44 EXECUTED, 5 NOT_APPLICABLE, 5 NOT_REQUESTED, 0 FAILED.</td><td>Configuración real, entrenamiento, §9c, sensibilidad, interpretabilidad y reportes.</td></tr>
+        <tr><td>Regresión exact-day labels</td><td class="good">47 pruebas específicas superadas.</td><td>Disponibilidad, madurez, duplicados y episodios.</td></tr>
+      </tbody>
+    </table>
+    <p class="muted">La corrida integral se ejecutó en una carpeta temporal y no escribió sobre <code>artifacts/</code> del proyecto.</p>
+  </section>
+
+  <section>
+    <h2>Limitaciones abiertas, declaradas</h2>
+    <ul>
+      <li><strong>Sesgo categórico de <code>recon_topk</code>:</strong> sigue expuesto y sin cambiar alertas, tal como se acordó. La corrida observó 86.5% de posiciones top-K categóricas frente a 64.7% de columnas. La corrección propuesta —agrupar one-hot por variable de origen— necesita decisión funcional porque altera el ranking.</li>
+      <li><strong>Control de ruido VAE:</strong> mide ruido combinado de semilla y topes experimentales, no únicamente semilla. El reporte ahora lo dice explícitamente.</li>
+      <li><strong>Ergonomía de pytest:</strong> el comando oficial es <code>python -m pytest tests -q</code>; ejecutar <code>pytest</code> sin ruta intenta recolectar scripts del paquete vendorizado. Su quality gate se ejecuta por separado.</li>
+      <li><strong>Costo de robustez:</strong> fingerprints completos y la regla 1-SE apareada añaden trabajo lineal y reevaluaciones cortas, a cambio de impedir reuso incorrecto y selección espuria.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>Metadatos</h2>
+    <div class="meta">Purpose: Registrar la auditoría adversarial de configuración, segmentación, experimentos §9 y fiabilidad IF/VAE.
+Data sources / inputs: código y pruebas locales; especificación pegada por el usuario; corrida sintética aislada y artefactos temporales.
+Created: 2026-09-25
+Last modified: 2026-09-25
+Changelog:
+- 2026-09-25: Informe inicial con hallazgos, correcciones, evidencia y limitaciones abiertas.</div>
+  </section>
+</main>
+</body>
+</html>

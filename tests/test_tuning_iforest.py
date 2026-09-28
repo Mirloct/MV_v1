@@ -112,6 +112,44 @@ class TestSearchSpaceAndDeploy(TunerBase):
         self.assertEqual(auto["max_samples"], "auto")
 
 
+class TestSelectionTracking(TunerBase):
+    """The selection phase ((trials + 1) * noise_seeds full refits) can run unattended for a
+    long time; it must leave a readable, persistent trail in the log -- not just a live bar,
+    which tqdm writes straight to stderr and never through `log` -- so progress and health
+    can be audited from execution.log after the fact, not only watched live."""
+
+    def test_reference_and_every_trial_log_progress_with_elapsed_and_eta(self):
+        X, _, valid = _panel()
+        with self.assertLogs("modelo", level="INFO") as captured:
+            self.run_tuner(X, valid, name="tracked", n_trials=3, noise_seeds=2)
+        lines = [m for m in captured.output if "Selection:" in m]
+        self.assertEqual(sum("reference evaluated" in m for m in lines), 1)
+        self.assertEqual(sum("trial " in m and " done (" in m for m in lines), 3)
+        for m in lines:
+            self.assertIn("cycles (", m)
+            self.assertIn("elapsed=", m)
+            self.assertIn("ETA=", m)
+        # cycles-done accounting is monotonic and ends at the full budget: (3 trials + 1
+        # reference) * 2 seeds = 8.
+        counts = [int(m.split(" -- ")[1].split("/")[0]) for m in lines]
+        self.assertEqual(counts, sorted(counts))
+        self.assertEqual(counts[-1], (3 + 1) * 2)
+
+    def test_trial_summaries_report_the_same_mean_used_for_selection(self):
+        X, _, valid = _panel()
+        with self.assertLogs("modelo", level="INFO") as captured:
+            study, payload = self.run_tuner(X, valid, name="tracked-mean", n_trials=3, noise_seeds=2)
+        selection = study.user_attrs["selection"]
+        logged_means = {}
+        for m in captured.output:
+            if "Selection: trial " in m and " done (" in m:
+                num = int(m.split("Selection: trial ")[1].split(" done")[0])
+                mean = float(m.split("mean=")[1].split(",")[0])
+                logged_means[num] = mean
+        for trial_number, ev in selection["trial_evaluations"].items():
+            self.assertAlmostEqual(logged_means[int(trial_number)], ev["mean"], places=6)
+
+
 class TestResume(TunerBase):
     def test_n_trials_is_a_total_budget(self):
         X, _, valid = _panel()

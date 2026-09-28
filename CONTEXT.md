@@ -131,7 +131,14 @@ Produced by `src/data`, consumed by every downstream module:
   `entity_col` (`"entity_id"`), `target_col` (`None` for synthetic data —
   labels live in the separate file), `ground_truth_path` (or `None` if
   none was located), and `identification_columns` (see below; `()` unless
-  `main()` sets it right after loading). `time_col`/`entity_col` can be
+  `main()` sets it right after loading). Column-name hints (2026-09-27):
+  `_TIME_NAME_HINTS`/`_ENTITY_NAME_HINTS` in `src/data/loader.py` also match
+  `codmes`/`codclavepartycli` (this project's own real-data naming), on top
+  of the generic `period`/`date`/`time` and `entity`/`individual`/`id`. This
+  matters for `codmes`: an all-digit period column (`202401`-typed as a
+  plain integer, not `object`/datetime) is invisible to the structural
+  fallbacks below, so without the name hint it would not be inferred as
+  `time_col` at all. Tests: `tests/test_schema_inference.py`. `time_col`/`entity_col` can be
   `None` for arbitrary inputs; callers must handle that.
 - **Identification columns (2026-09-27)**: `data.identification_columns` of
   `configs/pipeline.yaml` (or `--identification-columns`) names panel columns
@@ -1141,6 +1148,14 @@ synthetic data** — the direction of the ψ effect must be re-checked on real d
 - **Selection**: the paper default (ψ=256) is re-evaluated with 3 seeds → noise `sd`;
   deployed = cheapest trial within 1 `sd` of the best, kept only if it beats the default
   by > 1 `sd`, else the default. YAML `selection` block + `study.user_attrs["selection"]`.
+  Cost: `(n_trials + 1) × noise_seeds` full refit+score cycles, sequential — deliberate (a
+  real per-configuration noise estimate, not the tuning phase's single-seed value), but
+  scales with the panel size on the scoring side (`max_samples` is capped absolute, the
+  validation set it scores is not), so it can take tens of minutes at `--full` scale
+  (2026-09-27: 30 min observed, not a hang). Tracked live (`Bar`) and persistently
+  (`log.info` per trial with cycles done/total, elapsed, ETA — the bar alone never reaches
+  `execution.log`, tqdm writes straight to stderr). Tests: `TestSelectionTracking` in
+  `tests/test_tuning_iforest.py`.
 - **Objective**: labelled → AP on the *known* validation rows (`NaN` = unknown); needs
   ≥ 10 positives and both classes, else it falls back and logs why. Label-free →
   `tail_separation`. `rank_agreement` remains selectable (`objective_metric=`), averaged

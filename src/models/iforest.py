@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import time
 from typing import Callable, Optional, Sequence, Union
 
 import joblib
@@ -461,9 +462,14 @@ def _separation_margin(scores: np.ndarray, contamination: float) -> float:
     """DEPRECATED unsupervised proxy: normalized gap between tail and bulk.
 
     .. deprecated::
-       No longer the default unsupervised objective -- superseded by
-       :func:`_rank_agreement`. Kept importable for reference and for callers
-       that pass it explicitly via ``objective_metric``.
+       No longer the default unsupervised objective -- retired in favor of
+       :func:`_tail_separation` (see that function's docstring for why: this
+       one cut the tail at the trial's own ``contamination``, so shrinking
+       that knob inflated the metric independently of the forest).
+       ``_rank_agreement`` is a separate, still-selectable alternative
+       (``objective_metric="rank_agreement"``), not this function's successor.
+       Kept importable for reference and for callers that pass it explicitly
+       via ``objective_metric``.
 
     Splits the anomaly scores at the ``contamination`` quantile (top fraction
     treated as the putative anomalies) and returns
@@ -1021,20 +1027,75 @@ def tune_iforest(
         )
 
     # -- selection: replicated 1-SE rule + paired margin over paper default ---------- #
+    # This refits and re-scores EVERY completed trial (plus the reference) once per noise
+    # seed -- (len(completed) + 1) * noise_seeds full Isolation Forest fit+score cycles,
+    # sequential (each internally parallel via n_jobs). At `--full` scale (50 trials x 3
+    # seeds = 153 cycles, each scoring a validation set that grows with the panel, unlike
+    # `max_samples` which is capped absolute) this can genuinely take tens of minutes --
+    # deliberate, for a real per-configuration noise estimate rather than the tuning
+    # phase's single-seed value (see this function's docstring, "Selection rule" section).
+    # Without visible progress that silence reads as a hang; the bar below is the fix, not
+    # the algorithm.
     with log_phase("iforest.select (reference + noise)", log):
         selection_seeds = [random_state + 10_000 + i for i in range(noise_seeds)]
-        ref_values = [
-            evaluate(reference_params, seed) for seed in selection_seeds
-        ]
-        trial_evaluations = {}
-        for trial in completed:
-            values = [evaluate(trial.params, seed) for seed in selection_seeds]
-            trial_evaluations[trial.number] = {
-                "mean": float(np.mean(values)),
-                "sd": float(np.std(values, ddof=1)),
-                "se": float(np.std(values, ddof=1) / np.sqrt(len(values))),
-                "values": [float(v) for v in values],
-            }
+        n_cycles = (len(completed) + 1) * len(selection_seeds)
+        # The Bar below only reaches a live terminal/dashboard (tqdm writes straight to
+        # stderr, never through `log`). The `log.info` milestones after it are what let
+        # someone audit progress from `execution.log` after the fact, or on a run whose
+        # console output was not kept -- both matter for a phase that can run unattended
+        # for tens of minutes (see the comment above).
+        sel_progress = Bar(desc="iforest_select[reference+trials]", total=n_cycles, unit="fit")
+        sel_t0 = time.perf_counter()
+        done = 0
+
+        def _elapsed_eta(n_done: int) -> tuple[str, str]:
+            def fmt(s: float) -> str:
+                m, sec = divmod(int(max(s, 0)), 60)
+                h, m = divmod(m, 60)
+                return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+            elapsed = time.perf_counter() - sel_t0
+            per_cycle = elapsed / n_done if n_done else 0.0
+            return fmt(elapsed), fmt(per_cycle * (n_cycles - n_done))
+
+        try:
+            sel_progress.set_postfix_str("reference")
+            ref_values = []
+            for i, seed in enumerate(selection_seeds, start=1):
+                ref_values.append(evaluate(reference_params, seed))
+                done += 1
+                sel_progress.update(1)
+            elapsed_str, eta_str = _elapsed_eta(done)
+            log.info(
+                "Selection: reference evaluated (%d/%d seeds, mean=%.6f) -- "
+                "%d/%d cycles (%d%%), elapsed=%s, ETA=%s",
+                len(ref_values), len(selection_seeds), float(np.mean(ref_values)),
+                done, n_cycles, round(100 * done / n_cycles), elapsed_str, eta_str,
+            )
+            trial_evaluations = {}
+            for t_idx, trial in enumerate(completed, start=1):
+                sel_progress.set_postfix_str(f"trial {trial.number}")
+                values = []
+                for seed in selection_seeds:
+                    values.append(evaluate(trial.params, seed))
+                    done += 1
+                    sel_progress.update(1)
+                trial_evaluations[trial.number] = {
+                    "mean": float(np.mean(values)),
+                    "sd": float(np.std(values, ddof=1)),
+                    "se": float(np.std(values, ddof=1) / np.sqrt(len(values))),
+                    "values": [float(v) for v in values],
+                }
+                elapsed_str, eta_str = _elapsed_eta(done)
+                log.info(
+                    "Selection: trial %d done (%d/%d trials, mean=%.6f, sd=%.6f) -- "
+                    "%d/%d cycles (%d%%), elapsed=%s, ETA=%s",
+                    trial.number, t_idx, len(completed),
+                    trial_evaluations[trial.number]["mean"], trial_evaluations[trial.number]["sd"],
+                    done, n_cycles, round(100 * done / n_cycles), elapsed_str, eta_str,
+                )
+        finally:
+            sel_progress.close()
     reference = {"mean": float(np.mean(ref_values)), "sd": float(np.std(ref_values, ddof=1)),
                   "se": float(np.std(ref_values, ddof=1) / np.sqrt(len(ref_values))),
                   "values": [float(v) for v in ref_values], "params": dict(reference_params)}

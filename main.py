@@ -168,6 +168,9 @@ class PipelineConfig:
     # panels may use a different source-column name; the business default is
     # ``puesto``.  A missing column is rendered explicitly as "No disponible"
     # and never prevents the dashboard from being generated.
+    # NOT a model feature either: it is data for a human to identify the record, not a
+    # modelling signal, so it is folded into `identification_columns` below (automatically,
+    # by `main()`) and excluded from every phase that decides what the model sees.
     analyst_identity_column: str = "puesto"
     # Columns that exist in the raw panel purely to identify/describe a record for a
     # human reader (job title, name, area, an internal reference number, ...) and carry
@@ -485,6 +488,14 @@ def _event_supervision_config(config: "PipelineConfig"):
     )
 
 
+#: Real-data alternate names for the §8 grouping column, tried (in order, exact
+#: case-insensitive match -- never a substring: a segment name is specific enough that
+#: substring matching would risk a false positive) only when `diagnostic_segment_column`
+#: is still at its built-in default and that default is not a column of this panel. An
+#: *explicit* request (file/CLI/code) never falls back here -- it is validated as given.
+_SEGMENT_NAME_FALLBACKS: tuple = ("despuestocolaboradoragrupado",)
+
+
 def _validate_segment_column(config: "PipelineConfig", df, logger) -> None:
     """Fail EARLY (before any fitting) when a segment the user asked for is missing.
 
@@ -493,13 +504,36 @@ def _validate_segment_column(config: "PipelineConfig", df, logger) -> None:
     section at the very end of the run. Now an *explicit* request that cannot be met
     stops the run up front, naming the column asked for, the closest match ignoring
     case/whitespace and every available column; only the built-in default degrades
-    (warning + observability incident).
+    (warning + observability incident) -- but first tries `_SEGMENT_NAME_FALLBACKS`,
+    this project's own real-data name(s) for the same grouping.
     """
     import difflib
 
     name = (config.diagnostic_segment_column or "").strip()
     if not name or name in df.columns:
         return
+    source = config.config_sources.get("diagnostic_segment_column", "default")
+    if source == "default":
+        norm_cols = {str(c).strip().lower(): c for c in df.columns}
+        for candidate in _SEGMENT_NAME_FALLBACKS:
+            hit = norm_cols.get(candidate.strip().lower())
+            if hit:
+                logger.info(
+                    "diagnostic.segment_column default %r is not in this panel; using "
+                    "%r instead (known alternate name for the same §8 grouping).",
+                    name, hit,
+                )
+                observability.check(
+                    name="config.segment_column_present", category="data",
+                    definition="The configured segment column (or a known alternate "
+                               "name for it) exists in the panel.",
+                    expected=f"{name!r} or an alternate name in panel columns",
+                    severity="warning", passed=True,
+                    observed={"requested": name, "resolved": hit, "source": source},
+                    evidence="configs/pipeline.yaml",
+                )
+                config.diagnostic_segment_column = hit
+                return
     norm = {str(c).strip().lower(): c for c in df.columns}
     close = norm.get(name.lower()) or next(
         iter(difflib.get_close_matches(name, [str(c) for c in df.columns], 1, 0.6)), None)
@@ -2642,10 +2676,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "Pass 0 to disable (reports UNAVAILABLE with a stated reason).")
     parser.add_argument("--diagnostic-segment-column", type=str, default=None,
                         help="Column in the raw panel used for the diagnostic chapter's "
-                             "per-segment breakdown (default 'segment'). Point this at any "
-                             "other categorical column your real panel carries, e.g. "
-                             "--diagnostic-segment-column region. Pass an empty string "
-                             "(--diagnostic-segment-column '') to disable the breakdown.")
+                             "per-segment breakdown (default 'segment', falling back to "
+                             "'despuestocolaboradoragrupado' if 'segment' is absent -- only "
+                             "for that built-in default, see _SEGMENT_NAME_FALLBACKS). "
+                             "Point this at any other categorical column your real panel "
+                             "carries, e.g. --diagnostic-segment-column region -- an "
+                             "explicit value here never falls back, it must exist as given. "
+                             "Pass an empty string (--diagnostic-segment-column '') to "
+                             "disable the breakdown.")
     parser.add_argument("--auto-install-suite", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Auto-install the vendored IF-VAE Diagnostic Suite "

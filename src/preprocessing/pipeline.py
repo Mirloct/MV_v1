@@ -414,6 +414,8 @@ class PanelFeatureEngineer(BaseEstimator, TransformerMixin):
     def fit(self, X: pd.DataFrame, y=None):
         if not isinstance(X, pd.DataFrame):
             raise TypeError("PanelFeatureEngineer requires a pandas DataFrame")
+        # `keys`: every column dropped before feature building -- the panel keys plus
+        # `excluded_columns` (target/identification-only columns; see `key_columns`).
         keys = {self.entity_col, self.time_col, *(self.excluded_columns or ())} - {None}
         kept, panel_cols = [], []
         for col in X.columns:
@@ -953,6 +955,11 @@ def build_preprocessing_pipeline(
         ratio_features=ratio_features,
         lag_horizons=lag_horizons,
         fit_window_mask=fit_window_mask,
+        # Columns that must NEVER become a model feature, on top of entity/time (already
+        # handled by PanelFeatureEngineer's own entity_col/time_col): the target, if it
+        # rides inline, and identification-only columns (analyst identity column, e.g.
+        # "puesto"; anything else in configs/pipeline.yaml's data.identification_columns).
+        # See src/data/loader.py::key_columns -- the one place that exclusion set is built.
         excluded_columns=key_columns(schema) - {schema.entity_col, schema.time_col},
     )
 

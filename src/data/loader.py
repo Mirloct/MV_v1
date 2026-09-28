@@ -5,13 +5,21 @@ If the target CSV does not exist yet, it is generated on the fly via
 (time column, entity column, optional target column) is inferred and logged
 so downstream modules can consume the data without hardcoding column names.
 
-Schema inference is name-hint-first with structural fallbacks: a column whose
-name contains "period"/"date"/"time" wins the time slot, else the first
-datetime-dtype column, else an object column that parses as a date for >95%
-of its non-null values; the entity column is the first name containing
-"entity"/"individual"/"id", else the highest-cardinality non-time column that
-is still short of one value per row. Either can come back None, and callers
-must handle that.
+Schema inference is name-hint-first, with structural fallbacks used only when no column
+name matches:
+
+* Time column: a column whose name contains "period"/"date"/"time"/"codmes" wins first.
+  Otherwise, the first already-datetime-dtype column; otherwise, an `object` column that
+  parses as a date for >95% of its non-null values. Both fallbacks require the column to
+  already be `datetime`- or `object`-typed, so an all-digit numeric period column that the
+  name hint misses (e.g. an integer `codmes` like `202401`, read from CSV as `int64`) would
+  not be found by either fallback -- the name hint is the only thing that catches it.
+* Entity column: the first name containing "entity"/"individual"/"id"/"codclavepartycli".
+  Otherwise, the highest-cardinality remaining column whose value count is strictly between
+  1 and the row count: more entities than "everyone shares one value" (a plain constant or
+  near-constant category), fewer than "every row is its own value" (a per-row unique key).
+
+Either can come back `None`, and callers must handle that.
 
 Ground truth is never expected inside the panel itself. For a generated
 panel the loader takes the path the generator actually wrote; for a
@@ -35,8 +43,8 @@ from src.data.synthetic import generate_synthetic_panel
 from src.utils import paths
 from src.utils.logging_config import log_phase, setup_logging
 
-_TIME_NAME_HINTS = ("period", "date", "time")
-_ENTITY_NAME_HINTS = ("entity", "individual", "id")
+_TIME_NAME_HINTS = ("period", "date", "time", "codmes")
+_ENTITY_NAME_HINTS = ("entity", "individual", "id", "codclavepartycli")
 _TARGET_NAME_HINTS = ("target", "ground_truth", "groundtruth")
 
 # Names probed for a sibling ground-truth file when the panel already exists.

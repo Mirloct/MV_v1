@@ -235,6 +235,25 @@ class TestSegmentValidation(unittest.TestCase):
             cfg.config_sources = {"diagnostic_segment_column": "file"}
             main._validate_segment_column(cfg, self.df, self.log)
 
+    def test_default_segment_falls_back_to_a_known_alternate_name(self):
+        # "segment" (the built-in default) is absent, but this project's own real-data
+        # name for the same §8 grouping is present: the default silently resolves to it
+        # instead of degrading the section to NOT_APPLICABLE.
+        df = pd.DataFrame({"entity_id": ["a"], "despuestocolaboradoragrupado": ["x"]})
+        cfg = main.PipelineConfig()                              # segment_column at its default
+        main._validate_segment_column(cfg, df, self.log)
+        self.assertEqual(cfg.diagnostic_segment_column, "despuestocolaboradoragrupado")
+
+    def test_an_explicit_segment_request_never_falls_back(self):
+        # The fallback is only for the untouched built-in default -- an explicit request
+        # (file/CLI/code) that is missing must still stop the run, not silently switch to
+        # a different column the user did not ask for.
+        df = pd.DataFrame({"entity_id": ["a"], "despuestocolaboradoragrupado": ["x"]})
+        cfg = main.PipelineConfig(diagnostic_segment_column="segment")
+        cfg.config_sources = {"diagnostic_segment_column": "file"}
+        with self.assertRaises(ValueError):
+            main._validate_segment_column(cfg, df, self.log)
+
 
 class TestReportShowsTheRealColumnName(unittest.TestCase):
     def test_section_8_names_the_configured_column(self):

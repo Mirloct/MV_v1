@@ -25,10 +25,13 @@ data:
 
 diagnostic:
   # Columna del panel por la que se desglosa la sección 8 "Por segmento".
-  # Sin esta línea se usa el default 'segment' (y si el panel no lo tiene solo avisa).
-  # Al ACTIVARLA (quita el '#') pasa a ser un pedido explícito: debe existir en el panel; si no existe, la corrida se detiene AL
-  # INICIO (antes de ajustar nada) y te dice la columna más parecida y todas las
-  # disponibles. Usa '' para desactivar el desglose.
+  # Sin esta línea se usa el default 'segment'; si el panel no lo tiene, antes de avisar
+  # se intenta 'despuestocolaboradoragrupado' (nombre real de este proyecto para la misma
+  # agrupación); si tampoco existe, solo avisa.
+  # Al ACTIVARLA (quita el '#') pasa a ser un pedido explícito: debe existir en el panel (ya
+  # NO se intenta el nombre alternativo); si no existe, la corrida se detiene AL INICIO
+  # (antes de ajustar nada) y te dice la columna más parecida y todas las disponibles.
+  # Usa '' para desactivar el desglose.
   # segment_column: region
 
   # Vista agregada por entidad en el alcance del capítulo.
@@ -42,6 +45,8 @@ diagnostic:
 
 dashboard:
   # Columna que se muestra bajo el ID de la entidad en el perfil del analista.
+  # No es una feature del modelo: se agrega automáticamente a data.identification_columns
+  # de arriba y queda fuera de toda fase de modelado (ver esa sección).
   identity_column: puesto
 
 # ---------------------------------------------------------------------------

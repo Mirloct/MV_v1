@@ -230,6 +230,9 @@ CONFIG_KEYS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "vae.unknown_category_policy": ("vae_unknown_category_policy", _choice("explicit_token")),
     "vae.missing_category_policy": ("vae_missing_category_policy", _choice("explicit_token")),
     "experiments.backtest_min_fit_periods": ("diagnostic_backtest_min_fit_periods", _at_least(2)),
+    # -- Isolation Forest post-tuning selection (src/models/iforest.py::tune_iforest) -----
+    "iforest.selection_top_k": ("iforest_selection_top_k", _pos_int),
+    "iforest.noise_seeds": ("iforest_noise_seeds", _at_least(2)),
 }
 
 

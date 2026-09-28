@@ -359,6 +359,26 @@ class PipelineConfig:
     # Absolute `max_samples` range and `max_features` range of the IF tuner.
     iforest_max_samples_range: tuple = (1024, 32768)
     iforest_max_features_range: tuple = (0.5, 1.0)
+    # -- Post-tuning selection (src/models/iforest.py::tune_iforest, "Selection rule") --
+    # What it guarantees: the tuner's single-seed "winner" can just be a lucky random
+    # forest draw, not a genuinely better configuration. Before deploying it, this step
+    # re-evaluates the untuned paper default (max_samples=256) AND the top
+    # `iforest_selection_top_k` trials on `iforest_noise_seeds` different seeds each,
+    # and only deploys the tuned pick if (a) it is not statistically distinguishable
+    # from a cheaper near-tied trial (picks the cheaper one instead) and (b) it beats
+    # the untuned default by more than 1 noise standard error -- otherwise the untuned
+    # default ships. Without it, a "win" that is really just noise could get deployed.
+    # Cost: (min(iforest_selection_top_k, iforest_trials) + 1) * iforest_noise_seeds
+    # full Isolation Forest fit+score cycles -- bounded independent of `iforest_trials`,
+    # but each cycle still scores the FULL validation set (unlike `max_samples`, which
+    # is capped absolute), so it is not free on a large real panel. Lower
+    # `iforest_selection_top_k` (down to 1, which keeps the default-margin check but
+    # drops the "prefer the cheaper near-tied trial" refinement) or `iforest_noise_seeds`
+    # (minimum 2) to bound it further; `--iforest-selection-top-k 0` skips the whole
+    # step (deploys the tuner's single-seed winner directly, with none of the guarantees
+    # above -- only do this if the extra wall-clock time genuinely cannot be spared).
+    iforest_selection_top_k: int = 5
+    iforest_noise_seeds: int = 3
     # Model selection against reviewed labels. `auto`: when gate 4.5 authorises labels
     # and the validation months hold >= `tune_min_positive_rows` mature positive rows,
     # the IF tuner maximises average precision against them (the only real signal);
@@ -1203,6 +1223,10 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     max_samples_range=tuple(config.iforest_max_samples_range),
                     max_features_range=tuple(config.iforest_max_features_range),
                     bootstrap=bool(config.iforest_params.get("bootstrap", False)),
+                    # See the comment on `iforest_selection_top_k` above for exactly
+                    # what this step guarantees and what it costs.
+                    selection_top_k=config.iforest_selection_top_k,
+                    noise_seeds=config.iforest_noise_seeds,
                     holdout_frac=config.iforest_holdout_frac,
                     early_stopping_patience=config.iforest_tuning_early_stopping["patience"],
                     early_stopping_min_delta=config.iforest_tuning_early_stopping["min_delta"],
@@ -2806,6 +2830,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         metavar=("LO", "HI"),
                         help="Absolute rows-per-tree range searched by the IF tuner "
                              "(default 1024 32768, capped to the rows available).")
+    parser.add_argument("--iforest-selection-top-k", type=int, default=None, metavar="K",
+                        help="How many of the completed IF tuning trials get replicated "
+                             "with --iforest-noise-seeds seeds each before deploying one "
+                             "(default 5; bounds the post-tuning selection phase's cost "
+                             "independent of --iforest-trials). 1 keeps the "
+                             "margin-vs-untuned-default check but drops the "
+                             "prefer-the-cheaper-near-tied-trial refinement. 0 skips the "
+                             "whole phase and deploys the tuner's single-seed winner "
+                             "directly -- no noise-floor or margin check at all. See "
+                             "PipelineConfig.iforest_selection_top_k for what each level "
+                             "guarantees; lower it on a large real panel where the "
+                             "wall-clock cost of this phase matters.")
+    parser.add_argument("--iforest-noise-seeds", type=int, default=None, metavar="N",
+                        help="Seeds used to replicate the IF tuning selection (default 3, "
+                             "minimum 2). Multiplies the selection phase's cost together "
+                             "with --iforest-selection-top-k.")
     parser.add_argument("--event-challengers", choices=("off", "auto", "force"), default="auto",
                         help="Supervised challengers: off; auto = only if gate 4.5 authorises "
                              "them (default); force = exploratory run despite a red gate.")
@@ -2891,6 +2931,8 @@ _FILE_MANAGED_DESTS = {
     "diagnostic_experiment_vae_fit_budget": "diagnostic_experiment_vae_fit_budget",
     "diagnostic_experiment_families": "diagnostic_experiment_families",
     "vae_categorical_representation": "vae_categorical_representation",
+    "iforest_selection_top_k": "iforest_selection_top_k",
+    "iforest_noise_seeds": "iforest_noise_seeds",
 }
 
 
@@ -3000,6 +3042,14 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         if not 2 <= lo <= hi:
             raise SystemExit("--iforest-max-samples-range needs 2 <= LO <= HI.")
         config.iforest_max_samples_range = (int(lo), int(hi))
+    if args.iforest_selection_top_k is not None:
+        if args.iforest_selection_top_k < 0:
+            raise SystemExit("--iforest-selection-top-k must be >= 0 (0 = skip the phase).")
+        config.iforest_selection_top_k = args.iforest_selection_top_k
+    if args.iforest_noise_seeds is not None:
+        if args.iforest_noise_seeds < 2:
+            raise SystemExit("--iforest-noise-seeds must be >= 2 (needs a standard deviation).")
+        config.iforest_noise_seeds = args.iforest_noise_seeds
     if args.tune_min_positive_rows < 1:
         raise SystemExit("--tune-min-positive-rows must be at least 1.")
     if args.labels_dir is not None:

@@ -85,6 +85,27 @@ experiments:
   backtest_min_fit_periods: 4    # periodos mínimos de ajuste
 
 # ---------------------------------------------------------------------------
+# Isolation Forest: selección posterior al tuneo (src/models/iforest.py::tune_iforest,
+# sección "Selection rule" de su docstring). Qué asegura: el trial "ganador" del tuneo
+# puede ser solo un bosque con suerte, no una configuración genuinamente mejor -- antes
+# de desplegarlo se reevalúa con varias semillas de ruido junto con el default sin
+# tunear (ψ=256), y solo se despliega si (a) no es indistinguible de un trial más barato
+# casi empatado (se prefiere el más barato) y (b) supera al default por más de 1 error
+# estándar de ruido -- si no, se despliega el default sin tunear. Sin esto, una "mejora"
+# que en realidad es solo ruido podría desplegarse igual.
+# Costo: (min(selection_top_k, iforest_trials) + 1) * noise_seeds reajustes+repuntajes
+# completos del Isolation Forest -- acotado sin importar cuántos trials tenga el tuneo,
+# pero cada uno puntúa el conjunto de validación COMPLETO (a diferencia de max_samples,
+# que tiene un tope absoluto), así que en un panel real grande (p. ej. decenas de miles
+# de filas por mes) sí toma tiempo real. Bajar selection_top_k (hasta 1, que mantiene el
+# chequeo contra el default pero pierde la preferencia por el más barato entre empatados)
+# o noise_seeds (mínimo 2) para acotarlo más.
+iforest:
+  # selection_top_k: 5   # 0 = saltar esta fase entera y desplegar el ganador del tuneo
+  # sin ninguna de las garantías de arriba (nunca el default silencioso)
+  # noise_seeds: 3        # mínimo 2
+
+# ---------------------------------------------------------------------------
 # VAE: cómo ve las variables categóricas (src/models/mixed_vae.py).
 # El Isolation Forest NO cambia (sigue sin ver las categóricas).
 # ---------------------------------------------------------------------------

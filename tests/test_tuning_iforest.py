@@ -150,6 +150,65 @@ class TestSelectionTracking(TunerBase):
             self.assertAlmostEqual(logged_means[int(trial_number)], ev["mean"], places=6)
 
 
+class TestSelectionTopKBound(TunerBase):
+    """The selection phase only replicates the top `selection_top_k` completed trials
+    (by single-seed value) with noise seeds, not the whole tuning budget -- bounds its
+    cost independent of `n_trials` (a bigger real panel typically wants more trials)."""
+
+    def test_only_the_top_k_trials_are_replicated_not_the_whole_budget(self):
+        X, _, valid = _panel()
+        study, _ = self.run_tuner(X, valid, name="topk", n_trials=6, noise_seeds=2,
+                                  selection_top_k=2)
+        selection = study.user_attrs["selection"]
+        self.assertEqual(selection["n_trials_completed"], 6)
+        self.assertEqual(selection["n_trials_replicated"], 2)
+        self.assertEqual(len(selection["trial_evaluations"]), 2)
+
+    def test_the_single_seed_winner_is_always_among_the_replicated_candidates(self):
+        X, _, valid = _panel()
+        study, _ = self.run_tuner(X, valid, name="topk-winner", n_trials=6, noise_seeds=2,
+                                  selection_top_k=1)
+        completed = [t for t in study.trials if t.state.name == "COMPLETE"]
+        sign = 1.0 if study.direction.name == "MAXIMIZE" else -1.0
+        single_seed_winner = max(completed, key=lambda t: sign * t.value)
+        selection = study.user_attrs["selection"]
+        self.assertEqual(len(selection["trial_evaluations"]), 1)
+        self.assertIn(str(single_seed_winner.number), selection["trial_evaluations"])
+
+    def test_a_top_k_at_or_above_the_trial_count_replicates_everything(self):
+        X, _, valid = _panel()
+        study, _ = self.run_tuner(X, valid, name="topk-all", n_trials=3, noise_seeds=2,
+                                  selection_top_k=100)
+        self.assertEqual(study.user_attrs["selection"]["n_trials_replicated"], 3)
+
+
+class TestSelectionSkipped(TunerBase):
+    """`selection_top_k=0` deploys the tuner's own single-seed winner directly, with NONE
+    of the noise-floor/margin guarantees -- an explicit trade of rigor for wall-clock
+    time, never the silent default (the dataclass default is 5, not 0)."""
+
+    def test_zero_top_k_skips_replication_and_deploys_the_raw_winner(self):
+        X, _, valid = _panel()
+        with self.assertLogs("modelo", level="WARNING") as captured:
+            study, payload = self.run_tuner(X, valid, name="skip", n_trials=4, selection_top_k=0)
+        selection = study.user_attrs["selection"]
+        self.assertEqual(selection["deployed"], "tuned_unreplicated")
+        self.assertEqual(selection["n_trials_replicated"], 0)
+        self.assertIsNone(selection["reference"])
+        self.assertEqual(payload["status"], "final")
+        self.assertTrue(any("selection_top_k=0" in m for m in captured.output))
+        # No "Selection:" progress line at all -- the noise-replication phase never ran.
+        self.assertFalse(any("Selection:" in m for m in captured.output))
+
+    def test_the_deployed_trial_is_the_single_seed_winner(self):
+        X, _, valid = _panel()
+        study, payload = self.run_tuner(X, valid, name="skip-winner", n_trials=4, selection_top_k=0)
+        completed = [t for t in study.trials if t.state.name == "COMPLETE"]
+        sign = 1.0 if study.direction.name == "MAXIMIZE" else -1.0
+        expected = max(completed, key=lambda t: sign * t.value)
+        self.assertEqual(payload["best_params"]["max_samples"], expected.params["max_samples"])
+
+
 class TestResume(TunerBase):
     def test_n_trials_is_a_total_budget(self):
         X, _, valid = _panel()

@@ -182,19 +182,37 @@ even a `--quick` run covers the axis that matters.
 
 ### Selection rule (why "argmax" is not enough)
 
-The objective is noisy and the argmax of noisy values is biased upward. After the
-trials the tuner re-evaluates the **paper default** (ψ=256, all features) with
-`noise_seeds` (3) different seeds; their spread is the noise floor `sd`. Then:
+The objective is noisy and the argmax of noisy values is biased upward: the trial that
+"wins" the tuning search may just have gotten a lucky forest draw, not a genuinely
+better configuration. After the trials, the tuner re-evaluates the **paper default**
+(ψ=256, all features) with `noise_seeds` (default 3) different seeds — their spread is
+the noise floor `sd` — and, alongside it, only the **top `selection_top_k`** (default 5)
+completed trials by their single-seed tuning value (2026-09-27; a trial ranked below that
+cutoff has no realistic chance of being the true best once noise is accounted for, so
+replicating it spends the same cost for no new decision). Then, among the replicated
+trials:
 
 1. **1-standard-error rule** — among trials within one `sd` of the best value,
    take the *cheapest* (smallest ψ × `max_features`).
 2. **Margin rule** — keep that pick only if it beats the reference mean by more
    than `margin_sd` (1.0) `sd`; otherwise the reference default is deployed.
 
+Cost: `(min(selection_top_k, n_trials) + 1) * noise_seeds` full fit+score cycles —
+bounded independent of `n_trials`, so a bigger tuning budget (typically wanted for a
+bigger real panel) no longer multiplies this phase's wall-clock cost along with it. Each
+cycle still scores the *full* validation set (unlike ψ, which has an absolute cap), so on
+a large real panel this phase still takes real time — lower `selection_top_k` (down to 1,
+which keeps rule 2 but drops rule 1) or `noise_seeds` (minimum 2) to bound it further, or
+`selection_top_k=0` to skip the whole phase and deploy the tuning search's raw single-seed
+winner directly (no noise floor, no margin check — an explicit trade, never the default).
+`--iforest-selection-top-k` / `--iforest-noise-seeds`, or `iforest.selection_top_k` /
+`iforest.noise_seeds` in `configs/pipeline.yaml`.
+
 The decision (`selection` block: best/picked trial, noise, reference values,
-`deployed: tuned | reference_default`, `beats_reference`) is written to the YAML
-and to `study.user_attrs["selection"]`. A tuned configuration that cannot be
-told apart from the default is not a finding.
+`deployed: tuned | reference_default | tuned_unreplicated`, `beats_reference`,
+`n_trials_completed`, `n_trials_replicated`) is written to the YAML and to
+`study.user_attrs["selection"]`. A tuned configuration that cannot be told apart from
+the default is not a finding.
 
 ### Held-out objective
 

@@ -1145,16 +1145,27 @@ synthetic data** — the direction of the ψ effect must be re-checked on real d
   Untuned fallback: `PipelineConfig.iforest_params` = 300 trees, ψ=4096 (clipped to the
   rows), all features. `contamination` stays only as the deployed `predict()` operating
   point (`contamination_tuned: false` in the YAML).
-- **Selection**: the paper default (ψ=256) is re-evaluated with 3 seeds → noise `sd`;
-  deployed = cheapest trial within 1 `sd` of the best, kept only if it beats the default
-  by > 1 `sd`, else the default. YAML `selection` block + `study.user_attrs["selection"]`.
-  Cost: `(n_trials + 1) × noise_seeds` full refit+score cycles, sequential — deliberate (a
-  real per-configuration noise estimate, not the tuning phase's single-seed value), but
-  scales with the panel size on the scoring side (`max_samples` is capped absolute, the
-  validation set it scores is not), so it can take tens of minutes at `--full` scale
-  (2026-09-27: 30 min observed, not a hang). Tracked live (`Bar`) and persistently
-  (`log.info` per trial with cycles done/total, elapsed, ETA — the bar alone never reaches
-  `execution.log`, tqdm writes straight to stderr). Tests: `TestSelectionTracking` in
+- **Selection**: the paper default (ψ=256) is re-evaluated with `noise_seeds` (default 3)
+  seeds → noise `sd`; deployed = cheapest replicated trial within 1 `sd` of the best
+  replicated mean, kept only if it beats the default by > 1 `sd`, else the default. YAML
+  `selection` block + `study.user_attrs["selection"]`. Cost:
+  `(min(selection_top_k, n_trials) + 1) × noise_seeds` full refit+score cycles, sequential
+  — deliberate (a real per-configuration noise estimate, not the tuning phase's
+  single-seed value), and bounded independent of `n_trials` since **2026-09-28**: only the
+  top `selection_top_k` (default 5) completed trials by single-seed value get replicated,
+  not the whole budget (a trial ranked below that cutoff cannot be the true best once
+  noise is accounted for). Still scales with the panel size on the scoring side
+  (`max_samples` is capped absolute, the validation set it scores is not), so it can take
+  real time on a large real panel (2026-09-27: 30 min observed pre-bound at `--full` scale,
+  not a hang; a 2026-09-28 report of ~360k real rows/18 months is what prompted the bound).
+  `iforest_selection_top_k`/`iforest_noise_seeds` (`PipelineConfig`, `--iforest-selection-
+  top-k`/`--iforest-noise-seeds`, or `iforest.selection_top_k`/`iforest.noise_seeds` in
+  `configs/pipeline.yaml`); `selection_top_k=0` skips the whole phase and deploys the
+  tuner's raw single-seed winner (`deployed: "tuned_unreplicated"`), with none of the
+  guarantees above — an explicit trade, never the default. Tracked live (`Bar`) and
+  persistently (`log.info` per trial with cycles done/total, elapsed, ETA — the bar alone
+  never reaches `execution.log`, tqdm writes straight to stderr). Tests:
+  `TestSelectionTracking`, `TestSelectionTopKBound`, `TestSelectionSkipped` in
   `tests/test_tuning_iforest.py`.
 - **Objective**: labelled → AP on the *known* validation rows (`NaN` = unknown); needs
   ≥ 10 positives and both classes, else it falls back and logs why. Label-free →

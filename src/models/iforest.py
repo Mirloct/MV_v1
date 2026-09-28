@@ -93,6 +93,11 @@ _REFERENCE_MAX_SAMPLES = 256           # Liu et al. (2008) paper default = the r
 _PSI_ANCHORS = (1024, 4096, 16384, 32768)
 _DEFAULT_TAIL_FRACS = (0.005, 0.01, 0.02)
 _DEFAULT_NOISE_SEEDS = 3
+# How many trials get the noise-seed replication treatment in the selection phase below,
+# not the whole completed budget: bounds that phase's cost at (top_k + 1) * noise_seeds
+# regardless of n_trials, so a bigger tuning budget (a larger real panel typically wants
+# more trials) does not multiply the selection phase's wall-clock cost along with it.
+_DEFAULT_SELECTION_TOP_K = 5
 _MIN_EVAL_POSITIVES = 10
 
 # Label-free objective names accepted by `objective_metric`. Passing one of
@@ -656,6 +661,7 @@ def tune_iforest(
     bootstrap: bool = False,
     tail_fracs: Sequence[float] = _DEFAULT_TAIL_FRACS,
     noise_seeds: int = _DEFAULT_NOISE_SEEDS,
+    selection_top_k: int = _DEFAULT_SELECTION_TOP_K,
     margin_sd: float = 1.0,
     one_se_rule: bool = True,
     min_eval_positives: int = _MIN_EVAL_POSITIVES,
@@ -692,15 +698,39 @@ def tune_iforest(
     that matters. A model-based sampler (TPE) has nothing to model with 15 noisy
     trials on an almost one-dimensional response.
 
-    Selection rule (not just "argmax")
-    ----------------------------------
-    The objective is noisy, and the argmax of noisy values is biased upward. After
-    the trials, the **paper default** (``max_samples=256``, all features) is
-    re-evaluated with ``noise_seeds`` different seeds. Every trial is re-evaluated
-    on those same seeds; the deployed configuration is the *cheapest* replicated
-    mean within one standard error of the best replicated mean. It is kept only
-    when its paired improvement over the reference exceeds ``margin_sd`` standard
-    errors; otherwise the reference default is kept. The decision is written to YAML.
+    Selection rule (not just "argmax") -- what it guarantees, and its cost
+    ------------------------------------------------------------------------
+    The objective is noisy (one train/eval split, one random forest draw per trial),
+    and the argmax of several noisy values is biased upward: the trial that "wins"
+    single-seed tuning may just have gotten a lucky draw, not a genuinely better
+    configuration. Deploying it anyway risks handing production a hyperparameter
+    choice that is not actually better than the untuned default -- only noisier.
+    This step is what stands between the single-seed winner and the deployed model:
+
+    1. The **paper default** (``max_samples=256``, all features) is re-evaluated with
+       ``noise_seeds`` different seeds, to measure how much the objective moves for a
+       FIXED configuration -- the noise floor.
+    2. Only the **top ``selection_top_k`` trials** by their single-seed tuning value
+       (always including whichever trial "won" that noisy round) are re-evaluated on
+       those same seeds -- not the whole completed budget. A trial ranked far below
+       the apparent best has no realistic chance of being the true best once noise is
+       accounted for, so replicating it would spend the same cost for no new decision.
+       This bounds the phase at ``(min(selection_top_k, n_trials) + 1) * noise_seeds``
+       full refit+score cycles, REGARDLESS of ``n_trials`` -- a larger tuning budget
+       (typically wanted for a larger real panel) no longer multiplies this phase's
+       wall-clock cost along with it.
+    3. Among those replicated trials, the deployed configuration is the *cheapest*
+       whose replicated mean is within one standard error of the best replicated
+       mean (so a trial statistically indistinguishable from the best is not paid
+       for if a cheaper one is just as good).
+    4. It is kept only when its paired improvement over the reference default exceeds
+       ``margin_sd`` standard errors; otherwise the untuned reference is kept -- a
+       "win" that cannot be told apart from noise is not deployed as one.
+
+    The decision (including which trials were replicated and why) is written to YAML
+    and ``study.user_attrs['selection']``. Even at ``selection_top_k=1`` this keeps
+    guarantee 1 and 4 (the margin-vs-default check) -- only guarantee 3 (prefer the
+    cheapest among several near-tied candidates) needs more than one trial replicated.
 
     Objective (held-out, always out-of-sample)
     ------------------------------------------
@@ -762,6 +792,10 @@ def tune_iforest(
         bootstrap: Fixed bootstrap flag.
         tail_fracs: Top-k fractions averaged by the legacy ``rank_agreement``.
         noise_seeds: Seeds used to measure the reference's noise floor (>= 2).
+        selection_top_k: How many of the completed trials (by single-seed value) get
+            replicated with ``noise_seeds`` for selection (>= 1; clipped to
+            ``n_trials`` when smaller). Bounds the selection phase's cost independent
+            of ``n_trials`` -- see "Selection rule" above.
         margin_sd: Noise sds by which the pick must beat the reference.
         one_se_rule: Apply the cheapest-within-noise rule.
         min_eval_positives: Minimum held-out positives for the labelled objective.
@@ -1027,96 +1061,135 @@ def tune_iforest(
         )
 
     # -- selection: replicated 1-SE rule + paired margin over paper default ---------- #
-    # This refits and re-scores EVERY completed trial (plus the reference) once per noise
-    # seed -- (len(completed) + 1) * noise_seeds full Isolation Forest fit+score cycles,
-    # sequential (each internally parallel via n_jobs). At `--full` scale (50 trials x 3
-    # seeds = 153 cycles, each scoring a validation set that grows with the panel, unlike
-    # `max_samples` which is capped absolute) this can genuinely take tens of minutes --
-    # deliberate, for a real per-configuration noise estimate rather than the tuning
-    # phase's single-seed value (see this function's docstring, "Selection rule" section).
-    # Without visible progress that silence reads as a hang; the bar below is the fix, not
-    # the algorithm.
-    with log_phase("iforest.select (reference + noise)", log):
-        selection_seeds = [random_state + 10_000 + i for i in range(noise_seeds)]
-        n_cycles = (len(completed) + 1) * len(selection_seeds)
-        # The Bar below only reaches a live terminal/dashboard (tqdm writes straight to
-        # stderr, never through `log`). The `log.info` milestones after it are what let
-        # someone audit progress from `execution.log` after the fact, or on a run whose
-        # console output was not kept -- both matter for a phase that can run unattended
-        # for tens of minutes (see the comment above).
-        sel_progress = Bar(desc="iforest_select[reference+trials]", total=n_cycles, unit="fit")
-        sel_t0 = time.perf_counter()
-        done = 0
+    # Refits and re-scores only the TOP `selection_top_k` completed trials (by their
+    # single-seed tuning value) plus the reference, once per noise seed -- see this
+    # function's docstring, "Selection rule" section, for exactly what this guarantees
+    # and why replicating every completed trial is not needed for it. Cost:
+    # (min(selection_top_k, len(completed)) + 1) * noise_seeds full Isolation Forest
+    # fit+score cycles, sequential (each internally parallel via n_jobs) -- bounded
+    # regardless of n_trials, but each cycle still scores a validation set that grows
+    # with the panel (unlike `max_samples`, which is capped absolute), so this can still
+    # take real time on a large real panel. Without visible progress that reads as a
+    # hang; the bar below is the fix for that, not the algorithm.
+    #
+    # `selection_top_k <= 0` skips this whole phase: the tuner's own single-seed winner
+    # is deployed directly, with NONE of the guarantees above (no noise floor, no
+    # cheaper-within-noise preference, no margin-vs-default check) -- an explicit
+    # trade of rigor for wall-clock time, never the silent default.
+    if int(selection_top_k) <= 0:
+        best_trial = max(completed, key=lambda t: sign * t.value)
+        final_params = dict(best_trial.params)
+        final_value, final_trial = float(best_trial.value), best_trial.number
+        selection = {
+            "best_trial": best_trial.number, "best_value": final_value,
+            "picked_trial": best_trial.number, "picked_value": final_value,
+            "margin_sd": float(margin_sd), "one_se_rule": bool(one_se_rule),
+            "beats_reference": None, "params": final_params,
+            "deployed": "tuned_unreplicated", "trial_evaluations": {}, "reference": None,
+            "n_trials_completed": len(completed), "n_trials_replicated": 0,
+        }
+        log.warning(
+            "iforest_selection_top_k=0: deploying the tuner's single-seed winner (trial "
+            "%d, value=%.6f) directly -- skipped the noise-floor and margin-vs-default "
+            "checks entirely (see tune_iforest's 'Selection rule' docstring).",
+            best_trial.number, final_value,
+        )
+    else:
+        with log_phase("iforest.select (reference + noise)", log):
+            selection_seeds = [random_state + 10_000 + i for i in range(noise_seeds)]
+            top_k = max(1, min(int(selection_top_k), len(completed)))
+            # Always includes the apparent single-seed winner (rank 0 of this sort);
+            # dropping a lower-ranked trial cannot change the pick, only save the cost
+            # of confirming what its rank already made unlikely.
+            candidates = sorted(completed, key=lambda t: sign * t.value, reverse=True)[:top_k]
+            if top_k < len(completed):
+                log.info(
+                    "Selection: replicating the top %d of %d completed trials "
+                    "(single-seed value); the rest cannot outrank them once noise is "
+                    "accounted for.", top_k, len(completed),
+                )
+            n_cycles = (len(candidates) + 1) * len(selection_seeds)
+            # The Bar below only reaches a live terminal/dashboard (tqdm writes straight
+            # to stderr, never through `log`). The `log.info` milestones after it are
+            # what let someone audit progress from `execution.log` after the fact, or on
+            # a run whose console output was not kept -- both matter for a phase that
+            # can run unattended for real time (see the comment above).
+            sel_progress = Bar(desc="iforest_select[reference+trials]", total=n_cycles, unit="fit")
+            sel_t0 = time.perf_counter()
+            done = 0
 
-        def _elapsed_eta(n_done: int) -> tuple[str, str]:
-            def fmt(s: float) -> str:
-                m, sec = divmod(int(max(s, 0)), 60)
-                h, m = divmod(m, 60)
-                return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+            def _elapsed_eta(n_done: int) -> tuple[str, str]:
+                def fmt(s: float) -> str:
+                    m, sec = divmod(int(max(s, 0)), 60)
+                    h, m = divmod(m, 60)
+                    return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
 
-            elapsed = time.perf_counter() - sel_t0
-            per_cycle = elapsed / n_done if n_done else 0.0
-            return fmt(elapsed), fmt(per_cycle * (n_cycles - n_done))
+                elapsed = time.perf_counter() - sel_t0
+                per_cycle = elapsed / n_done if n_done else 0.0
+                return fmt(elapsed), fmt(per_cycle * (n_cycles - n_done))
 
-        try:
-            sel_progress.set_postfix_str("reference")
-            ref_values = []
-            for i, seed in enumerate(selection_seeds, start=1):
-                ref_values.append(evaluate(reference_params, seed))
-                done += 1
-                sel_progress.update(1)
-            elapsed_str, eta_str = _elapsed_eta(done)
-            log.info(
-                "Selection: reference evaluated (%d/%d seeds, mean=%.6f) -- "
-                "%d/%d cycles (%d%%), elapsed=%s, ETA=%s",
-                len(ref_values), len(selection_seeds), float(np.mean(ref_values)),
-                done, n_cycles, round(100 * done / n_cycles), elapsed_str, eta_str,
-            )
-            trial_evaluations = {}
-            for t_idx, trial in enumerate(completed, start=1):
-                sel_progress.set_postfix_str(f"trial {trial.number}")
-                values = []
+            try:
+                sel_progress.set_postfix_str("reference")
+                ref_values = []
                 for seed in selection_seeds:
-                    values.append(evaluate(trial.params, seed))
+                    ref_values.append(evaluate(reference_params, seed))
                     done += 1
                     sel_progress.update(1)
-                trial_evaluations[trial.number] = {
-                    "mean": float(np.mean(values)),
-                    "sd": float(np.std(values, ddof=1)),
-                    "se": float(np.std(values, ddof=1) / np.sqrt(len(values))),
-                    "values": [float(v) for v in values],
-                }
                 elapsed_str, eta_str = _elapsed_eta(done)
                 log.info(
-                    "Selection: trial %d done (%d/%d trials, mean=%.6f, sd=%.6f) -- "
+                    "Selection: reference evaluated (%d/%d seeds, mean=%.6f) -- "
                     "%d/%d cycles (%d%%), elapsed=%s, ETA=%s",
-                    trial.number, t_idx, len(completed),
-                    trial_evaluations[trial.number]["mean"], trial_evaluations[trial.number]["sd"],
+                    len(ref_values), len(selection_seeds), float(np.mean(ref_values)),
                     done, n_cycles, round(100 * done / n_cycles), elapsed_str, eta_str,
                 )
-        finally:
-            sel_progress.close()
-    reference = {"mean": float(np.mean(ref_values)), "sd": float(np.std(ref_values, ddof=1)),
-                  "se": float(np.std(ref_values, ddof=1) / np.sqrt(len(ref_values))),
-                  "values": [float(v) for v in ref_values], "params": dict(reference_params)}
-    selection = _select_trial(
-        completed, reference, sign=sign, one_se_rule=one_se_rule, margin_sd=margin_sd,
-        cost_of=lambda p: float(p["max_samples"]) * float(p["max_features"]),
-        evaluations=trial_evaluations,
-    )
-    selection["trial_evaluations"] = trial_evaluations
-    selection["reference"] = reference
-    if selection["beats_reference"]:
-        final_params, final_value, final_trial = selection["params"], selection["picked_value"], selection["picked_trial"]
-        selection["deployed"] = "tuned"
-    else:
-        final_params, final_value, final_trial = reference_params, reference["mean"], -1
-        selection["deployed"] = "reference_default"
-        log.warning(
-            "The selected trial (replicated mean %.4f) does not beat the paper default "
-            "(%.4f) by more than %.1f paired standard error(s); keeping %s.",
-            selection["picked_value"], reference["mean"], margin_sd, reference_params,
+                trial_evaluations = {}
+                for t_idx, trial in enumerate(candidates, start=1):
+                    sel_progress.set_postfix_str(f"trial {trial.number}")
+                    values = []
+                    for seed in selection_seeds:
+                        values.append(evaluate(trial.params, seed))
+                        done += 1
+                        sel_progress.update(1)
+                    trial_evaluations[trial.number] = {
+                        "mean": float(np.mean(values)),
+                        "sd": float(np.std(values, ddof=1)),
+                        "se": float(np.std(values, ddof=1) / np.sqrt(len(values))),
+                        "values": [float(v) for v in values],
+                    }
+                    elapsed_str, eta_str = _elapsed_eta(done)
+                    log.info(
+                        "Selection: trial %d done (%d/%d replicated, mean=%.6f, "
+                        "sd=%.6f) -- %d/%d cycles (%d%%), elapsed=%s, ETA=%s",
+                        trial.number, t_idx, len(candidates),
+                        trial_evaluations[trial.number]["mean"],
+                        trial_evaluations[trial.number]["sd"],
+                        done, n_cycles, round(100 * done / n_cycles), elapsed_str, eta_str,
+                    )
+            finally:
+                sel_progress.close()
+        reference = {"mean": float(np.mean(ref_values)), "sd": float(np.std(ref_values, ddof=1)),
+                      "se": float(np.std(ref_values, ddof=1) / np.sqrt(len(ref_values))),
+                      "values": [float(v) for v in ref_values], "params": dict(reference_params)}
+        selection = _select_trial(
+            candidates, reference, sign=sign, one_se_rule=one_se_rule, margin_sd=margin_sd,
+            cost_of=lambda p: float(p["max_samples"]) * float(p["max_features"]),
+            evaluations=trial_evaluations,
         )
+        selection["trial_evaluations"] = trial_evaluations
+        selection["reference"] = reference
+        selection["n_trials_completed"] = len(completed)
+        selection["n_trials_replicated"] = len(candidates)
+        if selection["beats_reference"]:
+            final_params, final_value, final_trial = selection["params"], selection["picked_value"], selection["picked_trial"]
+            selection["deployed"] = "tuned"
+        else:
+            final_params, final_value, final_trial = reference_params, reference["mean"], -1
+            selection["deployed"] = "reference_default"
+            log.warning(
+                "The selected trial (replicated mean %.4f) does not beat the paper default "
+                "(%.4f) by more than %.1f paired standard error(s); keeping %s.",
+                selection["picked_value"], reference["mean"], margin_sd, reference_params,
+            )
     try:
         study.set_user_attr("selection", _json_safe(selection))
     except Exception:  # noqa: BLE001 - metadata only

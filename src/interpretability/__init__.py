@@ -11,6 +11,7 @@ from src.interpretability.iforest_explain import (
     explain_rows_iforest,
     path_length_analysis,
     shap_summary_iforest,
+    split_count_analysis,
 )
 from src.interpretability.vae_explain import (
     explain_rows_vae,
@@ -21,6 +22,7 @@ from src.interpretability.vae_explain import (
 __all__ = [
     "shap_summary_iforest",
     "path_length_analysis",
+    "split_count_analysis",
     "explain_rows_iforest",
     "latent_space_plot",
     "reconstruction_error_by_feature",

@@ -41,7 +41,8 @@ from src.utils import observability, paths
 from src.utils.logging_config import log_phase, setup_logging
 from src.utils.progress import track
 
-__all__ = ["shap_summary_iforest", "path_length_analysis", "explain_rows_iforest"]
+__all__ = ["shap_summary_iforest", "path_length_analysis", "explain_rows_iforest",
+           "split_count_analysis"]
 
 _DEFAULT_FIG_DIR = paths.FIGURES_DIR
 
@@ -799,6 +800,190 @@ def path_length_analysis(
         )
         _checkpoint("path_length_completed", n_rows=int(scores.size))
         return summary
+
+
+def split_count_analysis(
+    detector,
+    X,
+    row_mask=None,
+    feature_names=None,
+    out_dir: str = _DEFAULT_FIG_DIR,
+    filename: str = "iforest_split_counts.png",
+    top_n: int = 10,
+    max_samples: int = 3000,
+    random_state: int = 42,
+) -> dict:
+    """How many splits ("cortes") a feature typically needs before it helps isolate a
+    flagged row, and which features isolate flagged rows with the fewest of them.
+
+    Own analysis, not a published metric (unlike :func:`path_length_analysis`'s exact
+    closed-form score). For each row in ``X[row_mask]`` and each tree in the forest, this
+    walks the row's decision path (``tree.decision_path``, translated from the tree's own
+    -- randomly subsampled, when ``max_features < 1`` -- feature subset back to the
+    original feature indices via ``estimators_features_``) and, for every feature that
+    appears at least once along that path before the row reaches its leaf:
+
+    * ``avg_cuts_when_used`` -- the mean TOTAL path length (any feature, not just this
+      one) of the isolations this feature participated in. Low = when this feature is
+      involved, the row tends to isolate fast, cleanly, with few splits overall: a
+      **clear signal**. High = this feature mostly shows up in long, many-split
+      isolations: a **weak/noisy signal** that needed a lot of help.
+    * ``usage_count`` / ``usage_rate`` -- how often the feature participates in an
+      isolation at all (out of ``n_rows * n_trees`` row-tree isolations), independent of
+      how short those isolations were.
+
+    A feature that never appears on any flagged row's path (never used to isolate an
+    outlier here) is left out of the ranking entirely -- it is not "noisy", it is simply
+    not part of how this run's outliers get isolated.
+
+    Args:
+        detector: A fitted :class:`IsolationForestDetector` (``.model_`` is the
+            underlying scikit-learn ``IsolationForest``).
+        X: Preprocessed feature matrix, row-aligned with ``row_mask`` if given.
+        row_mask: Boolean mask selecting the rows to analyse -- normally the FLAGGED
+            (above-threshold) rows, so this answers "how are THIS run's outliers being
+            isolated", not "how is every row isolated". ``None`` uses every row in ``X``.
+        feature_names: Optional names aligned to ``X``'s columns.
+        top_n: How many features to keep in ``top_clear`` / ``top_noisy``.
+        max_samples: Row cap on the (already-filtered) analysed set, for cost -- this
+            walks ``n_rows * n_trees`` decision paths.
+        random_state: Seed for the row subsample.
+
+    Returns:
+        ``{"n_rows_analyzed", "n_trees", "mean_path_length", "per_feature":
+        {name: {"avg_cuts_when_used", "usage_count", "usage_rate", "total_splits"}},
+        "top_clear": [(name, avg_cuts), ...], "top_noisy": [(name, avg_cuts), ...],
+        "figure_path"}``. ``per_feature``/``top_clear``/``top_noisy`` only include
+        features actually used at least once; if none were (or there are no rows to
+        analyse), those come back empty and no figure is written.
+    """
+    log = setup_logging()
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, filename)
+
+    Xd = _densify(X)
+    names = _resolve_feature_names(feature_names, Xd.shape[1])
+    if row_mask is not None:
+        row_mask = np.asarray(row_mask, dtype=bool).ravel()
+        if row_mask.shape[0] != Xd.shape[0]:
+            raise ValueError(
+                f"row_mask has {row_mask.shape[0]} entries but X has {Xd.shape[0]} rows."
+            )
+        Xd = Xd[row_mask]
+    Xd, _ = _subsample(Xd, max_samples, random_state)
+    n_rows, n_features = Xd.shape
+    _checkpoint("split_count_started", n_rows=int(n_rows), n_features=int(n_features))
+
+    empty = {
+        "n_rows_analyzed": int(n_rows), "n_trees": 0, "mean_path_length": float("nan"),
+        "per_feature": {}, "top_clear": [], "top_noisy": [], "figure_path": None,
+    }
+    model = getattr(detector, "model_", None)
+    if model is None:
+        raise RuntimeError("split_count_analysis requires a fitted detector (.model_ is None).")
+    if n_rows == 0:
+        log.warning("split_count_analysis: no rows to analyse (empty row_mask); skipping.")
+        _checkpoint("split_count_completed", n_rows_analyzed=0)
+        return empty
+
+    with log_phase("interpretability.split_count_iforest", log):
+        n_trees = len(model.estimators_)
+        total_splits = np.zeros(n_features, dtype=np.float64)
+        usage_count = np.zeros(n_features, dtype=np.int64)
+        sum_pathlen_when_used = np.zeros(n_features, dtype=np.float64)
+        row_path_len_sum = np.zeros(n_rows, dtype=np.float64)
+
+        for est, feat_idx in track(
+            zip(model.estimators_, model.estimators_features_),
+            desc="split_count_analysis", unit="tree", total=n_trees,
+        ):
+            feat_idx = np.asarray(feat_idx)
+            node_indicator = est.decision_path(Xd[:, feat_idx])
+            tree_feat = est.tree_.feature
+            coo = node_indicator.tocoo()
+            is_split = tree_feat[coo.col] != -2               # exclude the leaf itself
+            rows = coo.row[is_split]
+            global_feats = feat_idx[tree_feat[coo.col[is_split]]]
+
+            path_len_this_tree = np.bincount(rows, minlength=n_rows).astype(np.float64)
+            row_path_len_sum += path_len_this_tree
+
+            np.add.at(total_splits, global_feats, 1)          # every split occurrence
+            if rows.size:
+                # One (row, feature) pair per tree, however many times that feature was
+                # used along that single row's path -- "did this feature help isolate
+                # this row in this tree", not "how many times in this one tree".
+                pairs = np.unique(np.stack([rows, global_feats], axis=1), axis=0)
+                np.add.at(usage_count, pairs[:, 1], 1)
+                np.add.at(sum_pathlen_when_used, pairs[:, 1], path_len_this_tree[pairs[:, 0]])
+
+        mean_path_length = float(np.mean(row_path_len_sum) / n_trees) if n_trees else float("nan")
+        used = np.flatnonzero(usage_count > 0)
+        if used.size == 0:
+            log.warning("split_count_analysis: no feature appeared on any analysed "
+                       "row's isolation path; skipping the chart.")
+            _checkpoint("split_count_completed", n_rows_analyzed=int(n_rows), n_features_used=0)
+            return {**empty, "n_trees": n_trees, "mean_path_length": mean_path_length}
+
+        avg_cuts = sum_pathlen_when_used[used] / usage_count[used]
+        denom = float(n_rows * n_trees)
+        per_feature = {
+            names[j]: {
+                "avg_cuts_when_used": float(avg_cuts[i]),
+                "usage_count": int(usage_count[j]),
+                "usage_rate": float(usage_count[j] / denom) if denom else 0.0,
+                "total_splits": int(total_splits[j]),
+            }
+            for i, j in enumerate(used)
+        }
+        order_clear = used[np.argsort(avg_cuts)]               # fewest cuts first
+        order_noisy = used[np.argsort(-avg_cuts)]               # most cuts first
+        top_clear = [(names[j], per_feature[names[j]]["avg_cuts_when_used"])
+                    for j in order_clear[:top_n]]
+        top_noisy = [(names[j], per_feature[names[j]]["avg_cuts_when_used"])
+                    for j in order_noisy[:top_n]]
+
+        _save_split_count_plot(top_clear, top_noisy, out_path,
+                               n_rows=n_rows, n_trees=n_trees)
+        log.info(
+            "Split-count analysis saved to %s (%d row(s) x %d tree(s), %d feature(s) "
+            "used, mean path length %.2f); clearest=%s, noisiest=%s.",
+            out_path, n_rows, n_trees, used.size, mean_path_length,
+            top_clear[0][0] if top_clear else "n/a", top_noisy[0][0] if top_noisy else "n/a",
+        )
+        _checkpoint("split_count_completed", n_rows_analyzed=int(n_rows),
+                   n_features_used=int(used.size))
+        return {
+            "n_rows_analyzed": int(n_rows), "n_trees": int(n_trees),
+            "mean_path_length": mean_path_length, "per_feature": per_feature,
+            "top_clear": top_clear, "top_noisy": top_noisy,
+            "figure_path": os.path.abspath(out_path),
+        }
+
+
+def _save_split_count_plot(top_clear, top_noisy, out_path, *, n_rows, n_trees):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, max(3.0, 0.4 * max(len(top_clear), len(top_noisy)) + 1.5)))
+    for ax, items, title, color in (
+        (axes[0], top_clear, "Menos cortes para aislar (señal más clara)", "#1baf7a"),
+        (axes[1], top_noisy, "Más cortes para aislar (señal más débil)", "#e34948"),
+    ):
+        names_ = [n for n, _ in items][::-1]
+        vals = [v for _, v in items][::-1]
+        y_pos = np.arange(len(names_))
+        ax.barh(y_pos, vals, color=color)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(names_)
+        ax.set_xlabel("cortes promedio hasta aislar (cuando la variable participa)")
+        ax.set_title(title)
+    fig.suptitle(f"Isolation Forest -- cortes hasta aislar filas marcadas "
+                f"({n_rows} filas x {n_trees} árboles)")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=120)
+    plt.close(fig)
 
 
 def explain_rows_iforest(

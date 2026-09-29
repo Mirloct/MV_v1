@@ -501,15 +501,31 @@ def _row_filter_rows(context: dict):
     ]
 
 
+def _row_filter_summary_sentence(context: dict) -> Optional[str]:
+    """One explicit sentence with the count AND the percentage -- requested so the
+    removal is stated plainly, not only readable from a table cell."""
+    f = context.get("row_filter")
+    if not f or not f.get("n_rows_before"):
+        return None
+    pct = 100 * f["n_rows_dropped"] / f["n_rows_before"]
+    return (
+        f"Se eliminaron {f['n_rows_dropped']:,} de {f['n_rows_before']:,} observaciones "
+        f"({pct:.1f}%) por tener al menos el {round(100 * f['cutoff'])}% de sus "
+        f"{f['n_columns_checked']} columnas numéricas explícitamente en 0 -- antes de "
+        "cualquier ajuste o split, así que no participan en ninguna fase del flujo."
+    )
+
+
 def _row_filter_section_md(context: dict) -> str:
     """Records loaded vs. dropped by the pre-split exact-zero filter."""
     rows = _row_filter_rows(context)
     if rows is None:
         return ""
+    sentence = _row_filter_summary_sentence(context)
     return "\n".join([
         "## Filtro de filas en cero exacto\n",
-        "_Las filas excluidas se eliminan antes del split y no participan "
-        "en ninguna parte del flujo. Los faltantes no cuentan como cero._\n",
+        f"{sentence}\n" if sentence else "",
+        "_Los faltantes no cuentan como cero._\n",
         _md_table(["Concepto", "Valor"], rows),
     ])
 
@@ -1604,12 +1620,13 @@ def _row_filter_section_html(context: dict) -> str:
     rows = _row_filter_rows(context)
     if rows is None:
         return ""
+    sentence = _row_filter_summary_sentence(context)
+    lead = f"<p class='lead'>{html.escape(sentence)}</p>" if sentence else ""
     return (
         "<h2 id='row-filter'>Filtro de filas en cero exacto</h2>"
         "<div class='card'>"
-        "<p class='subtitle'>Las filas excluidas se eliminan antes del split "
-        "y no participan en ninguna parte del flujo. Los faltantes no cuentan "
-        "como cero.</p>"
+        f"{lead}"
+        "<p class='subtitle'>Los faltantes no cuentan como cero.</p>"
         f"{_html_table(['Concepto', 'Valor'], rows)}"
         "</div>"
     )

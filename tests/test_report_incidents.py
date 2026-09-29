@@ -42,3 +42,17 @@ class RowFilterSectionTests(unittest.TestCase):
     def test_absent_stats_render_nothing(self):
         from src.reporting.report import _row_filter_section_md
         self.assertEqual(_row_filter_section_md({}), "")
+
+    def test_an_explicit_sentence_states_the_count_and_percentage(self):
+        # Explicit user request: state plainly how many observations (with >= 90% of
+        # their variables exactly 0) were removed, not only leave it in a table cell.
+        from src.reporting.report import _row_filter_section_html, _row_filter_section_md
+
+        ctx = {"row_filter": self.STATS}
+        for out in (_row_filter_section_md(ctx), _row_filter_section_html(ctx)):
+            self.assertIn("Se eliminaron", out)
+            self.assertIn("60", out)
+            self.assertIn("6,000", out)
+            self.assertIn("1.0%", out)          # 60 / 6000 = 1.0%
+            self.assertIn("90%", out)
+            self.assertIn("13", out)            # n_columns_checked

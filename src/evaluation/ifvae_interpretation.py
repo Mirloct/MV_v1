@@ -81,6 +81,37 @@ METHODOLOGY_NOTES = {
         "menos de 30 observaciones tienen varianza alta; se señalan como "
         "tal, no se suprimen."
     ),
+    "jaccard-causes-and-reference-band": (
+        "Por qué el Jaccard multisemilla no es 1.0 (causas, no defectos de esta corrida "
+        "en particular): (1) el propio mecanismo de ambos detectores es estocástico por "
+        "diseño -- el Isolation Forest muestrea filas (`max_samples`) y, si "
+        "`max_features` < 1, columnas por árbol; esa aleatoriedad es justamente lo que da "
+        "diversidad al ensamble y le permite exponer casos de enmascaramiento/ahogamiento "
+        "('masking'/'swamping') que un solo árbol determinista no vería -- es un costo "
+        "aceptado del mecanismo, no un error; el VAE añade además la inicialización "
+        "aleatoria de pesos y el descenso estocástico por minilotes. (2) El conjunto de "
+        "alerta es un top-K finito: una observación justo en el borde del corte, con un "
+        "puntaje casi empatado con la K-ésima, puede entrar o salir del conjunto por una "
+        "diferencia de puntaje mínima -- un cambio de una sola observación en un top-10 ya "
+        "mueve el Jaccard en varios puntos porcentuales, así que K pequeño amplifica el "
+        "efecto de cada empate. (3) Es una corrida no supervisada: no hay una verdad base "
+        "contra la cual promediar el ruido, así que lo único medible es el acuerdo entre "
+        "corridas, nunca cuál corrida (si alguna) tiene razón. Umbral de referencia (no un "
+        "veredicto automático de esta corrida -- ver 'stability-no-universal-cutoff'): la "
+        "convención general de lectura del índice de Jaccard es >0.7 alta similitud, "
+        "0.4-0.7 moderada/sustancial pero incompleta, <0.4 baja; en estabilidad de "
+        "selección de features, un valor de 0.5 se usa como criterio de aceptación en la "
+        "literatura del área, y Kuncheva (2007, 'A Stability Index for Feature Selection') "
+        "propone corregir el propio Jaccard por azar para comparar tamaños de subconjunto "
+        "distintos. Para un tablero de revisión de casos como el de este proyecto -- donde "
+        "el costo de que la lista cambie de forma importante entre corridas es que un "
+        "analista revise una cola distinta cada vez -- una lectura razonable es: < 0.4 "
+        "amerita investigar (no necesariamente K/semilla; puede ser una señal genuinamente "
+        "débil, ver 'Concordancia y desacuerdo'), 0.4-0.6 es el rango esperable para un "
+        "ensamble estocástico de top-K pequeño (documentar el margen de asiento, no tratar "
+        "cada cambio de semilla como un hallazgo), >= 0.6 es una estabilidad cómoda dado "
+        "que 0.5 ya se reporta como 'aceptable' en la literatura de selección de features."
+    ),
 }
 
 #: Below this population size, a rank/set statistic is flagged as high-variance.
@@ -243,8 +274,36 @@ def _interpret_latent(latent: dict) -> dict:
     return _toolkit_section("latent", "Diagnóstico del espacio latente", fragments, [])
 
 
+#: Reference reading bands for the multi-seed Jaccard mean -- NOT a pass/fail verdict on
+#: this run (see METHODOLOGY_NOTES["jaccard-causes-and-reference-band"] for the literature
+#: behind each cut and why it stays a reading aid, not a hard gate like
+#: DEGENERATE_JACCARD).
+JACCARD_REFERENCE_BANDS = (
+    (0.4, "por debajo de la banda de referencia (0.4): amerita revisar -- puede ser el "
+         "ruido esperable de K/semilla pequeños, o una señal genuinamente débil (ver "
+         "'Concordancia y desacuerdo')"),
+    (0.6, "dentro del rango esperable para un ensamble estocástico de top-K pequeño"),
+    (float("inf"), "en la banda cómoda (>= 0.6 de referencia, dado que 0.5 ya se reporta "
+                   "como umbral aceptable en la literatura de estabilidad de selección "
+                   "de features)"),
+)
+
+
+def _jaccard_band(jaccard: float) -> str:
+    for limit, text in JACCARD_REFERENCE_BANDS:
+        if jaccard < limit:
+            return text
+    return JACCARD_REFERENCE_BANDS[-1][1]
+
+
 def _interpret_stability(stability: dict) -> dict:
     fragments, validity = [], []
+    any_executed = any(stability[k]["status"] == STATUS_EXECUTED for k in ("iforest", "vae"))
+    if any_executed:
+        fragments.append(_fragment(
+            "Por qué el Jaccard multisemilla no es 1.0, y qué umbral de referencia usar: "
+            "ver la nota metodológica de esta afirmación.",
+            basis="jaccard-causes-and-reference-band"))
     for key, label in (("iforest", "Isolation Forest"), ("vae", "VAE")):
         block = stability[key]
         if block["status"] != STATUS_EXECUTED:
@@ -259,8 +318,8 @@ def _interpret_stability(stability: dict) -> dict:
                     "semilla aleatoria.")
         fragments.append(_fragment(
             f"{label}: Jaccard medio {jaccard:.3f} entre {block['refits']} "
-            f"reajustes (top-{block['top_k']}).{note}",
-            basis="stability-no-universal-cutoff",
+            f"reajustes (top-{block['top_k']}) -- {_jaccard_band(jaccard)}.{note}",
+            basis="jaccard-causes-and-reference-band",
             severity="attention" if jaccard < DEGENERATE_JACCARD else "info"))
     if (stability["iforest"]["status"] == STATUS_EXECUTED
             and stability["vae"]["status"] == STATUS_EXECUTED):

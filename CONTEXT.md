@@ -717,6 +717,46 @@ P95 checkpoint, stacking, or the VAE deliverable.
     annotation. A second panel (`go.Heatmap`, `make_subplots`) shows the
     same population as a 4x4 quartile confusion matrix (count + % per
     cell) — the table view for a fast read.
+- **Isolation Forest split-count analysis (2026-09-28)**:
+  `src.interpretability.split_count_analysis` — own analysis, not a published
+  metric. For each row of the OOT alert queue (the calibrated-threshold
+  flagged rows, not every row) and each tree, walks the real decision path
+  (`tree.decision_path`, translating the tree's own feature subset back to
+  the original index via `estimators_features_` when `max_features < 1`) and
+  measures, per feature, the mean TOTAL path length of the isolations it
+  participated in. Low = the variable is usually involved in fast, clean
+  isolations (clear signal); high = it only shows up in long, many-split
+  isolations (weak/noisy signal). Two report charts: top-10 fewest cuts, top
+  10 most cuts (requested so "the model only carries clear signals"). Wired
+  in `main.py` Phase 10 alongside SHAP/path-length, via
+  `main._flagged_rows_for_split_count`: normally the calibrated-threshold OOT
+  alert set, but a strict business threshold (this project's default POT
+  calibration targets a 0.1% false-alarm rate) can legitimately flag zero
+  rows in a small OOT window — confirmed live on a `--quick` run — so a
+  below-`min_rows` (default 10) flagged set falls back to the top OOT rows by
+  score (default 50) instead of leaving the chart empty; logged either way.
+  Tests: `tests/test_iforest_split_counts.py` (13 tests total: the analysis
+  itself + the fallback helper, mutation-checked).
+- **Per-seed stability, visual (2026-09-28)**: `_seeded_refit_stability`
+  (`src/evaluation/ifvae_diagnostic.py`) now exposes the full seed×seed
+  pairwise-Jaccard matrix and each seed's mean against the rest (the
+  aggregate mean/min already shown were always computed over this same
+  matrix; it was just discarded after averaging). A fact table per seed-pair
+  in the diagnostic contract §7, and a Plotly heatmap per detector
+  (`chart_static["stability_seeds"]`) in the report, so a reader can see
+  *which* seed disagrees, not only the aggregate number. The interpretation
+  chapter also gained `METHODOLOGY_NOTES["jaccard-causes-and-reference-band"]`
+  (why the Jaccard mean is not 1.0 — stochastic subsampling by design, a
+  finite top-K amplifying boundary ties, no ground truth to average noise
+  against — plus a literature-grounded reading band: <0.4 investigate,
+  0.4–0.6 expected for a small stochastic top-K ensemble, ≥0.6 comfortable;
+  Kuncheva 2007, arXiv:2402.11404 already cited by this project). This is
+  additive, not a replacement — the existing "no universal cutoff" stance
+  (`stability-no-universal-cutoff`) and the degenerate-Jaccard hard flag
+  (`DEGENERATE_JACCARD`) are unchanged.
+- **Row-filter section, explicit (2026-09-28)**: the exact-zero-row filter's
+  report section now leads with one prose sentence stating the count AND the
+  percentage removed, not only a table cell.
 - Charts and the glossary are conditioned on `config.supervised`: a run that
   did not compute a supervised metric does not show it, and does not list it
   in the indicator glossary either.

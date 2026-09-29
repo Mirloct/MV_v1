@@ -642,6 +642,37 @@ def _add_fig(figs: list, title: str, path: Optional[str]) -> None:
         figs.append({"title": title, "path": path})
 
 
+def _flagged_rows_for_split_count(
+    oot_mask: np.ndarray, scores: np.ndarray, threshold: float,
+    *, min_rows: int = 10, fallback_n: int = 50, logger=None,
+) -> np.ndarray:
+    """Which OOT rows count as "flagged" for `split_count_analysis`: normally the
+    calibrated-threshold alert set, so the chart answers "how are THIS run's real
+    alerts isolated" -- but a strict business threshold (this project's default POT
+    calibration targets a 0.1% false-alarm rate) can legitimately flag zero rows in a
+    small OOT window, which is real, not a bug, and would leave nothing to analyse.
+    Falls back to the top OOT rows by score instead of skipping the chart outright;
+    logged, never silent about which one happened.
+    """
+    flagged_mask = (
+        oot_mask & (scores >= threshold) if np.isfinite(threshold) else np.zeros_like(oot_mask)
+    )
+    if int(flagged_mask.sum()) >= min_rows or not oot_mask.any():
+        return flagged_mask
+    oot_idx = np.flatnonzero(oot_mask)
+    n_fallback = min(oot_idx.size, max(min_rows, fallback_n))
+    top_idx = oot_idx[np.argsort(-scores[oot_idx])[:n_fallback]]
+    if logger is not None:
+        logger.info(
+            "split_count_analysis: only %d OOT row(s) above the calibrated threshold; "
+            "using the top %d OOT row(s) by score instead so the per-feature reading has "
+            "enough rows to be meaningful.", int(flagged_mask.sum()), n_fallback,
+        )
+    result = np.zeros_like(oot_mask)
+    result[top_idx] = True
+    return result
+
+
 def _model_metrics(supervised, labels, scores, oot_mask, X, label_types=None) -> dict:
     """Assemble supervised (OOT + overall) and unsupervised metrics into one dict.
 
@@ -2212,6 +2243,19 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     diagnostic_suite_result["quadrants"],
                     diagnostic_suite_result["report_dir"],
                 )
+                # Per-seed breakdown (§7's aggregate mean/min are computed over exactly
+                # this matrix -- see `_seeded_refit_stability`) for the report's seed x
+                # seed Jaccard heatmap: visual stability, not only one summary number.
+                _stability = diagnostic_suite_result.get("stability") or {}
+                chart_static["stability_seeds"] = {
+                    key: {
+                        "seeds": block.get("seeds"),
+                        "pairwise_jaccard": block.get("pairwise_jaccard"),
+                        "per_seed_mean_jaccard": block.get("per_seed_mean_jaccard"),
+                    }
+                    for key, block in _stability.items()
+                    if block.get("status") == "EXECUTED" and block.get("pairwise_jaccard")
+                }
             except Exception as exc:  # noqa: BLE001 - never block the report above
                 logger.warning(
                     "IF-VAE diagnostic suite failed (%s); the report chapter for it "
@@ -2297,6 +2341,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 from src.interpretability import (
                     path_length_analysis,
                     shap_summary_iforest,
+                    split_count_analysis,
                 )
 
                 try:
@@ -2322,6 +2367,29 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     }
                 except Exception as exc:
                     logger.warning("path_length_analysis failed (%s); continuing.", exc)
+                try:
+                    # Which features the OOT ALERT QUEUE actually gets isolated by, and
+                    # with how much help: the calibrated threshold on the OOT window is
+                    # this run's own definition of "flagged", so that -- not every row --
+                    # is what "cuántos cortes para detectar outliers" means here.
+                    threshold_if = model_specs["iforest"]["threshold"]["threshold"]
+                    flagged_mask = _flagged_rows_for_split_count(
+                        oot_mask, scores, threshold_if, logger=logger,
+                    )
+                    split_result = split_count_analysis(
+                        detector, X_model, row_mask=flagged_mask, feature_names=names_model,
+                    )
+                    _add_fig(figures, "iForest split-count analysis",
+                            split_result.get("figure_path"))
+                    chart_static["iforest_splits"] = {
+                        "top_clear": split_result.get("top_clear"),
+                        "top_noisy": split_result.get("top_noisy"),
+                        "n_rows_analyzed": split_result.get("n_rows_analyzed"),
+                        "n_trees": split_result.get("n_trees"),
+                        "mean_path_length": split_result.get("mean_path_length"),
+                    }
+                except Exception as exc:
+                    logger.warning("split_count_analysis failed (%s); continuing.", exc)
             else:
                 from src.interpretability import (
                     latent_space_plot,

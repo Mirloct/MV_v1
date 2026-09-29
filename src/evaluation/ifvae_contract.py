@@ -684,6 +684,20 @@ def _section_stability(stability: dict) -> dict:
                                            source=block["source"])),
             ("Artefacto de origen", field(block.get("artifact"), source=block["source"])),
         ], title=title))
+        seeds = block.get("seeds") or []
+        pairwise = block.get("pairwise_jaccard") or []
+        pair_rows = [
+            [seeds[i], seeds[j], _fmt_float(pairwise[i][j])]
+            for i in range(len(seeds)) for j in range(i + 1, len(seeds))
+        ]
+        blocks.append(_table_block(
+            ["Semilla A", "Semilla B", "Jaccard"], pair_rows,
+            title=f"{title} -- Jaccard por par de semillas",
+            caption="Cada fila es UNA comparación entre dos reajustes independientes "
+                    "(misma configuración, otra semilla). El promedio y el mínimo de "
+                    "arriba se calculan sobre exactamente estas filas.",
+            empty_text="Menos de dos semillas -- no hay pares que comparar.",
+        ))
     blocks.append(_note_block(
         "«Reajuste» significa reentrenar el detector con una semilla distinta "
         "sobre el mismo conjunto de entrenamiento, no revalidar contra verdad "

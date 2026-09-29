@@ -547,6 +547,54 @@ class InterpretationStructureTests(unittest.TestCase):
         self.assertFalse(agreement_check["valid"])
 
 
+class JaccardCausesAndThresholdTests(unittest.TestCase):
+    """Explicit user request: explain why Jaccard isn't 1.0 and give a literature-grounded
+    reference band, in the report -- `src.evaluation.ifvae_interpretation._interpret_stability`."""
+
+    def _block(self, jaccard, refits=3, top_k=10):
+        return {"status": STATUS_EXECUTED, "mean_jaccard": jaccard, "refits": refits, "top_k": top_k}
+
+    def test_a_causes_explanation_fragment_is_present_once_when_anything_ran(self):
+        from src.evaluation.ifvae_interpretation import _interpret_stability
+
+        section = _interpret_stability({
+            "iforest": self._block(0.5),
+            "vae": {"status": STATUS_NOT_REQUESTED, "reason": "x"},
+        })
+        causes = [f for f in section["reading"] if f["basis"] == "jaccard-causes-and-reference-band"]
+        self.assertGreaterEqual(len(causes), 1)
+        # Exactly one general "why not 1.0" fragment, not one per detector.
+        general = [f for f in causes if "no es 1.0" in f["text"]]
+        self.assertEqual(len(general), 1)
+
+    def test_no_causes_fragment_when_neither_detector_ran(self):
+        from src.evaluation.ifvae_interpretation import _interpret_stability
+
+        section = _interpret_stability({
+            "iforest": {"status": STATUS_NOT_REQUESTED, "reason": "x"},
+            "vae": {"status": STATUS_NOT_REQUESTED, "reason": "x"},
+        })
+        self.assertFalse(any("no es 1.0" in f["text"] for f in section["reading"]))
+
+    def test_jaccard_band_classification_matches_the_documented_cuts(self):
+        from src.evaluation.ifvae_interpretation import _jaccard_band
+
+        self.assertIn("amerita revisar", _jaccard_band(0.1))
+        self.assertIn("amerita revisar", _jaccard_band(0.39))
+        self.assertIn("esperable", _jaccard_band(0.4))
+        self.assertIn("esperable", _jaccard_band(0.59))
+        self.assertIn("cómoda", _jaccard_band(0.6))
+        self.assertIn("cómoda", _jaccard_band(0.95))
+
+    def test_the_band_reading_is_embedded_in_the_per_detector_fragment(self):
+        from src.evaluation.ifvae_interpretation import _interpret_stability
+
+        section = _interpret_stability({"iforest": self._block(0.75), "vae": self._block(0.2)})
+        by_text = " ".join(f["text"] for f in section["reading"])
+        self.assertIn("banda cómoda", by_text)
+        self.assertIn("amerita revisar", by_text)
+
+
 class DecisionFlowTests(unittest.TestCase):
     """The decision flow must branch on THIS run's real numbers, not a
     scenario baked into the code."""
@@ -751,6 +799,63 @@ class RealStabilityTests(unittest.TestCase):
             x_fit, x_score, seeds_a, k=10,
         )
         self.assertEqual(result["runs"], 3)
+
+    def test_pairwise_jaccard_is_a_symmetric_seed_by_seed_matrix(self):
+        """Per-seed comparison, requested so stability can be read seed-by-seed, not
+        only as one aggregate mean/min/std."""
+        from src.evaluation.ifvae_diagnostic import _seeded_refit_stability
+        from src.models import IsolationForestDetector
+
+        if_detector, x_fit, x_score, _ = self._fit_tiny_detectors()
+        seeds = tuple(1 + 1000 * (i + 1) for i in range(4))
+        result = _seeded_refit_stability(
+            IsolationForestDetector, if_detector,
+            ("n_estimators", "max_samples", "max_features", "contamination", "bootstrap"),
+            x_fit, x_score, seeds, k=10,
+        )
+        matrix = result["pairwise_jaccard"]
+        self.assertEqual(len(matrix), len(seeds))
+        for i, row in enumerate(matrix):
+            self.assertEqual(len(row), len(seeds))
+            self.assertEqual(row[i], 1.0)                       # a seed agrees with itself
+            for j, v in enumerate(row):
+                self.assertEqual(v, matrix[j][i])                # symmetric
+                self.assertGreaterEqual(v, 0.0)
+                self.assertLessEqual(v, 1.0)
+        per_seed = result["per_seed_mean_jaccard"]
+        self.assertEqual(len(per_seed), len(seeds))
+        for i, m in enumerate(per_seed):
+            others = [matrix[i][j] for j in range(len(seeds)) if j != i]
+            self.assertAlmostEqual(m, sum(others) / len(others), places=9)
+        # The mean/min already reported are exactly the off-diagonal entries of this
+        # same matrix -- not a separately (and possibly inconsistently) computed value.
+        off_diag = [matrix[i][j] for i in range(len(seeds)) for j in range(i + 1, len(seeds))]
+        self.assertAlmostEqual(result["mean_jaccard"], sum(off_diag) / len(off_diag), places=9)
+        self.assertAlmostEqual(result["min_jaccard"], min(off_diag), places=9)
+
+    def test_the_contract_exposes_one_table_row_per_seed_pair(self):
+        if_detector, x_if_fit, x_if_score, vae_detector = self._fit_tiny_detectors()
+        reference, scored, features = synthetic_frames(n_reference=60, n_scored=40)
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = diagnose_frames(
+                reference, scored, features, tmp,
+                stability={
+                    "if_detector": if_detector, "x_if_fit": x_if_fit,
+                    "x_if_score": x_if_score, "vae_detector": vae_detector,
+                    "x_vae_fit": x_if_fit, "x_vae_score": x_if_score,
+                    "valid_mask": None, "stability_refits": 3, "base_seed": 42,
+                },
+            )
+        stability = section_by_id(payload["contract"], "stability")
+        table_titles = {b["title"]: b for b in stability["blocks"] if b["kind"] == "table"}
+        for label in ("Isolation Forest -- Jaccard por par de semillas",
+                     "VAE -- Jaccard por par de semillas"):
+            table = table_titles[label]
+            self.assertEqual(table["columns"], ["Semilla A", "Semilla B", "Jaccard"])
+            self.assertEqual(len(table["rows"]), 3)              # C(3, 2) pairs for 3 seeds
+            for row in table["rows"]:
+                self.assertEqual(len(row), 3)
+                self.assertNotEqual(row[0], row[1])               # never a seed paired with itself
 
 
 class ExperimentMatrixTests(unittest.TestCase):

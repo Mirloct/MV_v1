@@ -227,6 +227,28 @@ FIGURE_NOTES: dict[str, str] = {
         "reales, confirmando que el puntaje significa lo que el algoritmo "
         "afirma."
     ),
+    "iforest_split_counts": (
+        "Cuántas divisiones ('cortes') aleatorias, en promedio, hace falta atravesar "
+        "antes de que cada variable ayude a aislar una fila de la cola de alerta OOT -- "
+        "no todas las filas del panel, solo las marcadas por el umbral calibrado de esta "
+        "corrida. 'Menos cortes' = cuando la variable participa, el aislamiento suele ser "
+        "rápido y limpio: señal clara. 'Más cortes' = la variable solo aparece en "
+        "aislamientos largos, que necesitaron mucha ayuda de otras variables: señal débil "
+        "o ruidosa. Análisis propio de este proyecto (no una métrica publicada), construido "
+        "recorriendo el camino de decisión real de cada árbol del bosque -- ver "
+        "`src.interpretability.split_count_analysis`. Una variable ausente de ambos "
+        "gráficos nunca participó en el aislamiento de ninguna fila marcada en esta corrida."
+    ),
+    "stability_seeds": (
+        "Jaccard del conjunto de alerta (top-K) entre cada PAR de reajustes con otra "
+        "semilla, misma configuración -- el detalle detrás del Jaccard medio/mínimo de "
+        "la sección 'Estabilidad'. Celdas oscuras (cercanas a 1) son pares de semillas "
+        "que coinciden mucho en a quién marcan; celdas claras son pares que discrepan. "
+        "Un solo cuadro claro en una fila/columna señala una semilla específica que se "
+        "aparta de las demás, no un problema generalizado -- algo que el número agregado "
+        "no puede distinguir. La diagonal es siempre 1 (una semilla comparada consigo "
+        "misma)."
+    ),
     "vae_recon_by_feature": (
         "Qué columnas (o, con embeddings, qué variables originales) reconstruye peor el VAE. Dado que el "
         "puntaje de anomalía ES el error de reconstrucción, los features en "
@@ -1151,6 +1173,78 @@ def _build_static_replacements(chart_data, go, np, emit, log) -> list:
         except Exception as exc:
             if log:
                 log.warning("Path-length chart skipped (%s).", exc)
+
+    # -- 6b-bis. iForest split-count analysis: clearest vs noisiest features - #
+    splits = static.get("iforest_splits")
+    if isinstance(splits, dict) and (splits.get("top_clear") or splits.get("top_noisy")):
+        for key, fig_id, title, color in (
+            ("top_clear", "fig-splits-clear",
+             "Variables con menos cortes para aislar (señal más clara)", "#1baf7a"),
+            ("top_noisy", "fig-splits-noisy",
+             "Variables con más cortes para aislar (señal más débil)", "#e34948"),
+        ):
+            items = splits.get(key) or []
+            if not items:
+                continue
+            try:
+                items_plot = list(items)[::-1]     # highest at the top of a horizontal bar
+                names_ = [str(n) for n, _ in items_plot]
+                vals = [float(v) for _, v in items_plot]
+                fig = go.Figure(go.Bar(
+                    x=vals, y=names_, orientation="h", showlegend=False,
+                    marker=dict(color=color, cornerradius=_BAR_CORNER_RADIUS),
+                    hovertemplate="%{y}: %{x:.2f} cortes<extra></extra>",
+                ))
+                fig.update_layout(_base_layout(
+                    go, title, height=max(280, 30 * len(names_) + 120), bargap=0.35,
+                    margin=dict(l=180, r=24, t=52, b=48),
+                ))
+                fig.update_xaxes(title_text="cortes promedio hasta aislar (cuando participa)")
+                _emit(fig, fig_id, title, FIGURE_NOTES["iforest_split_counts"], ["iforest"])
+                produced.append(fig_id)
+            except Exception as exc:
+                if log:
+                    log.warning("Chart %s skipped (%s).", fig_id, exc)
+
+    # -- 6b-ter. Stability: pairwise Jaccard between seeds, one heatmap per detector - #
+    stability_seeds = static.get("stability_seeds")
+    if isinstance(stability_seeds, dict):
+        # A single hue, light->dark (the palette's sequential blue ramp): magnitude, not
+        # identity, so this is never the categorical iForest/VAE series colour.
+        blue_scale = [
+            [0.00, "#cde2fb"], [0.25, "#6da7ec"], [0.50, "#2a78d6"],
+            [0.75, "#184f95"], [1.00, "#0d366b"],
+        ]
+        for key, fig_id, model_label in (
+            ("iforest", "fig-stability-seeds-if", "Isolation Forest"),
+            ("vae", "fig-stability-seeds-vae", "VAE"),
+        ):
+            block = stability_seeds.get(key)
+            if not isinstance(block, dict) or not block.get("pairwise_jaccard"):
+                continue
+            try:
+                seeds = [str(s) for s in (block.get("seeds") or [])]
+                matrix = block["pairwise_jaccard"]
+                title = f"Estabilidad entre semillas (Jaccard) — {model_label}"
+                fig = go.Figure(go.Heatmap(
+                    z=matrix, x=seeds, y=seeds, zmin=0, zmax=1, colorscale=blue_scale,
+                    colorbar=dict(title=dict(text="Jaccard", side="right"),
+                                  thickness=12, len=0.75, outlinewidth=0),
+                    hovertemplate="semilla %{x} vs %{y}: %{z:.3f}<extra></extra>",
+                    texttemplate="%{z:.2f}", textfont=dict(size=10),
+                ))
+                fig.update_layout(_base_layout(
+                    go, title, height=max(320, 46 * len(seeds) + 140),
+                    margin=dict(l=70, r=90, t=52, b=60),
+                ))
+                fig.update_xaxes(title_text="semilla", type="category")
+                fig.update_yaxes(title_text="semilla", type="category",
+                                 autorange="reversed")
+                _emit(fig, fig_id, title, FIGURE_NOTES["stability_seeds"], ["__neutral__"])
+                produced.append(fig_id)
+            except Exception as exc:
+                if log:
+                    log.warning("Chart %s skipped (%s).", fig_id, exc)
 
     # -- 6c. 2D embeddings and the VAE latent space ------------------------- #
     for key, fig_id, title, note, model in (

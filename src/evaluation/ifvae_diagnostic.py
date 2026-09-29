@@ -677,15 +677,30 @@ def _seeded_refit_stability(
         set(np.argsort(-row, kind="stable")[:effective_k].tolist())
         for row in score_runs
     ]
+    n_runs = len(top_sets)
     pairwise = []
-    for left_idx in range(len(top_sets)):
-        for right_idx in range(left_idx + 1, len(top_sets)):
+    # Symmetric seed x seed matrix (1.0 on the diagonal): the per-PAIR breakdown behind
+    # `mean_jaccard`/`min_jaccard`, so a report can show which specific seed(s) drag
+    # stability down instead of only the aggregate.
+    pairwise_matrix = np.eye(n_runs).tolist()
+    for left_idx in range(n_runs):
+        for right_idx in range(left_idx + 1, n_runs):
             union = top_sets[left_idx] | top_sets[right_idx]
-            pairwise.append(
-                len(top_sets[left_idx] & top_sets[right_idx]) / len(union)
-                if union else 1.0
-            )
+            j = (len(top_sets[left_idx] & top_sets[right_idx]) / len(union)
+                if union else 1.0)
+            pairwise.append(j)
+            pairwise_matrix[left_idx][right_idx] = j
+            pairwise_matrix[right_idx][left_idx] = j
     result["std_jaccard"] = float(np.std(pairwise, ddof=1)) if len(pairwise) > 1 else 0.0
+    result["pairwise_jaccard"] = pairwise_matrix
+    # Per-seed mean Jaccard against every OTHER seed: "how well does this one seed's
+    # alert set agree with the rest", so a single outlier seed shows up by name, not only
+    # as a lower aggregate mean/min.
+    result["per_seed_mean_jaccard"] = [
+        float(np.mean([pairwise_matrix[i][j] for j in range(n_runs) if j != i]))
+        if n_runs > 1 else None
+        for i in range(n_runs)
+    ]
     return result
 
 
@@ -725,6 +740,8 @@ def _build_stability(
             "mean_jaccard": if_result["mean_jaccard"],
             "std_jaccard": if_result["std_jaccard"],
             "min_jaccard": if_result["min_jaccard"],
+            "pairwise_jaccard": if_result["pairwise_jaccard"],
+            "per_seed_mean_jaccard": if_result["per_seed_mean_jaccard"],
             "resampling_unit": "Observación entidad–periodo (población evaluada)",
             "artifact": None,
         }
@@ -746,6 +763,8 @@ def _build_stability(
             "mean_jaccard": vae_result["mean_jaccard"],
             "std_jaccard": vae_result["std_jaccard"],
             "min_jaccard": vae_result["min_jaccard"],
+            "pairwise_jaccard": vae_result["pairwise_jaccard"],
+            "per_seed_mean_jaccard": vae_result["per_seed_mean_jaccard"],
             "resampling_unit": "Observación entidad–periodo (población evaluada)",
             "artifact": None,
         }

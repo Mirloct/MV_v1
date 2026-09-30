@@ -127,6 +127,10 @@ def build_analyst_dashboard(
             profile download covers full history, not only OOT.
         identity_column: Source column displayed below the entity ID in the
             profile. Defaults to the configured business field ``"puesto"``.
+            When it varies across periods for the same entity, the LATEST
+            period with a non-empty value wins (`_identity_for`) -- never the
+            first, and never a blank period silently masking an earlier real
+            value.
         out_path: Destination ``.html``. Defaults to
             ``artifacts/reports/analyst_dashboard.html``.
 

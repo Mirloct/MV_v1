@@ -878,9 +878,17 @@ download is therefore a complete entity history, not only OOT. Each case has
 exactly three operational states (`Sin revisión`, `En revisión`, `Cerrado`),
 persisted in browser storage with an ISO change timestamp. “Casos revisados”
 shows only the two non-default states and exports their ID, configured identity
-field (default `puesto`), status, date and time. `puesto` is shown immediately
-below the ID in the profile; `--analyst-identity-column` changes the source
-column without changing model inputs.
+field (default `puesto`), status, date and time. The identity field is shown
+immediately below the ID in the profile; `--analyst-identity-column` (or
+`dashboard.identity_column` in `configs/pipeline.yaml`) changes the source
+column without changing model inputs — it is folded into
+`data.identification_columns` automatically (see "Identification columns"
+above), so it never reaches feature building. If the value varies across
+periods for the same entity, the profile shows the value from the **latest**
+period that has a non-empty one (`analyst_dashboard._identity_for`, walks
+periods newest-first and returns the first non-blank value) — never the
+first, and a blank period never masks an earlier real value. Test:
+`test_case_workflow_identity_and_reviewed_export_are_present`.
 
 Detector explanations are sourced from the complete, de-duplicated explained
 OOT frame, not the filtered P90 export. This matters for a VAE-only P95 entity

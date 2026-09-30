@@ -46,8 +46,12 @@ diagnostic:
 dashboard:
   # Columna que se muestra bajo el ID de la entidad en el perfil del analista.
   # No es una feature del modelo: se agrega automáticamente a data.identification_columns
-  # de arriba y queda fuera de toda fase de modelado (ver esa sección).
-  identity_column: puesto
+  # de arriba y queda fuera de toda fase de modelado (ver esa sección). Se sube a la base
+  # junto con el resto del panel, pero el pipeline la ignora para entrenar/puntuar.
+  # Si el valor cambia de un mes a otro para la misma entidad, el perfil muestra el del
+  # ÚLTIMO mes disponible con un valor no vacío (nunca el primero, y un mes en blanco no
+  # tapa un valor real de un mes anterior).
+  identity_column: despuestocolaborador
 
 # ---------------------------------------------------------------------------
 # Apartado 9 del capítulo diagnóstico: experimentos ACTIVOS por defecto.

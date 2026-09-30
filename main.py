@@ -167,7 +167,12 @@ class PipelineConfig:
     # the analyst profile.  It is deliberately configurable because real
     # panels may use a different source-column name; the business default is
     # ``puesto``.  A missing column is rendered explicitly as "No disponible"
-    # and never prevents the dashboard from being generated.
+    # and never prevents the dashboard from being generated.  If the value
+    # changes across periods for the same entity (e.g. a job-title change),
+    # the profile shows the value from the LATEST period that has a non-empty
+    # one for that entity -- `src.reporting.analyst_dashboard._identity_for`,
+    # tested in `test_case_workflow_identity_and_reviewed_export_are_present`
+    # (a later period's value wins over an earlier one for the same entity).
     # NOT a model feature either: it is data for a human to identify the record, not a
     # modelling signal, so it is folded into `identification_columns` below (automatically,
     # by `main()`) and excluded from every phase that decides what the model sees.

@@ -44,6 +44,7 @@ import numpy as np
 warnings.filterwarnings("ignore")
 
 from src.utils import console_ui, observability, paths
+from src.utils.dependency_check import check_dependencies
 from src.utils.logging_config import log_phase, setup_logging
 
 # --------------------------------------------------------------------------- #
@@ -118,6 +119,20 @@ class PipelineConfig:
     # missing or stdout is not a TTY (piped/redirected/CI), so it never
     # corrupts a captured log. See src/utils/console_ui.py.
     console_ui: bool = True
+    # Every run starts by checking that `requirements.txt`'s packages are
+    # installed at or above their stated minimum (src/utils/dependency_check.py)
+    # -- a missing/outdated library otherwise surfaces as an opaque ImportError
+    # several phases in, instead of failing immediately with the exact fix.
+    # `skip_dependency_check` disables the check entirely (a pre-vetted
+    # Docker image, an air-gapped environment where pip has no index access).
+    # `auto_install_deps` is the opposite direction: by default the check only
+    # PRINTS the `pip install` command and stops, never installing anything on
+    # its own -- upgrading third-party packages in the caller's Python
+    # environment is a side effect with real blast radius (it can affect other
+    # projects sharing the same interpreter), so running it is an explicit
+    # opt-in, not a default.
+    skip_dependency_check: bool = False
+    auto_install_deps: bool = False
     numeric_transform: str = "yeo-johnson"
     categorical_encoding: str = "onehot"
     # Categories below this fraction of rows collapse into one "infrequent"
@@ -163,28 +178,38 @@ class PipelineConfig:
     # one-off or a recurring case across the window, which the last-3-months
     # analyst dashboard depends on. `--n-oot-periods` overrides.
     n_oot_periods: int = 3
-    # Extra identification field displayed directly below the entity ID in
-    # the analyst profile.  It is deliberately configurable because real
-    # panels may use a different source-column name; the business default is
-    # ``puesto``.  A missing column is rendered explicitly as "No disponible"
-    # and never prevents the dashboard from being generated.  If the value
-    # changes across periods for the same entity (e.g. a job-title change),
-    # the profile shows the value from the LATEST period that has a non-empty
-    # one for that entity -- `src.reporting.analyst_dashboard._identity_for`,
-    # tested in `test_case_workflow_identity_and_reviewed_export_are_present`
-    # (a later period's value wins over an earlier one for the same entity).
-    # NOT a model feature either: it is data for a human to identify the record, not a
-    # modelling signal, so it is folded into `identification_columns` below (automatically,
-    # by `main()`) and excluded from every phase that decides what the model sees.
-    analyst_identity_column: str = "puesto"
+    # Extra identification fields displayed directly below the entity ID in
+    # the analyst profile -- one row per field, in this order. Deliberately a
+    # LIST (not a single field) because real panels can carry several such
+    # display-only attributes (job title, grouping, ...); adding or removing
+    # one is a one-line edit to `dashboard.identity_columns` in
+    # configs/pipeline.yaml, nothing else. The business default is a single
+    # field, ``puesto``. A missing column is rendered explicitly as "No
+    # disponible" and never prevents the dashboard from being generated. If a
+    # field's value changes across periods for the same entity (e.g. a
+    # job-title change), the profile shows the value from the LATEST period
+    # that has a non-empty one for that entity, independently per field --
+    # `src.reporting.analyst_dashboard._identities_for`, tested in
+    # `test_case_workflow_identity_and_reviewed_export_are_present` (a later
+    # period's value wins over an earlier one for the same entity).
+    # NOT model features either: this is data for a human to identify the record, not a
+    # modelling signal, so every field here is folded into `identification_columns` below
+    # (automatically, by `main()`) and excluded from every phase that decides what the
+    # model sees.
+    analyst_identity_columns: tuple = ("puesto",)
     # Columns that exist in the raw panel purely to identify/describe a record for a
     # human reader (job title, name, area, an internal reference number, ...) and carry
     # no modelling signal: never a model feature, never checked by the exact-zero-row
     # filter, never perturbed by the post-training sensitivity study, in EVERY run --
-    # `analyst_identity_column` above is folded in automatically, so it never needs to
-    # be repeated here. `main()` copies the resolved set onto `PanelSchema.
-    # identification_columns`, the single place every one of those phases reads it from
-    # (`src.data.loader.key_columns`) -- see CONTEXT.md "Identification columns".
+    # `analyst_identity_columns` above is folded in automatically, so none of them needs
+    # to be repeated here. This list is a SUPERSET of `analyst_identity_columns`: a column
+    # named only here (not in `analyst_identity_columns`) is excluded from modelling but
+    # never shown in the dashboard card -- e.g. a segment/grouping column used elsewhere
+    # in the report (`diagnostic_segment_column`) that should stay out of training without
+    # becoming a per-case display field. `main()` copies the resolved set onto
+    # `PanelSchema.identification_columns`, the single place every one of those phases
+    # reads it from (`src.data.loader.key_columns`) -- see CONTEXT.md "Identification
+    # columns".
     identification_columns: tuple = ()
     # Headline deliverable: everyone at or above this percentile of the OOT
     # score distribution, each row graded p90/p95/p99 so the queue can be
@@ -228,12 +253,14 @@ class PipelineConfig:
     # (top-K Jaccard across refits, same metric the suite itself uses for
     # IF -- see `src/evaluation/ifvae_diagnostic.py`). TRADE-OFF: VAE refits
     # are full training runs, not just scoring, so each unit here costs
-    # roughly one extra VAE fit; 3 is the minimum needed to compute a
-    # meaningful pairwise Jaccard (top_k_stability needs >= 2, 3 gives more
-    # than one pairwise comparison). Set to 0 to disable (reports
-    # UNAVAILABLE with a stated reason) on a machine where this cost is not
-    # acceptable.
-    diagnostic_stability_refits: int = 3
+    # roughly one extra VAE fit. The minimum for a meaningful pairwise
+    # Jaccard is 2 (top_k_stability needs >= 2); 5 (raised from 3 by
+    # explicit request) gives 10 pairwise comparisons instead of 3, a more
+    # robust read for the per-seed stability table/heatmap in the report
+    # (see CONTEXT.md "Per-seed stability, visual"). Set to 0 to disable
+    # (reports UNAVAILABLE with a stated reason) on a machine where this
+    # cost is not acceptable.
+    diagnostic_stability_refits: int = 5
     # Column in the raw panel (`df`) used for the diagnostic chapter's §8
     # per-segment breakdown (temporal/segmentación). Default `"segment"`
     # matches this project's own synthetic panel; point it at any other
@@ -245,7 +272,7 @@ class PipelineConfig:
     # NOT_APPLICABLE for that run -- never a silent no-op.
     diagnostic_segment_column: Optional[str] = "segment"
     # The single user-editable file (`configs/pipeline.yaml`, or `--config PATH`) that
-    # can set the segment column, the analyst identity column and the diagnostic
+    # can set the segment column, the analyst identity columns and the diagnostic
     # grids in ONE place. `cli_explicit` = fields given on the command line (never
     # overridden by the file); `config_sources` records where each file-managed value
     # came from (cli / code / file / default) and lands in the run's resolved config.
@@ -581,21 +608,22 @@ def _validate_segment_column(config: "PipelineConfig", df, logger) -> None:
 
 
 def _resolve_identification_columns(config: "PipelineConfig", df, logger) -> tuple:
-    """The columns no modelling phase may see: ``identification_columns`` plus
-    ``analyst_identity_column`` (folded in automatically -- an identity column is by
-    definition "for identification, not for the model", so it never needs to be listed
-    twice). A configured name absent from this panel only warns: unlike the segment
-    column, nothing downstream breaks if it is a no-op here, and the same config file
-    is meant to run against panels that do not all carry the same optional columns.
+    """The columns no modelling phase may see: ``identification_columns`` plus every
+    field in ``analyst_identity_columns`` (folded in automatically -- an identity
+    column is by definition "for identification, not for the model", so none of them
+    needs to be listed twice). A configured name absent from this panel only warns:
+    unlike the segment column, nothing downstream breaks if it is a no-op here, and
+    the same config file is meant to run against panels that do not all carry the
+    same optional columns.
     """
     requested = tuple(dict.fromkeys(  # de-dup, keep order
         [c for c in config.identification_columns if c]
-        + ([config.analyst_identity_column] if config.analyst_identity_column else [])
+        + [c for c in config.analyst_identity_columns if c]
     ))
     missing = [c for c in requested if c not in df.columns]
     if missing:
         logger.warning(
-            "identification_columns/dashboard.identity_column %s not in this panel; "
+            "identification_columns/dashboard.identity_columns %s not in this panel; "
             "ignored (no effect on feature building). Available columns: %s.",
             missing, ", ".join(map(str, df.columns)),
         )
@@ -607,9 +635,20 @@ def _resolve_identification_columns(config: "PipelineConfig", df, logger) -> tup
                    "sources, exact-zero-row filter, transform diagnostics, sensitivity).",
         expected="requested ⊆ panel columns", severity="warning", passed=not missing,
         observed={"requested": list(requested), "resolved": list(resolved), "missing": missing},
-        evidence="configs/pipeline.yaml (data.identification_columns, dashboard.identity_column)",
+        evidence="configs/pipeline.yaml (data.identification_columns, dashboard.identity_columns)",
     )
     return resolved
+
+
+def _existing_identity_columns(identity_columns: tuple, resolved_identification_columns: tuple) -> tuple:
+    """Dashboard display fields trimmed to those that survived
+    ``_resolve_identification_columns`` (i.e. actually exist in this panel), order
+    preserved. A configured field absent from the real panel must never reach
+    ``build_analyst_dashboard`` -- the warning for it was already logged by
+    ``_resolve_identification_columns`` above, so this only drops it, it does not
+    warn a second time.
+    """
+    return tuple(c for c in identity_columns if c in resolved_identification_columns)
 
 
 def _mixed_vae_config(config: "PipelineConfig"):
@@ -729,6 +768,26 @@ def run_pipeline(config: PipelineConfig) -> dict:
     # -- Phase 1: environment / logging ------------------------------------- #
     logger = setup_logging()
     _ensure_dirs()
+    # Fails fast, before any phase does real work, rather than letting a
+    # missing/outdated package surface as an opaque ImportError several phases
+    # in. Checked here specifically because most third-party imports in this
+    # codebase are deferred to inside the functions that need them (not at
+    # module top), so this still runs before most of requirements.txt has
+    # actually been imported into the process -- an `--auto-install-deps` fix
+    # applied here can still take effect for the rest of THIS run, not only
+    # the next one.
+    if not config.skip_dependency_check:
+        requirements_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "requirements.txt"
+        )
+        if not check_dependencies(
+            requirements_path, logger=logger, auto_install=config.auto_install_deps,
+        ):
+            raise SystemExit(
+                "Dependencias insuficientes para ejecutar el pipeline -- revisa "
+                "execution.log para el comando `pip install` exacto, o vuelve a "
+                "correr con --auto-install-deps para instalarlas automáticamente."
+            )
     # Mirrors ERROR/CRITICAL records for the report's "Qué no se ejecutó o
     # falló" section. Warnings stay out of the report by operator request;
     # `execution.log` remains the complete runtime record. It is detached
@@ -850,6 +909,16 @@ def run_pipeline(config: PipelineConfig) -> dict:
         # `src.data.loader.key_columns(schema)` instead of keeping its own column list,
         # so this is the only place identification columns need to be resolved.
         schema.identification_columns = _resolve_identification_columns(config, df, logger)
+        # Dashboard display list, trimmed to only the fields that actually exist in
+        # THIS panel. Explicit requirement: a configured dashboard field absent from
+        # the real panel must never reach `build_analyst_dashboard` -- it is silently
+        # dropped (order of the remaining fields preserved), never rendered as a
+        # permanent "No disponible" row, and never a crash. `identification_columns`
+        # (the broader ignored-but-not-necessarily-displayed list) already gets this
+        # same tolerant treatment inside `_resolve_identification_columns` itself.
+        config.analyst_identity_columns = _existing_identity_columns(
+            config.analyst_identity_columns, schema.identification_columns
+        )
         # -- exact-zero row filter ------------------------------------------- #
         # Hard exclusion, applied to `df` itself before the chronological
         # split, any fit, and every export: a row whose input columns are
@@ -2067,7 +2136,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 },
                 months_present_by_model=months_by_model,
                 entity_records=df,
-                identity_column=config.analyst_identity_column,
+                identity_columns=config.analyst_identity_columns,
             )
             analyst_dashboard_path = dashboard_path
             _dash_ok = os.path.isfile(dashboard_path) and os.path.getsize(dashboard_path) > 0
@@ -2386,12 +2455,27 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     )
                     _add_fig(figures, "iForest split-count analysis",
                             split_result.get("figure_path"))
+                    # A feature absent from `per_feature` never helped isolate any
+                    # flagged row this run -- the strongest signal this analysis can
+                    # give for "safe to consider dropping" (see the report's
+                    # "Variables que menos aportan..." section). Only meaningful when
+                    # the analysis actually found rows/features to walk: an empty
+                    # `per_feature` from zero analysed rows would otherwise look like
+                    # every feature is unused, which is a data-availability artefact,
+                    # not a signal about the features themselves.
+                    per_feature = split_result.get("per_feature") or {}
+                    analysis_ran = bool(split_result.get("top_clear") or split_result.get("top_noisy"))
                     chart_static["iforest_splits"] = {
                         "top_clear": split_result.get("top_clear"),
                         "top_noisy": split_result.get("top_noisy"),
                         "n_rows_analyzed": split_result.get("n_rows_analyzed"),
                         "n_trees": split_result.get("n_trees"),
                         "mean_path_length": split_result.get("mean_path_length"),
+                        "n_features_total": len(names_model),
+                        "unused_features": (
+                            sorted(set(names_model) - set(per_feature.keys()))
+                            if analysis_ran else []
+                        ),
                     }
                 except Exception as exc:
                     logger.warning("split_count_analysis failed (%s); continuing.", exc)
@@ -2768,7 +2852,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "max-per-entity rule already used elsewhere in this pipeline).")
     parser.add_argument("--diagnostic-stability-refits", type=int, default=None,
                         help="Independent seed refits used to measure IF/VAE alert-set "
-                             "stability (default 3). VAE refits are full training runs -- "
+                             "stability (default 5). VAE refits are full training runs -- "
                              "this is the most expensive part of the diagnostic chapter. "
                              "Pass 0 to disable (reports UNAVAILABLE with a stated reason).")
     parser.add_argument("--diagnostic-segment-column", type=str, default=None,
@@ -2788,6 +2872,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "is not already importable (default ON; always installs from "
                              "this repo's own vendored copy, never from an index). "
                              "--no-auto-install-suite requires it pre-installed instead.")
+    parser.add_argument("--skip-dependency-check", action="store_true", default=False,
+                        help="Skip the startup check that every package in requirements.txt "
+                             "is installed at or above its minimum version (default: check "
+                             "runs). Use on a pre-vetted environment (a pinned Docker image, "
+                             "an air-gapped machine without pip index access) where the check "
+                             "itself is unnecessary or cannot succeed.")
+    parser.add_argument("--auto-install-deps", action="store_true", default=False,
+                        help="If the dependency check above finds a missing or outdated "
+                             "package, install it automatically (`pip install --upgrade`) "
+                             "instead of stopping with the command printed to "
+                             "execution.log (default: OFF). This modifies the active Python "
+                             "environment -- opt in explicitly if that is what you want here.")
     parser.add_argument("--diagnostic-experiment-contamination-grid", type=float, nargs="*",
                         default=None, metavar="C",
                         help="Isolation Forest operating points (top-c%% of the score) compared "
@@ -2950,21 +3046,25 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Trailing months reserved AFTER test, exclusively for the OOT "
                              "Excel deliverable -- never used for fitting, tuning, threshold "
                              "calibration, or test-set metrics (default 3: the last 3 months).")
-    parser.add_argument("--analyst-identity-column", type=str, default=None,
-                        help="Source column shown below the entity ID in the analyst profile "
-                             "(default 'puesto', or dashboard.identity_column of "
-                             "configs/pipeline.yaml). Missing values are shown as unavailable. "
-                             "Folded into --identification-columns automatically: it is never "
-                             "a model feature either.")
+    parser.add_argument("--analyst-identity-columns", type=str, nargs="*", default=None,
+                        metavar="COLUMN",
+                        help="Source column(s) shown below the entity ID in the analyst profile, "
+                             "one row per field in the order given (default: 'puesto', or "
+                             "dashboard.identity_columns of configs/pipeline.yaml). Missing values "
+                             "are shown as unavailable. Folded into --identification-columns "
+                             "automatically: none of them is ever a model feature either.")
     parser.add_argument("--identification-columns", type=str, nargs="*", default=None,
                         metavar="COLUMN",
                         help="Panel columns that identify/describe a record for a human reader "
-                             "(job title, name, area, an internal reference number, ...) and "
-                             "must never be a model feature, in ANY phase (default: none besides "
-                             "--analyst-identity-column). Still shown wherever identification is "
-                             "the point: the analyst dashboard, the OOT Excel export, the raw "
-                             "data profile. Default: data.identification_columns of "
-                             "configs/pipeline.yaml.")
+                             "(job title, name, area, an internal reference number, a segment/"
+                             "grouping column used elsewhere in the report, ...) and must never be "
+                             "a model feature, in ANY phase (default: none besides "
+                             "--analyst-identity-columns, which is folded in automatically). This "
+                             "list is a SUPERSET of --analyst-identity-columns: a column named only "
+                             "here is excluded from modelling but NOT shown in the dashboard card. "
+                             "Columns named here ARE still shown wherever identification is the "
+                             "point regardless: the OOT Excel export, the raw data profile. "
+                             "Default: data.identification_columns of configs/pipeline.yaml.")
     parser.add_argument("--vae-categorical-representation", choices=("onehot", "embedding"), default=None,
                         help="How the VAE receives categorical variables: 'embedding' (one index per "
                              "variable, learned embeddings, one contribution per variable) or 'onehot' "
@@ -2972,7 +3072,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "categorical_representation of configs/pipeline.yaml.")
     parser.add_argument("--config", type=str, default=None, metavar="PATH",
                         help="Single configuration file for the diagnostic knobs (segment "
-                             "column, analyst identity column, experiment grids). Default: "
+                             "column, analyst identity columns, experiment grids). Default: "
                              "configs/pipeline.yaml next to main.py if it exists. Precedence: "
                              "CLI flag > value set in code > file > built-in default.")
     parser.add_argument("--threshold-method", default="pot", choices=["pot", "percentile"],
@@ -2996,7 +3096,7 @@ _FILE_MANAGED_DESTS = {
     "diagnostic_entity_view": "diagnostic_entity_view",
     "diagnostic_stability_refits": "diagnostic_stability_refits",
     "diagnostic_sensitivity_grid": "diagnostic_sensitivity_grid",
-    "analyst_identity_column": "analyst_identity_column",
+    "analyst_identity_columns": "analyst_identity_columns",
     "identification_columns": "identification_columns",
     "diagnostic_experiment_contamination_grid": "diagnostic_experiment_contamination_grid",
     "diagnostic_experiment_capacity_grid": "diagnostic_experiment_capacity_grid",
@@ -3070,8 +3170,6 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         n_val_periods=args.n_val_periods,
         n_test_periods=args.n_test_periods,
         n_oot_periods=args.n_oot_periods,
-        **({"analyst_identity_column": args.analyst_identity_column}
-           if args.analyst_identity_column is not None else {}),
         threshold_method=args.threshold_method,
         threshold_percentile=args.threshold_percentile,
         threshold_target_far=args.threshold_target_far,
@@ -3079,6 +3177,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         run_diagnostic_suite=args.run_diagnostic_suite,
         diagnostic_entity_view=args.diagnostic_entity_view,
         diagnostic_auto_install_suite=args.auto_install_suite,
+        skip_dependency_check=args.skip_dependency_check,
+        auto_install_deps=args.auto_install_deps,
         run_sensitivity_analysis=args.run_sensitivity_analysis,
         sensitivity_max_test_rows=args.sensitivity_max_test_rows,
         sensitivity_combination_top_k=args.sensitivity_combination_top_k,
@@ -3131,6 +3231,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         config.labels_usable_statuses = tuple(args.labels_usable_statuses)
     if args.identification_columns is not None:
         config.identification_columns = tuple(args.identification_columns)
+    if args.analyst_identity_columns is not None:
+        config.analyst_identity_columns = tuple(args.analyst_identity_columns)
     for _flag, _val in (("--label-horizon-months", args.label_horizon_months),
                         ("--label-confirm-delay-months", args.label_confirm_delay_months),
                         ("--label-maturity-buffer-months", args.label_maturity_buffer_months),

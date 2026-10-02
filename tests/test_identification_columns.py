@@ -87,5 +87,30 @@ class NumericTransformDiagnosticExclusionTests(unittest.TestCase):
         self.assertEqual(cols, ["x"])
 
 
+class ExistingIdentityColumnsTests(unittest.TestCase):
+    """`main._existing_identity_columns`: a dashboard display field configured
+    against a column absent from the real panel must be silently dropped
+    (never shown as a permanent "No disponible" row, never a crash) --
+    explicit user request so a config written for one panel can run against
+    another that does not carry every optional column."""
+
+    def test_a_missing_field_is_dropped_order_preserved(self):
+        import main
+        resolved = main._existing_identity_columns(
+            ("puesto", "no_existe", "area"), ("puesto", "area"),
+        )
+        self.assertEqual(resolved, ("puesto", "area"))
+
+    def test_every_field_present_is_a_no_op(self):
+        import main
+        resolved = main._existing_identity_columns(("puesto",), ("puesto", "area"))
+        self.assertEqual(resolved, ("puesto",))
+
+    def test_every_field_missing_leaves_an_empty_dashboard_list(self):
+        import main
+        resolved = main._existing_identity_columns(("no_existe",), ("area",))
+        self.assertEqual(resolved, ())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,7 +21,7 @@ layer.
 
 **Stability refits are a real, additional cost.** Unlike every other section,
 which only reads what ``run_diagnostic`` already computed, IF and VAE
-stability each refit their detector ``stability_refits`` times (default 3)
+stability each refit their detector ``stability_refits`` times (default 5)
 with different seeds on the SAME architecture/hyperparameters this run's own
 production detector used (read off the fitted instance's own public
 attributes, e.g. ``vae_detector.latent_dim``) to measure top-K alert-set
@@ -1110,7 +1110,7 @@ def run_ifvae_diagnostic_suite(
     percentile_threshold: float = 0.95,
     sensitivity_grid: Optional[Sequence[float]] = None,
     entity_view: bool = False,
-    stability_refits: int = 3,
+    stability_refits: int = 5,
     base_seed: int = 42,
     segment: Optional[np.ndarray] = None,
     segment_name: Optional[str] = None,

@@ -20,11 +20,14 @@ turn into an ignored setting.
 Data sources / inputs: ``configs/pipeline.yaml`` or the path supplied by
 ``--config``; values are applied to ``main.PipelineConfig``.
 Created: 2026-09-25
-Last modified: 2026-09-27
+Last modified: 2026-10-01
 Changelog:
 - 2026-09-25: Made YAML validation reject duplicate/unknown empty keys,
   non-finite or out-of-range grids, and inconsistent backtest origin counts.
 - 2026-09-27: Added ``data.identification_columns`` (list of column names).
+- 2026-10-01: ``dashboard.identity_column`` (one field) replaced by
+  ``dashboard.identity_columns`` (a list) -- the analyst dashboard can now
+  show several identification fields per case, not only one.
 """
 
 from __future__ import annotations
@@ -201,7 +204,7 @@ CONFIG_KEYS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "diagnostic.entity_view": ("diagnostic_entity_view", _bool),
     "diagnostic.stability_refits": ("diagnostic_stability_refits", _pos_int),
     "diagnostic.sensitivity_grid": ("diagnostic_sensitivity_grid", _unit_floats),
-    "dashboard.identity_column": ("analyst_identity_column", _text),
+    "dashboard.identity_columns": ("analyst_identity_columns", _strings),
     "data.identification_columns": ("identification_columns", _strings),
     # -- Section 9 experiments (src/evaluation/ifvae_experiments.py) ------------
     "experiments.families": ("diagnostic_experiment_families", _families),

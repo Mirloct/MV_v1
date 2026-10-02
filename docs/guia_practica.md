@@ -168,7 +168,7 @@ El segmento se declara **una sola vez**, en `configs/pipeline.yaml`:
 diagnostic:
   segment_column: region     # columna del panel; '' desactiva el desglose
 dashboard:
-  identity_column: puesto    # columna bajo el ID en el perfil del analista
+  identity_columns: [puesto]   # una o más columnas bajo el ID en el perfil del analista
 ```
 
 Precedencia: flag de línea de comandos > valor fijado en código > este archivo >
@@ -201,13 +201,18 @@ data:
   identification_columns: [puesto, nombre_empleado]
 ```
 
-`dashboard.identity_column` se agrega automáticamente a esa lista — no hace falta
-repetirla. Quedan fuera de la matriz de features (IF y VAE), del filtro de fila en cero
-exacto, del diagnóstico de transformaciones numéricas y de la sensibilidad
-post-entrenamiento; siguen apareciendo donde identificar es el punto (dashboard del
-analista, Excel de OOT). Un nombre que no existe en el panel solo avisa, no detiene la
-corrida — el mismo archivo puede correr contra paneles que no traen todas las mismas
-columnas opcionales. Igual que el segmento, un solo lugar decide esto
+Cada campo de `dashboard.identity_columns` se agrega automáticamente a esa lista — no
+hace falta repetirlo. Quedan fuera de la matriz de features (IF y VAE), del filtro de
+fila en cero exacto, del diagnóstico de transformaciones numéricas y de la sensibilidad
+post-entrenamiento; siguen apareciendo donde identificar es el punto (Excel de OOT,
+perfil crudo del panel). `data.identification_columns` es un SUPERCONJUNTO de
+`dashboard.identity_columns`: un nombre que solo está en la primera queda fuera del
+modelo pero nunca se muestra en la tarjeta del caso (p. ej. una columna de segmento que
+no debe ser feature pero tampoco es algo que el analista necesite ver caso por caso). Un
+nombre que no existe en el panel solo avisa, no detiene la corrida — el mismo archivo
+puede correr contra paneles que no traen todas las mismas columnas opcionales, y un campo
+de `dashboard.identity_columns` ausente del panel simplemente no aparece en la tarjeta
+(nunca rompe el dashboard). Igual que el segmento, un solo lugar decide esto
 (`src/data/loader.py::key_columns`): declarar la columna aquí es la única edición
 necesaria.
 

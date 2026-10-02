@@ -369,11 +369,15 @@ temporales, estabilidad entre ventanas) ahora **corren por defecto**; detalle y 
 `data.identification_columns` marca columnas que solo sirven para identificar un registro
 (puesto, nombre, área, un número de referencia interno, ...): quedan fuera de TODA fase que
 decida qué ve el modelo (features de IF/VAE, filtro de fila en cero, diagnóstico de
-transformaciones numéricas, sensibilidad post-entrenamiento), pero siguen apareciendo donde
-identificar es el punto (dashboard del analista, Excel de OOT). `dashboard.identity_column` se
-agrega automáticamente a esta lista, sin repetirla. Todo se resuelve en un solo lugar
-(`src/data/loader.py::key_columns`), así que agregar una columna aquí es la única edición
-necesaria; ver `CONTEXT.md` → "Identification columns".
+transformaciones numéricas, sensibilidad post-entrenamiento). `dashboard.identity_columns`
+(una LISTA: pueden mostrarse varios campos a la vez en la tarjeta del caso) se agrega
+automáticamente a esta lista, sin repetirla ahí. Esta lista es un superconjunto de esa: un
+nombre que solo está aquí queda fuera del modelo pero nunca se muestra en la tarjeta del
+dashboard — sigue apareciendo donde identificar es el punto de todos modos (Excel de OOT,
+perfil crudo del panel). Un nombre que no existe en el panel solo avisa, nunca rompe la
+corrida. Todo se resuelve en un solo lugar (`src/data/loader.py::key_columns`), así que
+agregar una columna aquí es la única edición necesaria; ver `CONTEXT.md` → "Identification
+columns".
 
 ### VAE: embeddings en lugar de one-hot para las categóricas
 
@@ -474,7 +478,7 @@ python main.py --diagnostic-segment-column region  # apartado 8 por una columna 
 python main.py --config otra.yaml                # otro archivo de configuración
 python main.py --diagnostic-experiment-capacity-grid 4 8 16  # refits VAE opt-in
 python main.py --no-auto-install-suite  # valida ifvae_diag, pero no lo instala
-python main.py --analyst-identity-column puesto  # identificación visible bajo el ID
+python main.py --analyst-identity-columns puesto area  # uno o más campos bajo el ID
 python main.py --sensitivity-high-zero-cutoff 0.90  # regla de registros casi vacíos
 python main.py --no-run-sensitivity-analysis  # omite la Fase 9d post-entrenamiento
 python main.py --help

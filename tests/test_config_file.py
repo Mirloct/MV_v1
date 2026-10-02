@@ -44,10 +44,10 @@ class TestPrecedence(Base):
     def test_file_sets_values_that_are_still_at_their_default(self):
         cfg = main.PipelineConfig()
         path = self.write("diagnostic:\n  segment_column: region\n  stability_refits: 1\n"
-                          "dashboard:\n  identity_column: cargo\n")
+                          "dashboard:\n  identity_columns: [cargo]\n")
         report = apply_config_file(cfg, path)
         self.assertEqual((cfg.diagnostic_segment_column, cfg.diagnostic_stability_refits,
-                          cfg.analyst_identity_column), ("region", 1, "cargo"))
+                          cfg.analyst_identity_columns), ("region", 1, ("cargo",)))
         self.assertEqual(report["sources"]["diagnostic_segment_column"], "file")
         self.assertEqual(report["sources"]["diagnostic_entity_view"], "default")
 
@@ -85,7 +85,9 @@ class TestPrecedence(Base):
     def test_standalone_tools_read_the_same_value(self):
         path = self.write("diagnostic:\n  segment_column: canal\n")
         self.assertEqual(configured_value("diagnostic.segment_column", "segment", path), "canal")
-        self.assertEqual(configured_value("dashboard.identity_column", "puesto", path), "puesto")
+        self.assertEqual(
+            configured_value("dashboard.identity_columns", ("puesto",), path), ("puesto",)
+        )
 
     def test_shipped_file_does_not_turn_the_default_segment_into_an_explicit_request(self):
         cfg = main.PipelineConfig()
@@ -136,8 +138,9 @@ class TestCliWiring(Base):
     def test_only_flags_really_given_are_explicit(self):
         cfg = self._cfg()
         self.assertEqual(cfg.cli_explicit, ())
-        cfg = self._cfg("--diagnostic-segment-column", "region", "--analyst-identity-column=cargo")
-        self.assertEqual(set(cfg.cli_explicit), {"diagnostic_segment_column", "analyst_identity_column"})
+        cfg = self._cfg("--diagnostic-segment-column", "region",
+                        "--analyst-identity-columns", "cargo")
+        self.assertEqual(set(cfg.cli_explicit), {"diagnostic_segment_column", "analyst_identity_columns"})
         self.assertEqual(self._cfg("--config", "x.yaml").config_file, "x.yaml")
 
     def test_passing_the_default_value_on_the_command_line_still_wins_over_the_file(self):
@@ -147,11 +150,16 @@ class TestCliWiring(Base):
                           frozenset(cfg.cli_explicit))
         self.assertTrue(cfg.diagnostic_entity_view)
 
-    def test_identity_column_default_is_no_longer_a_dead_default(self):
+    def test_identity_columns_default_is_no_longer_a_dead_default(self):
         cfg = self._cfg()
-        apply_config_file(cfg, self.write("dashboard:\n  identity_column: cargo\n"),
+        apply_config_file(cfg, self.write("dashboard:\n  identity_columns: [cargo]\n"),
                           frozenset(cfg.cli_explicit))
-        self.assertEqual(cfg.analyst_identity_column, "cargo")
+        self.assertEqual(cfg.analyst_identity_columns, ("cargo",))
+
+    def test_analyst_identity_columns_flag_accepts_several_fields(self):
+        cfg = self._cfg("--analyst-identity-columns", "cargo", "area")
+        self.assertEqual(cfg.analyst_identity_columns, ("cargo", "area"))
+        self.assertIn("analyst_identity_columns", cfg.cli_explicit)
 
     def test_identification_columns_flag_wins_over_the_file(self):
         cfg = self._cfg("--identification-columns", "puesto", "area")
@@ -160,6 +168,17 @@ class TestCliWiring(Base):
         apply_config_file(cfg, self.write("data:\n  identification_columns: [other]\n"),
                           frozenset(cfg.cli_explicit))
         self.assertEqual(cfg.identification_columns, ("puesto", "area"))   # the file never wins
+
+    def test_dependency_check_flags_default_off_and_wire_through(self):
+        # Both default OFF: the check always runs (skip=False) and never
+        # mutates the environment on its own (auto_install=False) unless the
+        # operator opts in explicitly on the command line.
+        cfg = self._cfg()
+        self.assertFalse(cfg.skip_dependency_check)
+        self.assertFalse(cfg.auto_install_deps)
+        cfg = self._cfg("--skip-dependency-check", "--auto-install-deps")
+        self.assertTrue(cfg.skip_dependency_check)
+        self.assertTrue(cfg.auto_install_deps)
 
 
 class TestIdentificationColumnsFile(Base):
@@ -181,16 +200,23 @@ class TestIdentificationColumnsFile(Base):
 
 class TestResolveIdentificationColumns(unittest.TestCase):
     """`main._resolve_identification_columns`: the single place `data.identification_columns` and
-    `dashboard.identity_column` are folded into the one set every modelling phase reads from
+    `dashboard.identity_columns` are folded into the one set every modelling phase reads from
     `PanelSchema.identification_columns` via `src.data.loader.key_columns`."""
 
     df = pd.DataFrame({"entity_id": ["a"], "puesto": ["x"], "area": ["y"]})
     log = logging.getLogger("modelo.test_identification_columns")
 
     def test_identity_column_is_folded_in_without_repeating_it(self):
-        cfg = main.PipelineConfig(identification_columns=("area",))    # analyst_identity_column stays 'puesto'
+        cfg = main.PipelineConfig(identification_columns=("area",))    # analyst_identity_columns stays ('puesto',)
         self.assertEqual(main._resolve_identification_columns(cfg, self.df, self.log),
                          ("area", "puesto"))
+
+    def test_every_identity_column_is_folded_in_not_only_the_first(self):
+        cfg = main.PipelineConfig(
+            identification_columns=(), analyst_identity_columns=("puesto", "area"),
+        )
+        self.assertEqual(main._resolve_identification_columns(cfg, self.df, self.log),
+                         ("puesto", "area"))
 
     def test_already_listed_identity_column_is_not_duplicated(self):
         cfg = main.PipelineConfig(identification_columns=("puesto", "area"))
@@ -204,9 +230,22 @@ class TestResolveIdentificationColumns(unittest.TestCase):
         self.assertEqual(resolved, ("area", "puesto"))                 # missing one silently dropped
         self.assertIn("no_existe", " ".join(captured.output))
 
-    def test_disabling_identity_column_leaves_only_the_explicit_list(self):
-        cfg = main.PipelineConfig(identification_columns=("area",), analyst_identity_column="")
+    def test_disabling_identity_columns_leaves_only_the_explicit_list(self):
+        cfg = main.PipelineConfig(identification_columns=("area",), analyst_identity_columns=())
         self.assertEqual(main._resolve_identification_columns(cfg, self.df, self.log), ("area",))
+
+    def test_an_identification_only_column_is_excluded_but_not_in_the_dashboard_list(self):
+        # Explicit user scenario: a column (e.g. the segment/grouping column)
+        # must be excluded from modelling without becoming a dashboard display
+        # field -- so it belongs ONLY in `identification_columns`, never in
+        # `analyst_identity_columns`. `identification_columns` is therefore a
+        # superset of `analyst_identity_columns`, not the same set.
+        cfg = main.PipelineConfig(
+            identification_columns=("area",), analyst_identity_columns=("puesto",),
+        )
+        resolved = main._resolve_identification_columns(cfg, self.df, self.log)
+        self.assertEqual(set(resolved), {"area", "puesto"})
+        self.assertEqual(cfg.analyst_identity_columns, ("puesto",))    # dashboard list unaffected
 
 
 class TestSegmentValidation(unittest.TestCase):

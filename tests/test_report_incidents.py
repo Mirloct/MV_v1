@@ -56,3 +56,73 @@ class RowFilterSectionTests(unittest.TestCase):
             self.assertIn("1.0%", out)          # 60 / 6000 = 1.0%
             self.assertIn("90%", out)
             self.assertIn("13", out)            # n_columns_checked
+
+
+class IForestSplitsRecommendationSectionTests(unittest.TestCase):
+    """The feature-removal recommendation built from `split_count_analysis`'s
+    output (`chart_data.static.iforest_splits`) -- explicit user request:
+    beyond the existing "fewest/most cuts" charts, state a recommendation on
+    which variables contribute least to telling outliers apart."""
+
+    def _ctx(self, **overrides):
+        block = {
+            "top_clear": [("balance", 3.2), ("age", 4.1)],
+            "top_noisy": [("region_code", 11.7), ("channel", 10.9)],
+            "n_rows_analyzed": 50,
+            "n_trees": 300,
+            "mean_path_length": 8.4,
+            "n_features_total": 5,
+            "unused_features": ["legacy_flag"],
+        }
+        block.update(overrides)
+        return {"chart_data": {"static": {"iforest_splits": block}}}
+
+    def test_absent_block_renders_nothing(self):
+        from src.reporting.report import (
+            _iforest_splits_section_html, _iforest_splits_section_md,
+        )
+        self.assertEqual(_iforest_splits_section_md({}), "")
+        self.assertEqual(_iforest_splits_section_html({}), "")
+
+    def test_empty_top_lists_render_nothing(self):
+        # split_count_analysis found no rows/features to analyse -- nothing to
+        # recommend from an analysis that never ran, not "everything is unused".
+        from src.reporting.report import (
+            _iforest_splits_section_html, _iforest_splits_section_md,
+        )
+        ctx = self._ctx(top_clear=[], top_noisy=[], unused_features=[])
+        self.assertEqual(_iforest_splits_section_md(ctx), "")
+        self.assertEqual(_iforest_splits_section_html(ctx), "")
+
+    def test_zero_usage_variable_is_recommended_for_removal(self):
+        from src.reporting.report import (
+            _iforest_splits_section_html, _iforest_splits_section_md,
+        )
+        ctx = self._ctx()
+        for out in (_iforest_splits_section_md(ctx), _iforest_splits_section_html(ctx)):
+            self.assertIn("legacy_flag", out)
+            self.assertIn("Candidata a eliminar", out)
+            self.assertIn("0% de uso", out)
+            self.assertIn("1 de las 5", out)   # 1 unused_feature out of n_features_total
+
+    def test_noisiest_used_variables_are_flagged_to_review_not_remove(self):
+        from src.reporting.report import (
+            _iforest_splits_section_html, _iforest_splits_section_md,
+        )
+        ctx = self._ctx()
+        for out in (_iforest_splits_section_md(ctx), _iforest_splits_section_html(ctx)):
+            self.assertIn("region_code", out)
+            self.assertIn("Candidata a revisar", out)
+            # A weak-signal variable must never be worded as a removal
+            # recommendation -- only the 0%-usage tier earns that wording.
+            self.assertNotIn("region_code</td><td>0% de uso", out)
+
+    def test_no_unused_variables_states_that_explicitly(self):
+        from src.reporting.report import (
+            _iforest_splits_section_html, _iforest_splits_section_md,
+        )
+        ctx = self._ctx(unused_features=[])
+        for out in (_iforest_splits_section_md(ctx), _iforest_splits_section_html(ctx)):
+            self.assertIn("Ninguna de las 5 variables", out)
+            self.assertIn("0% de participación", out)
+            self.assertNotIn("Candidata a eliminar", out)

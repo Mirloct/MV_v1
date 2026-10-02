@@ -104,6 +104,23 @@ layout was dropped — keep filenames unique when adding a figure.
 - tqdm, joblib, rich, psutil (progress, parallelism/persistence, console dashboard)
 - pyyaml (config files)
 
+**Startup dependency check (2026-10-01).** `run_pipeline` (`main.py`) calls
+`src.utils.dependency_check.check_dependencies` right after `_ensure_dirs()`,
+before any phase does real work: parses `requirements.txt` (plain
+`name>=X.Y` lines only), compares against what is actually installed via
+`importlib.metadata.version`, and on a missing/outdated package logs the
+exact `pip install --upgrade` command that fixes everything at once, then
+stops the run (`SystemExit`) -- never an opaque `ImportError` several phases
+in. Never installs anything by default (upgrading a third-party package in
+the caller's environment has real blast radius beyond this run);
+`--auto-install-deps` (default OFF) opts into actually running `pip`.
+`--skip-dependency-check` (default OFF) disables the check entirely for a
+pre-vetted environment. Runs this early specifically because most
+third-party imports in this codebase are deferred to inside the functions
+that need them, not at module top, so a fix applied here can still take
+effect for the rest of THIS run. Tests: `tests/test_dependency_check.py`
+(12 tests) plus one CLI-wiring test in `test_config_file.py`.
+
 ## Data contract
 
 Produced by `src/data`, consumed by every downstream module:
@@ -140,33 +157,45 @@ Produced by `src/data`, consumed by every downstream module:
   fallbacks below, so without the name hint it would not be inferred as
   `time_col` at all. Tests: `tests/test_schema_inference.py`. `time_col`/`entity_col` can be
   `None` for arbitrary inputs; callers must handle that.
-- **Identification columns (2026-09-27)**: `data.identification_columns` of
-  `configs/pipeline.yaml` (or `--identification-columns`) names panel columns
-  that exist purely to identify/describe a record for a human reader (job
-  title, name, area, an internal reference number, ...) and carry no
-  modelling signal. `main._resolve_identification_columns` folds in
-  `dashboard.identity_column` automatically (it is never listed twice) and
-  sets the result on `schema.identification_columns` once, right after
-  `load_or_generate_panel`, before anything else reads `schema`. Every phase
-  that decides what the model sees calls `src.data.loader.key_columns(schema)`
-  — the *one* place that set is assembled — instead of keeping its own column
-  list: feature building (`PanelFeatureEngineer`/`build_preprocessing_pipeline`),
-  the VAE's categorical sources (`categorical_sources`), the exact-zero-row
-  filter, the numeric-transform diagnostic (`infer_numeric_features`) and the
+- **Identification columns (2026-09-27, generalized to a list 2026-10-01)**:
+  `data.identification_columns` of `configs/pipeline.yaml` (or
+  `--identification-columns`) names panel columns that exist purely to
+  identify/describe a record for a human reader (job title, name, area, an
+  internal reference number, a segment/grouping column used elsewhere in the
+  report, ...) and carry no modelling signal. `main._resolve_identification_columns`
+  folds in every field of `dashboard.identity_columns` automatically (none of
+  them needs to be listed twice) and sets the result on
+  `schema.identification_columns` once, right after `load_or_generate_panel`,
+  before anything else reads `schema`. Every phase that decides what the
+  model sees calls `src.data.loader.key_columns(schema)` — the *one* place
+  that set is assembled — instead of keeping its own column list: feature
+  building (`PanelFeatureEngineer`/`build_preprocessing_pipeline`), the VAE's
+  categorical sources (`categorical_sources`), the exact-zero-row filter, the
+  numeric-transform diagnostic (`infer_numeric_features`) and the
   post-training sensitivity study. A name absent from the loaded panel only
   warns (`config.identification_columns_present`, category `data`) — unlike
   the segment column, nothing downstream breaks, and the same config file is
   meant to run against panels that do not all carry the same optional
-  columns. This is a *modelling* exclusion, not a display one: the analyst
-  dashboard, the OOT Excel "VARIABLES" columns and the raw data profile keep
-  showing these columns, since identification is exactly what they are for.
-  The vendored IF-VAE Diagnostic Suite needs no separate configuration for
+  columns. This is a *modelling* exclusion, not a display one in general: the
+  OOT Excel "VARIABLES" columns and the raw data profile (and the analyst
+  dashboard's full per-entity CSV download, which embeds every raw source
+  column verbatim) keep showing all of these columns regardless, since
+  identification is exactly what they are for. The ONE place this is
+  display-selective is the dashboard's per-case identity summary (the rows
+  shown directly under the entity ID when a case is opened): only fields also
+  listed in `dashboard.identity_columns` render there — see "Full-history
+  download and case workflow" below for that superset relationship.
+  `identification_columns` is therefore a superset of `identity_columns`, not
+  the same set: a name that belongs ONLY in the former is excluded from
+  modelling but never becomes a per-case display row. The vendored IF-VAE
+  Diagnostic Suite needs no separate configuration for
   this — its `DiagnosticConfig.features` list is built from the
   already-preprocessed feature names, so an excluded column is already absent
   by the time the suite sees it. Tests: `tests/test_identification_columns.py`
-  (the shared `key_columns` helper and the two call sites with no test file of
-  their own), plus one test in each of `test_config_file.py` (resolution/
-  precedence), `test_zero_row_filter.py`, `test_mixed_vae.py`
+  (the shared `key_columns` helper, the two call sites with no test file of
+  their own, and `_existing_identity_columns` -- the dashboard-list trimming
+  helper, see below), plus one test in each of `test_config_file.py`
+  (resolution/precedence), `test_zero_row_filter.py`, `test_mixed_vae.py`
   (`categorical_sources`) and `test_sensitivity.py`.
 - **Period parsing**: `src/data/loader.py::detect_period_format` /
   `parse_period_column` handle compact formats pandas cannot infer on its
@@ -737,6 +766,44 @@ P95 checkpoint, stacking, or the VAE deliverable.
   score (default 50) instead of leaving the chart empty; logged either way.
   Tests: `tests/test_iforest_split_counts.py` (13 tests total: the analysis
   itself + the fallback helper, mutation-checked).
+- **Removal recommendation from the split-count analysis (2026-09-29)**:
+  explicit user request, built on the block above. `main.py` now also stores,
+  in the same `chart_data.static.iforest_splits` payload, `n_features_total`
+  and `unused_features` — model features present in `X_model`/`names_model`
+  that never appear in `split_result["per_feature"]` at all, i.e. never
+  helped isolate a single flagged OOT row this run (a stronger signal than
+  merely needing many cuts when a feature *does* participate). Only computed
+  when the analysis actually ran (`top_clear`/`top_noisy` non-empty) — an
+  empty `per_feature` from zero analysed rows would otherwise look like every
+  feature is unused, which is a data-availability artefact, not a signal
+  about the features. New report section (MD `_iforest_splits_section_md` /
+  HTML `_iforest_splits_section_html` in `src/reporting/report.py`, right
+  after the existing split-count charts): a table naming the 0%-usage
+  features as "Candidata a eliminar" and the `top_noisy` features as the
+  weaker "Candidata a revisar (señal débil)" — the two tiers are worded
+  differently on purpose (mutation-checked: swapping the wording makes
+  `test_noisiest_used_variables_are_flagged_to_review_not_remove` and
+  `test_no_unused_variables_states_that_explicitly` fail). Always framed as a
+  suggestion pending cross-checks (SHAP importance, multi-seed stability),
+  never an automatic action, and explicit when no 0%-usage feature exists (no
+  blanket removal claim from this signal alone). Tests:
+  `IForestSplitsRecommendationSectionTests` in `tests/test_report_incidents.py`
+  (6 tests).
+- **Stability refits default raised 3 -> 5 (2026-10-01)**: explicit user
+  request. `PipelineConfig.diagnostic_stability_refits` (`main.py`), its
+  `--diagnostic-stability-refits` CLI help text, the commented example in
+  `configs/pipeline.yaml`, and `run_ifvae_diagnostic_suite`'s own parameter
+  default (`src/evaluation/ifvae_diagnostic.py`) all moved from 3 to 5. Still
+  configurable per run (`diagnostic.stability_refits` in the config file, or
+  the CLI flag); 0 still disables the section entirely (UNAVAILABLE, stated
+  reason), and 2 is still the hard minimum `top_k_stability` needs. Five
+  seeds gives 10 pairwise comparisons for the per-seed Jaccard
+  table/heatmap below instead of 3 — a more robust visual read — at the cost
+  of two more full VAE refits per run (this is the single most expensive
+  part of the diagnostic chapter; see the trade-off note on the field
+  itself). No test asserted the old default value, so none needed updating;
+  tests that exercise `stability_refits` do so with an explicit value of
+  their own regardless of the project default.
 - **Per-seed stability, visual (2026-09-28)**: `_seeded_refit_stability`
   (`src/evaluation/ifvae_diagnostic.py`) now exposes the full seed×seed
   pairwise-Jaccard matrix and each seed's mean against the rest (the
@@ -877,18 +944,44 @@ their available periods and original columns are retained. The UTF-8 profile
 download is therefore a complete entity history, not only OOT. Each case has
 exactly three operational states (`Sin revisión`, `En revisión`, `Cerrado`),
 persisted in browser storage with an ISO change timestamp. “Casos revisados”
-shows only the two non-default states and exports their ID, configured identity
-field (default `puesto`), status, date and time. The identity field is shown
-immediately below the ID in the profile; `--analyst-identity-column` (or
-`dashboard.identity_column` in `configs/pipeline.yaml`) changes the source
-column without changing model inputs — it is folded into
+shows only the two non-default states and exports their ID, configured
+identity field(s) (default a single field, `puesto`), status, date and time.
+
+**Several identity fields, not just one (generalized 2026-10-01).** The
+identity field shown immediately below the ID in the profile was generalized
+from one hardcoded column to a LIST, `dashboard.identity_columns` in
+`configs/pipeline.yaml` (`--analyst-identity-columns` on the CLI, `nargs="*"`)
+— one row per configured field, in order, explicit user request ("pueda ver
+varios campos adicionales"). Each field is folded into
 `data.identification_columns` automatically (see "Identification columns"
-above), so it never reaches feature building. If the value varies across
-periods for the same entity, the profile shows the value from the **latest**
-period that has a non-empty one (`analyst_dashboard._identity_for`, walks
-periods newest-first and returns the first non-blank value) — never the
-first, and a blank period never masks an earlier real value. Test:
-`test_case_workflow_identity_and_reviewed_export_are_present`.
+above), so none of them ever reaches feature building. For each field
+independently, if its value varies across periods for the same entity, the
+profile shows the value from the **latest** period that has a non-empty one
+(`analyst_dashboard._identities_for`, walks periods newest-first per field
+and returns the first non-blank value for THAT field) — never the first, a
+blank period never masks an earlier real value, and one field being blank in
+the latest period never affects another field's own latest value. Rendered
+as `profiles[key]["identities"]`, a list of `{"label", "value"}` pairs,
+index-aligned with a matching list of static `<div class="midentity">` rows
+built from `identity_columns` at render time (`id="mIdentity_<i>"`); the CSV
+export (`exportReviewedCases`) gained one column per configured field
+instead of a single "identity" column. Test:
+`test_case_workflow_identity_and_reviewed_export_are_present`, plus
+`MultipleIdentityColumnsTests` (two fields rendering independently, and an
+empty list rendering no identity row at all) in `tests/test_analyst_dashboard.py`.
+
+**A configured field absent from the real panel never breaks the dashboard
+(2026-10-01).** Explicit user request: `main.py` trims
+`config.analyst_identity_columns` to the fields that survived
+`_resolve_identification_columns` (i.e. actually exist in this panel) right
+after resolving it (`main._existing_identity_columns`, order preserved)
+*before* calling `build_analyst_dashboard` — a configured display field
+absent from the real panel is silently dropped, never rendered as a
+permanent "No disponible" row. `data.identification_columns` (the broader
+list) already got this same tolerant treatment inside
+`_resolve_identification_columns` itself (a missing name there only warns,
+category `data`, via `config.identification_columns_present`). Tests:
+`ExistingIdentityColumnsTests` in `tests/test_identification_columns.py`.
 
 Detector explanations are sourced from the complete, de-duplicated explained
 OOT frame, not the filtered P90 export. This matters for a VAE-only P95 entity
@@ -1248,7 +1341,7 @@ synthetic data** — the direction of the ψ effect must be re-checked on real d
 
 The diagnostic knobs a user edits most live in **one** file, `configs/pipeline.yaml` next
 to `main.py` (or `--config PATH`), loaded by `src/utils/config_file.py`: the segment column
-(`diagnostic.segment_column`), the analyst identity column (`dashboard.identity_column`),
+(`diagnostic.segment_column`), the analyst identity columns (`dashboard.identity_columns`),
 the identification-only columns excluded from every modelling phase
 (`data.identification_columns` — see "Identification columns" above), entity view,
 stability refits, the sensitivity grid and the whole `experiments:` block.
@@ -1264,7 +1357,7 @@ said "segmento". Now an **explicit** segment that is not a column of the panel s
 **at the start** (`_validate_segment_column`: closest match ignoring case + every available
 column); only the built-in default degrades to `NOT_APPLICABLE` with a warning and an
 observability incident. The report names the real column ("Por segmento (region)") and
-`tools/export_diagnostic_suite_inputs.py` reads the same value. `--analyst-identity-column`
+`tools/export_diagnostic_suite_inputs.py` reads the same value. `--analyst-identity-columns`
 no longer has a dead dataclass default (argparse default is `None`).
 
 ## Mixed-type VAE: embeddings for categorical variables (2026-09-25)

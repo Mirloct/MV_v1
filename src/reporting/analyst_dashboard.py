@@ -88,7 +88,7 @@ def build_analyst_dashboard(
     months_present_by_model: Optional[dict[str, dict]] = None,
     oot_records: Optional[pd.DataFrame] = None,
     entity_records: Optional[pd.DataFrame] = None,
-    identity_column: str = "puesto",
+    identity_columns: Sequence[str] = ("puesto",),
 ) -> str:
     """Render the single, unified analyst review-queue dashboard.
 
@@ -125,12 +125,13 @@ def build_analyst_dashboard(
         entity_records: Complete raw panel. Every available row and source
             column for entities in the P95 review union is embedded so the
             profile download covers full history, not only OOT.
-        identity_column: Source column displayed below the entity ID in the
-            profile. Defaults to the configured business field ``"puesto"``.
-            When it varies across periods for the same entity, the LATEST
-            period with a non-empty value wins (`_identity_for`) -- never the
-            first, and never a blank period silently masking an earlier real
-            value.
+        identity_columns: Source column(s) displayed below the entity ID in the
+            profile, one row per field, in this order. Defaults to a single
+            field, the configured business default ``"puesto"``. For each
+            field independently, when its value varies across periods for the
+            same entity, the LATEST period with a non-empty value wins
+            (`_identities_for`) -- never the first, and never a blank period
+            silently masking an earlier real value.
         out_path: Destination ``.html``. Defaults to
             ``artifacts/reports/analyst_dashboard.html``.
 
@@ -190,13 +191,21 @@ def build_analyst_dashboard(
         for original_id, safe_row in zip(raw[entity_col].astype(str), safe_rows):
             records_by_entity.setdefault(original_id, []).append(safe_row)
 
-    def _identity_for(eid: str) -> str:
-        """Return the latest non-empty configured identity value."""
-        for row in reversed(records_by_entity.get(eid, [])):
-            value = row.get(identity_column)
-            if value is not None and str(value).strip():
-                return str(value)
-        return ""
+    def _identities_for(eid: str) -> list[dict]:
+        """Latest non-empty value of each configured identity field, computed
+        independently per field (one field being blank in the latest period
+        never masks another field's own latest real value)."""
+        records = records_by_entity.get(eid, [])
+        result = []
+        for col in identity_columns:
+            value = ""
+            for row in reversed(records):
+                candidate = row.get(col)
+                if candidate is not None and str(candidate).strip():
+                    value = str(candidate)
+                    break
+            result.append({"label": col, "value": value})
+        return result
 
     counts = {"if_only": 0, "vae_only": 0, "intersection": 0}
     recurrent_counts = {"if_only": 0, "vae_only": 0, "intersection": 0}
@@ -263,7 +272,7 @@ def build_analyst_dashboard(
 
         profiles[profile_key] = {
             "id": eid, "band": band,
-            "identity": _identity_for(eid),
+            "identities": _identities_for(eid),
             "tab": tab,
             "if_score": if_score, "vae_score": vae_score,
             "if_pctl": if_pctl, "vae_pctl": vae_pctl,
@@ -278,6 +287,17 @@ def build_analyst_dashboard(
     oot_label = ", ".join(all_periods) if all_periods else "(sin periodos)"
 
     month_label = {p: p for p in all_periods}  # ISO date is already the label
+
+    # One row per configured field, index-aligned with each profile's own
+    # "identities" list (built from the same `identity_columns`, same order)
+    # so `openProfile` can fill value `i` into label `i` without a name
+    # lookup. Empty when `identity_columns` is `()` -- the card then simply
+    # shows no identity row at all, never a crash.
+    identity_rows_html = "".join(
+        f'<div class="midentity"><span>{html.escape(str(col))}</span>'
+        f'<b id="mIdentity_{i}">No disponible</b></div>'
+        for i, col in enumerate(identity_columns)
+    )
 
     html_out = f"""<!DOCTYPE html>
 <html lang="es">
@@ -377,7 +397,7 @@ def build_analyst_dashboard(
       <div>
         <div class="meyebrow">Perfil de individuo priorizado</div>
         <div class="mid" id="mId">&mdash;</div>
-        <div class="midentity"><span>{html.escape(identity_column)}</span><b id="mIdentity">No disponible</b></div>
+        {identity_rows_html}
       </div>
       <span class="mband" id="mBand">&mdash;</span>
     </div>
@@ -584,7 +604,10 @@ function openProfile(id){{
   var r = PROFILES[id]; if(!r) return;
   ACTIVE_PROFILE = r;
   document.getElementById("mId").textContent = r.id;
-  document.getElementById("mIdentity").textContent = r.identity || "No disponible";
+  (r.identities||[]).forEach(function(it, i){{
+    var el = document.getElementById("mIdentity_"+i);
+    if (el) el.textContent = (it && it.value) || "No disponible";
+  }});
   syncCaseUI(id);
   var bandEl = document.getElementById("mBand");
   bandEl.textContent = (r.band || "-").toUpperCase();
@@ -644,7 +667,7 @@ function exportReviewedCases(){{
     var d=new Date(c.changed_at);
     rows.push({{
       id:r.id,
-      identity:r.identity||"",
+      identities:r.identities||[],
       status:STATUS_LABELS[c.status],
       changed_at:c.changed_at||"",
       changed_date:c.changed_at && !isNaN(d.getTime()) ? d.toLocaleDateString("es-PE") : "",
@@ -653,9 +676,12 @@ function exportReviewedCases(){{
   }});
   if(!rows.length) return;
   rows.sort(function(a,b){{return String(b.changed_at).localeCompare(String(a.changed_at));}});
-  var headers=[{json.dumps(entity_col, ensure_ascii=False)},{json.dumps(identity_column, ensure_ascii=False)},"estado","fecha_cambio_estado","hora_cambio_estado","timestamp_cambio_estado"];
+  var headers=[{json.dumps(entity_col, ensure_ascii=False)}].concat({json.dumps(list(identity_columns), ensure_ascii=False)},["estado","fecha_cambio_estado","hora_cambio_estado","timestamp_cambio_estado"]);
   var lines=[headers.map(csvCell).join(",")];
-  rows.forEach(function(r){{lines.push([r.id,r.identity,r.status,r.changed_date,r.changed_time,r.changed_at].map(csvCell).join(","));}});
+  rows.forEach(function(r){{
+    var idVals=r.identities.map(function(it){{return it && it.value || "";}});
+    lines.push([r.id].concat(idVals,[r.status,r.changed_date,r.changed_time,r.changed_at]).map(csvCell).join(","));
+  }});
   var blob=new Blob(["\\ufeff"+lines.join("\\r\\n")],{{type:"text/csv;charset=utf-8"}});
   var url=URL.createObjectURL(blob), a=document.createElement("a");
   a.href=url;a.download="casos_revisados.csv";document.body.appendChild(a);a.click();a.remove();

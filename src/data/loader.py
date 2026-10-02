@@ -81,8 +81,9 @@ class PanelSchema:
             identify or describe a record for a human reader (job title, name,
             area, an internal reference number, ...) and carry no modelling
             signal. Set once, by `main.py`, from `data.identification_columns`
-            of `configs/pipeline.yaml` (plus `dashboard.identity_column`,
-            folded in automatically -- no need to list it twice). Every
+            of `configs/pipeline.yaml` (plus every field in
+            `dashboard.identity_columns`, folded in automatically -- no need
+            to list them twice). Every
             phase that decides what the model sees calls :func:`key_columns`
             instead of re-deriving its own column list, so adding a name here
             is the *only* edit needed to keep it out of feature building, the

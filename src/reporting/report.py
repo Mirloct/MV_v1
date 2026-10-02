@@ -355,6 +355,89 @@ def _sensitivity_section_md(context: dict, out_dir: str) -> str:
     return "\n".join(parts)
 
 
+def _iforest_splits_block(context: dict) -> Optional[dict]:
+    """The `interpretability.split_count_analysis` payload `main.py` stores at
+    `chart_data.static.iforest_splits`, or ``None`` when the analysis did not
+    run or found no feature used to isolate any flagged row (nothing to base
+    a recommendation on either way)."""
+    static = (context.get("chart_data") or {}).get("static") or {}
+    block = static.get("iforest_splits")
+    if not isinstance(block, dict) or not (block.get("top_clear") or block.get("top_noisy")):
+        return None
+    return block
+
+
+def _iforest_splits_lead_sentence(block: dict) -> str:
+    n_rows = int(block.get("n_rows_analyzed") or 0)
+    n_trees = int(block.get("n_trees") or 0)
+    return (
+        f"Sobre las {n_rows:,} fila(s) marcadas por el umbral calibrado de esta corrida "
+        f"y los {n_trees:,} árbol(es) del bosque, cada variable de entrada se clasifica "
+        "por cuántos cortes hace falta atravesar, en promedio, para que ayude a aislar "
+        "una de esas filas (`src.interpretability.split_count_analysis`)."
+    )
+
+
+def _iforest_splits_recommendation_rows(block: dict) -> list[tuple[str, str, str]]:
+    """One row per variable worth flagging, most-confident recommendation first:
+    a 0%-usage variable never helped isolate a flagged row at all, which is a
+    stronger removal signal than merely needing many cuts when it does help."""
+    rows = []
+    for name in block.get("unused_features") or []:
+        rows.append((
+            str(name),
+            "0% de uso: nunca participó en aislar una fila marcada en esta corrida",
+            "Candidata a eliminar",
+        ))
+    for name, avg_cuts in block.get("top_noisy") or []:
+        rows.append((
+            str(name),
+            f"Participa, pero solo en aislamientos largos ({float(avg_cuts):.1f} cortes "
+            "promedio, con mucha ayuda de otras variables)",
+            "Candidata a revisar (señal débil)",
+        ))
+    return rows
+
+
+def _iforest_splits_recommendation_paragraph(block: dict) -> str:
+    unused = block.get("unused_features") or []
+    n_total = block.get("n_features_total")
+    if unused:
+        return (
+            f"{len(unused)} de las {n_total} variables del modelo nunca participaron "
+            "en aislar ninguna fila marcada en esta corrida: en los datos de esta corrida "
+            "no aportan señal de distinción de outliers. Se sugiere evaluar eliminarlas "
+            "del conjunto de features -- cruzando esta evidencia con la importancia SHAP "
+            "(sección de explicabilidad) y con la estabilidad entre semillas antes de "
+            "decidir en producción, ya que esto es evidencia de una sola corrida sobre "
+            "un único umbral calibrado, no una garantía universal."
+        )
+    return (
+        f"Ninguna de las {n_total} variables del modelo tuvo 0% de participación en esta "
+        "corrida: por sí sola, esta señal no sugiere eliminar ninguna variable por "
+        "completo. Las variables listadas abajo (\"más cortes\") son las candidatas de "
+        "menor prioridad a revisar, no a eliminar directamente."
+    )
+
+
+def _iforest_splits_section_md(context: dict) -> str:
+    """'Which model inputs contribute least to telling outliers apart, and
+    should they be dropped' -- built from the same split-count analysis
+    behind the 'menos cortes' / 'más cortes' charts in the figures gallery."""
+    block = _iforest_splits_block(context)
+    if block is None:
+        return ""
+    parts = [
+        "## Variables que menos aportan a distinguir outliers\n",
+        f"{_iforest_splits_lead_sentence(block)}\n",
+        f"{_iforest_splits_recommendation_paragraph(block)}\n",
+    ]
+    rows = _iforest_splits_recommendation_rows(block)
+    if rows:
+        parts.append(_md_table(["Variable", "Evidencia", "Recomendación"], rows))
+    return "\n".join(parts)
+
+
 def _md_table(headers: Sequence[str], rows: list[tuple[str, ...]]) -> str:
     """Generic n-column markdown table."""
     if not rows:
@@ -442,6 +525,7 @@ def _build_markdown(context: dict, out_dir: str) -> str:
     parts.append(_diagnostic_suite_section_md(context))
     parts.append(_interpretation_section_md(context))
     parts.append(_sensitivity_section_md(context, out_dir))
+    parts.append(_iforest_splits_section_md(context))
     parts.append(event_supervision_markdown(context, out_dir))
 
     # -- figures gallery ----------------------------------------------------- #
@@ -1615,6 +1699,25 @@ def _plotly_section_html(chart_data: Optional[dict], log) -> dict:
 _INCIDENT_CHIP = {"ERROR": "serious", "CRITICAL": "serious"}
 
 
+def _iforest_splits_section_html(context: dict) -> str:
+    """HTML twin of ``_iforest_splits_section_md``."""
+    block = _iforest_splits_block(context)
+    if block is None:
+        return ""
+    lead = html.escape(_iforest_splits_lead_sentence(block))
+    para = html.escape(_iforest_splits_recommendation_paragraph(block))
+    rows = _iforest_splits_recommendation_rows(block)
+    table = _html_table(["Variable", "Evidencia", "Recomendación"], rows) if rows else ""
+    return (
+        "<h2 id='iforest-splits'>Variables que menos aportan a distinguir outliers</h2>"
+        "<div class='card'>"
+        f"<p class='lead'>{lead}</p>"
+        f"<p>{para}</p>"
+        f"{table}"
+        "</div>"
+    )
+
+
 def _row_filter_section_html(context: dict) -> str:
     """HTML twin of ``_row_filter_section_md``."""
     rows = _row_filter_rows(context)
@@ -1736,6 +1839,7 @@ def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
     charts = _plotly_section_html(context.get("chart_data"), log)
     parts.append(charts.get("results", ""))
     parts.append(charts.get("explain", ""))
+    parts.append(_iforest_splits_section_html(context))
 
     # -- IF-VAE diagnostic suite (optional, external cross-validation) -------- #
     parts.append(_diagnostic_suite_section_html(context))

@@ -58,7 +58,7 @@ class AnalystDashboardTests(unittest.TestCase):
                     "vae": {"only-vae": ["2026-09"], "both": ["2026-09"]},
                 },
                 entity_records=raw,
-                identity_column="puesto",
+                identity_columns=["puesto"],
             )
             return out.read_text(encoding="utf-8")
 
@@ -97,8 +97,8 @@ class AnalystDashboardTests(unittest.TestCase):
 
     def test_case_workflow_identity_and_reviewed_export_are_present(self):
         html = self._build()
-        self.assertIn('"identity": "Gerente"', html)
-        self.assertIn('id="mIdentity"', html)
+        self.assertIn('"identities": [{"label": "puesto", "value": "Gerente"}]', html)
+        self.assertIn('id="mIdentity_0"', html)
         self.assertIn("Sin revisión", html)
         self.assertIn("En revisión", html)
         self.assertIn("Cerrado", html)
@@ -107,6 +107,66 @@ class AnalystDashboardTests(unittest.TestCase):
         self.assertIn("exportReviewedCases()", html)
         self.assertIn("fecha_cambio_estado", html)
         self.assertIn("hora_cambio_estado", html)
+
+
+class MultipleIdentityColumnsTests(unittest.TestCase):
+    """Explicit user request: the case card must be able to show SEVERAL
+    additional fields, not only one -- each resolved to its own latest
+    non-empty value, independently of the others."""
+
+    def _build(self, identity_columns) -> str:
+        schema = PanelSchema(time_col="period", entity_col="customer_id", target_col=None)
+        vae_table = pd.DataFrame({
+            "customer_id": ["only-if"],
+            "period": ["2026-09"],
+            "anomaly_score": [8.0],
+            "percentil": ["p99"],
+            "top_5_variables": ["age"],
+        })
+        raw = pd.DataFrame({
+            "customer_id": ["only-if", "only-if", "only-if"],
+            "period": ["2026-07", "2026-08", "2026-09"],
+            "balance": [90, 100, 150],
+            # puesto's latest non-empty is the 2026-09 row ("Gerente").
+            "puesto": ["Analista", "Analista", "Gerente"],
+            # area is BLANK in that same latest row -- its own latest
+            # non-empty must still resolve independently, to the 2026-08
+            # value, never masked by puesto's own latest row being filled.
+            "area": ["Comercial", "Riesgos", ""],
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "dashboard.html"
+            build_analyst_dashboard(
+                vae_table, schema, "vae", ["2026-09"],
+                {"only-if": 50.0}, {"only-if": 98.0},
+                {"only-if": 0.2}, {"only-if": 8.0},
+                {"only-if": ["2026-09"]},
+                n_total_oot=1,
+                out_path=str(out),
+                model_tables={"vae": vae_table},
+                months_present_by_model={"vae": {"only-if": ["2026-09"]}},
+                entity_records=raw,
+                identity_columns=identity_columns,
+            )
+            return out.read_text(encoding="utf-8")
+
+    def test_each_configured_field_renders_its_own_latest_value(self):
+        html = self._build(["puesto", "area"])
+        self.assertIn(
+            '"identities": [{"label": "puesto", "value": "Gerente"}, '
+            '{"label": "area", "value": "Riesgos"}]',
+            html,
+        )
+        self.assertIn('id="mIdentity_0"', html)
+        self.assertIn('id="mIdentity_1"', html)
+        self.assertIn("<span>puesto</span>", html)
+        self.assertIn("<span>area</span>", html)
+
+    def test_an_empty_list_renders_no_identity_row_at_all(self):
+        html = self._build([])
+        self.assertIn('"identities": []', html)
+        self.assertNotIn('id="mIdentity_0"', html)
+        self.assertNotIn('<div class="midentity">', html)
 
 
 if __name__ == "__main__":

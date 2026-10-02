@@ -3043,7 +3043,7 @@ Siempre en tono de sugerencia, nunca una acción automática: el párrafo explí
 
 ---
 
-## 2026-10-01 — Reajustes de estabilidad 3→5, dashboard con varios campos adicionales, fallback tolerante a columnas ausentes
+## 2026-10-01b — Reajustes de estabilidad 3→5, dashboard con varios campos adicionales, fallback tolerante a columnas ausentes
 
 Tres pedidos del usuario en el mismo bloque: subir los reajustes de semilla de la sección de estabilidad, generalizar el campo de identidad del dashboard a una lista de varios campos, y un fallback explícito para que una columna configurada que no existe en el panel real nunca rompa la corrida.
 
@@ -3065,5 +3065,5 @@ Tres pedidos del usuario en el mismo bloque: subir los reajustes de semilla de l
 - `tests/test_config_file.py`: `test_identity_columns_default_is_no_longer_a_dead_default`, `test_analyst_identity_columns_flag_accepts_several_fields`, `test_every_identity_column_is_folded_in_not_only_the_first`, `test_disabling_identity_columns_leaves_only_the_explicit_list`, `test_an_identification_only_column_is_excluded_but_not_in_the_dashboard_list` (el escenario superconjunto, explícito).
 - `tests/test_analyst_dashboard.py`: `MultipleIdentityColumnsTests` (2 pruebas nuevas) -- dos campos renderizan sus propios valores de forma independiente (uno con un hueco en el último período), y una lista vacía no renderiza ninguna fila de identidad.
 - `tests/test_identification_columns.py`: `ExistingIdentityColumnsTests` (3 pruebas) para `_existing_identity_columns`, mutación verificada a mano.
-- `py -m pytest -q --ignore=tools` → **354 passed** (346 + 8 netas de este bloque; +5 anteriores del chequeo de dependencias quedan incluidos en los 346).
+- `py -m pytest -q --ignore=tools` → **354 passed** (346 del bloque anterior + 8 netas de este: 3 nuevas en `test_config_file.py` -- dos de las cinco listadas arriba son renombres de pruebas ya existentes, no pruebas nuevas --, 2 en `test_analyst_dashboard.py`, 3 en `test_identification_columns.py`).
 - Corrida sintética completa (`--quick`, seed 42, directorio temporal), código 0, sin errores -- el panel sintético no trae ninguno de los cuatro campos reales (`despuestocolaborador`, `despuestocolaboradoragrupado`, `numedad`, `codmatricula`), así que `config.identification_columns_present` avisa como "failed health check" (categoría `data`, severidad `warning`) -- comportamiento esperado y ya documentado, no un error: el mismo archivo de configuración está pensado para correr contra paneles que no traen todas las columnas opcionales.

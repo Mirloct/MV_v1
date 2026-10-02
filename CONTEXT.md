@@ -789,21 +789,6 @@ P95 checkpoint, stacking, or the VAE deliverable.
   blanket removal claim from this signal alone). Tests:
   `IForestSplitsRecommendationSectionTests` in `tests/test_report_incidents.py`
   (6 tests).
-- **Stability refits default raised 3 -> 5 (2026-10-01)**: explicit user
-  request. `PipelineConfig.diagnostic_stability_refits` (`main.py`), its
-  `--diagnostic-stability-refits` CLI help text, the commented example in
-  `configs/pipeline.yaml`, and `run_ifvae_diagnostic_suite`'s own parameter
-  default (`src/evaluation/ifvae_diagnostic.py`) all moved from 3 to 5. Still
-  configurable per run (`diagnostic.stability_refits` in the config file, or
-  the CLI flag); 0 still disables the section entirely (UNAVAILABLE, stated
-  reason), and 2 is still the hard minimum `top_k_stability` needs. Five
-  seeds gives 10 pairwise comparisons for the per-seed Jaccard
-  table/heatmap below instead of 3 — a more robust visual read — at the cost
-  of two more full VAE refits per run (this is the single most expensive
-  part of the diagnostic chapter; see the trade-off note on the field
-  itself). No test asserted the old default value, so none needed updating;
-  tests that exercise `stability_refits` do so with an explicit value of
-  their own regardless of the project default.
 - **Per-seed stability, visual (2026-09-28)**: `_seeded_refit_stability`
   (`src/evaluation/ifvae_diagnostic.py`) now exposes the full seed×seed
   pairwise-Jaccard matrix and each seed's mean against the rest (the
@@ -824,6 +809,21 @@ P95 checkpoint, stacking, or the VAE deliverable.
 - **Row-filter section, explicit (2026-09-28)**: the exact-zero-row filter's
   report section now leads with one prose sentence stating the count AND the
   percentage removed, not only a table cell.
+- **Stability refits default raised 3 -> 5 (2026-10-01)**: explicit user
+  request. `PipelineConfig.diagnostic_stability_refits` (`main.py`), its
+  `--diagnostic-stability-refits` CLI help text, the commented example in
+  `configs/pipeline.yaml`, and `run_ifvae_diagnostic_suite`'s own parameter
+  default (`src/evaluation/ifvae_diagnostic.py`) all moved from 3 to 5. Still
+  configurable per run (`diagnostic.stability_refits` in the config file, or
+  the CLI flag); 0 still disables the section entirely (UNAVAILABLE, stated
+  reason), and 2 is still the hard minimum `top_k_stability` needs. Five
+  seeds gives 10 pairwise comparisons for the per-seed Jaccard table/heatmap
+  above instead of 3 — a more robust visual read — at the cost of two more
+  full VAE refits per run (this is the single most expensive part of the
+  diagnostic chapter; see the trade-off note on the field itself). No test
+  asserted the old default value, so none needed updating; tests that
+  exercise `stability_refits` do so with an explicit value of their own
+  regardless of the project default.
 - Charts and the glossary are conditioned on `config.supervised`: a run that
   did not compute a supervised metric does not show it, and does not list it
   in the indicator glossary either.
@@ -945,11 +945,13 @@ download is therefore a complete entity history, not only OOT. Each case has
 exactly three operational states (`Sin revisión`, `En revisión`, `Cerrado`),
 persisted in browser storage with an ISO change timestamp. “Casos revisados”
 shows only the two non-default states and exports their ID, configured
-identity field(s) (default a single field, `puesto`), status, date and time.
+identity field(s), status, date and time (see below for how many and which
+ones).
 
 **Several identity fields, not just one (generalized 2026-10-01).** The
 identity field shown immediately below the ID in the profile was generalized
-from one hardcoded column to a LIST, `dashboard.identity_columns` in
+from one hardcoded column (default `puesto`) to a LIST,
+`dashboard.identity_columns` in
 `configs/pipeline.yaml` (`--analyst-identity-columns` on the CLI, `nargs="*"`)
 — one row per configured field, in order, explicit user request ("pueda ver
 varios campos adicionales"). Each field is folded into

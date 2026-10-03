@@ -119,18 +119,9 @@ class PipelineConfig:
     # missing or stdout is not a TTY (piped/redirected/CI), so it never
     # corrupts a captured log. See src/utils/console_ui.py.
     console_ui: bool = True
-    # Every run starts by checking that `requirements.txt`'s packages are
-    # installed at or above their stated minimum (src/utils/dependency_check.py)
-    # -- a missing/outdated library otherwise surfaces as an opaque ImportError
-    # several phases in, instead of being fixed immediately. By explicit
-    # request, a missing/outdated dependency is installed automatically, in
-    # code, via `pip` -- the run is never stopped over something this check
-    # can fix itself, so `auto_install_deps` defaults to True.
-    # `--no-auto-install-deps` switches to check-only (log the problem and the
-    # exact `pip install` command, then stop) for the rare case where
-    # mutating the active Python environment is not wanted at all.
-    # `skip_dependency_check` disables the check entirely (a pre-vetted
-    # Docker image, an air-gapped environment where pip has no index access).
+    # Startup check (src/utils/dependency_check.py): requirements.txt packages
+    # below their minimum get installed automatically via pip. `--no-auto-install-deps`
+    # switches to check-only; `skip_dependency_check` disables the check.
     skip_dependency_check: bool = False
     auto_install_deps: bool = True
     numeric_transform: str = "yeo-johnson"
@@ -178,38 +169,17 @@ class PipelineConfig:
     # one-off or a recurring case across the window, which the last-3-months
     # analyst dashboard depends on. `--n-oot-periods` overrides.
     n_oot_periods: int = 3
-    # Extra identification fields displayed directly below the entity ID in
-    # the analyst profile -- one row per field, in this order. Deliberately a
-    # LIST (not a single field) because real panels can carry several such
-    # display-only attributes (job title, grouping, ...); adding or removing
-    # one is a one-line edit to `dashboard.identity_columns` in
-    # configs/pipeline.yaml, nothing else. The business default is a single
-    # field, ``puesto``. A missing column is rendered explicitly as "No
-    # disponible" and never prevents the dashboard from being generated. If a
-    # field's value changes across periods for the same entity (e.g. a
-    # job-title change), the profile shows the value from the LATEST period
-    # that has a non-empty one for that entity, independently per field --
-    # `src.reporting.analyst_dashboard._identities_for`, tested in
-    # `test_case_workflow_identity_and_reviewed_export_are_present` (a later
-    # period's value wins over an earlier one for the same entity).
-    # NOT model features either: this is data for a human to identify the record, not a
-    # modelling signal, so every field here is folded into `identification_columns` below
-    # (automatically, by `main()`) and excluded from every phase that decides what the
-    # model sees.
+    # Fields shown below the entity ID in the analyst profile, one row each
+    # (`dashboard.identity_columns`). Not model features: folded into
+    # `identification_columns` below automatically. A missing column renders
+    # "No disponible"; a value that varies across periods shows the latest
+    # non-empty one (`analyst_dashboard._identities_for`).
     analyst_identity_columns: tuple = ("puesto",)
-    # Columns that exist in the raw panel purely to identify/describe a record for a
-    # human reader (job title, name, area, an internal reference number, ...) and carry
-    # no modelling signal: never a model feature, never checked by the exact-zero-row
-    # filter, never perturbed by the post-training sensitivity study, in EVERY run --
-    # `analyst_identity_columns` above is folded in automatically, so none of them needs
-    # to be repeated here. This list is a SUPERSET of `analyst_identity_columns`: a column
-    # named only here (not in `analyst_identity_columns`) is excluded from modelling but
-    # never shown in the dashboard card -- e.g. a segment/grouping column used elsewhere
-    # in the report (`diagnostic_segment_column`) that should stay out of training without
-    # becoming a per-case display field. `main()` copies the resolved set onto
-    # `PanelSchema.identification_columns`, the single place every one of those phases
-    # reads it from (`src.data.loader.key_columns`) -- see CONTEXT.md "Identification
-    # columns".
+    # Columns that only identify/describe a record: never a model feature, never
+    # checked by the zero-row filter or sensitivity study. Superset of
+    # `analyst_identity_columns` (folded in automatically) -- a column named only
+    # here is excluded from modelling but not shown on the dashboard card.
+    # See CONTEXT.md "Identification columns".
     identification_columns: tuple = ()
     # Headline deliverable: everyone at or above this percentile of the OOT
     # score distribution, each row graded p90/p95/p99 so the queue can be
@@ -249,18 +219,10 @@ class PipelineConfig:
     # window) is the same one `true_oot_entity_scores` already applies
     # elsewhere in this pipeline, so showing it here is not a new rule.
     diagnostic_entity_view: bool = True
-    # Independent seed refits used to measure IF and VAE alert-set stability
-    # (top-K Jaccard across refits, same metric the suite itself uses for
-    # IF -- see `src/evaluation/ifvae_diagnostic.py`). TRADE-OFF: VAE refits
-    # are full training runs, not just scoring, so each unit here costs
-    # roughly one extra VAE fit. The minimum for a meaningful pairwise
-    # Jaccard is 2 (top_k_stability needs >= 2); 5 (raised from 3 by
-    # explicit request) gives 10 pairwise comparisons instead of 3, a more
-    # robust read for the per-seed stability table/heatmap in the report
-    # (see CONTEXT.md "Per-seed stability, visual"). Set to 0 to disable
-    # (reports UNAVAILABLE with a stated reason) on a machine where this
-    # cost is not acceptable.
-    diagnostic_stability_refits: int = 5
+    # Seed refits for IF/VAE alert-set stability (top-K Jaccard). Each VAE
+    # unit is a full retrain -- real cost on large real-data runs. Minimum 2,
+    # 0 disables (reports UNAVAILABLE).
+    diagnostic_stability_refits: int = 3
     # Column in the raw panel (`df`) used for the diagnostic chapter's §8
     # per-segment breakdown (temporal/segmentación). Default `"segment"`
     # matches this project's own synthetic panel; point it at any other
@@ -768,14 +730,10 @@ def run_pipeline(config: PipelineConfig) -> dict:
     # -- Phase 1: environment / logging ------------------------------------- #
     logger = setup_logging()
     _ensure_dirs()
-    # Runs before any phase does real work, so a missing/outdated package is
-    # fixed right here (installed automatically, by default) rather than
-    # surfacing as an opaque ImportError several phases in. Checked here
-    # specifically because most third-party imports in this codebase are
-    # deferred to inside the functions that need them (not at module top), so
-    # this still runs before most of requirements.txt has actually been
-    # imported into the process -- the install applied here can still take
-    # effect for the rest of THIS run, not only the next one.
+    # Before any phase does real work: fixes a missing/outdated package here
+    # rather than an opaque ImportError later (most third-party imports in
+    # this codebase are deferred, not at module top, so a fix still applies
+    # to the rest of this run).
     if not config.skip_dependency_check:
         requirements_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "requirements.txt"
@@ -909,13 +867,9 @@ def run_pipeline(config: PipelineConfig) -> dict:
         # `src.data.loader.key_columns(schema)` instead of keeping its own column list,
         # so this is the only place identification columns need to be resolved.
         schema.identification_columns = _resolve_identification_columns(config, df, logger)
-        # Dashboard display list, trimmed to only the fields that actually exist in
-        # THIS panel. Explicit requirement: a configured dashboard field absent from
-        # the real panel must never reach `build_analyst_dashboard` -- it is silently
-        # dropped (order of the remaining fields preserved), never rendered as a
-        # permanent "No disponible" row, and never a crash. `identification_columns`
-        # (the broader ignored-but-not-necessarily-displayed list) already gets this
-        # same tolerant treatment inside `_resolve_identification_columns` itself.
+        # Trim the dashboard display list to fields that actually exist in this
+        # panel, before `build_analyst_dashboard` sees it -- an absent field is
+        # dropped silently, never a permanent "No disponible" row.
         config.analyst_identity_columns = _existing_identity_columns(
             config.analyst_identity_columns, schema.identification_columns
         )
@@ -2852,7 +2806,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "max-per-entity rule already used elsewhere in this pipeline).")
     parser.add_argument("--diagnostic-stability-refits", type=int, default=None,
                         help="Independent seed refits used to measure IF/VAE alert-set "
-                             "stability (default 5). VAE refits are full training runs -- "
+                             "stability (default 3). VAE refits are full training runs -- "
                              "this is the most expensive part of the diagnostic chapter. "
                              "Pass 0 to disable (reports UNAVAILABLE with a stated reason).")
     parser.add_argument("--diagnostic-segment-column", type=str, default=None,
@@ -3094,6 +3048,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 #: argparse dest -> the file-managed PipelineConfig attribute it sets.
 _FILE_MANAGED_DESTS = {
+    "run_diagnostic_suite": "run_diagnostic_suite",
+    "auto_install_suite": "diagnostic_auto_install_suite",
     "diagnostic_segment_column": "diagnostic_segment_column",
     "diagnostic_entity_view": "diagnostic_entity_view",
     "diagnostic_stability_refits": "diagnostic_stability_refits",

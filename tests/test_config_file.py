@@ -51,6 +51,17 @@ class TestPrecedence(Base):
         self.assertEqual(report["sources"]["diagnostic_segment_column"], "file")
         self.assertEqual(report["sources"]["diagnostic_entity_view"], "default")
 
+    def test_the_diagnostic_suite_toggles_are_file_configurable(self):
+        # Explicit user request: run_diagnostic_suite / auto_install_suite
+        # must be settable from configs/pipeline.yaml, not only the CLI.
+        path = self.write("diagnostic:\n  run_suite: false\n  auto_install_suite: false\n")
+        cfg = main.PipelineConfig()
+        report = apply_config_file(cfg, path)
+        self.assertFalse(cfg.run_diagnostic_suite)
+        self.assertFalse(cfg.diagnostic_auto_install_suite)
+        self.assertEqual(report["sources"]["run_diagnostic_suite"], "file")
+        self.assertEqual(report["sources"]["diagnostic_auto_install_suite"], "file")
+
     def test_cli_and_code_values_beat_the_file(self):
         path = self.write("diagnostic:\n  segment_column: region\n  stability_refits: 1\n")
         cfg = main.PipelineConfig(diagnostic_stability_refits=7)               # set in code
@@ -134,6 +145,16 @@ class TestCliWiring(Base):
         args = parser.parse_args(list(argv))
         args._explicit_dests = main._explicit_dests(parser, list(argv))
         return main.config_from_args(args)
+
+    def test_explicit_no_auto_install_suite_beats_the_file(self):
+        # --auto-install-suite's argparse dest ("auto_install_suite") differs
+        # from the PipelineConfig field it sets ("diagnostic_auto_install_suite")
+        # -- regression guard for that name mapping in _FILE_MANAGED_DESTS.
+        cfg = self._cfg("--no-auto-install-suite")
+        self.assertIn("diagnostic_auto_install_suite", cfg.cli_explicit)
+        apply_config_file(cfg, self.write("diagnostic:\n  auto_install_suite: true\n"),
+                          frozenset(cfg.cli_explicit))
+        self.assertFalse(cfg.diagnostic_auto_install_suite)   # the file never wins
 
     def test_only_flags_really_given_are_explicit(self):
         cfg = self._cfg()

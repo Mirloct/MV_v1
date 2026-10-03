@@ -1,19 +1,11 @@
-"""Pre-flight check that every package `requirements.txt` floors is actually
-installed at or above that floor, run once at the very start of the pipeline
-(`main.run_pipeline`) -- before any phase does real work.
+"""Pre-flight check that every `requirements.txt` package is installed at or
+above its floor, run at the start of `main.run_pipeline`.
 
-By explicit design (and explicit user request, 2026-10-02): a missing or
-outdated dependency is fixed automatically, in code, by installing it via
-`pip` -- it never stops the run with an error for a human to act on
-afterwards. `auto_install=True` is the default for exactly that reason.
-Passing `auto_install=False` switches to check-only (log the problem and the
-`pip install` command, let the caller decide) for the rare case where
-mutating the active Python environment is not wanted at all (`main.py`'s
-`--no-auto-install-deps`).
+`auto_install=True` (default) installs anything missing/outdated via `pip`
+instead of stopping the run. `auto_install=False` only logs the problem and
+the `pip install` command (`main.py`'s `--no-auto-install-deps`).
 
-Only plain ``name>=X.Y`` lines are understood (every line in this project's
-own `requirements.txt` today); anything else (a different operator, a
-comment, a blank line) is skipped rather than guessed at.
+Only plain `name>=X.Y` lines are parsed; anything else is skipped.
 """
 
 from __future__ import annotations

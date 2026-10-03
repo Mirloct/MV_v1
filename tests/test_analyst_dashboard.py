@@ -169,5 +169,28 @@ class MultipleIdentityColumnsTests(unittest.TestCase):
         self.assertNotIn('<div class="midentity">', html)
 
 
+class ResponsiveLayoutTests(unittest.TestCase):
+    """`.main`/`.col-table`/`.tablewrap` use `flex:1` (`flex-basis:0`) to
+    size against `.shell`'s fixed desktop height. Explicit user report: once
+    `.shell` drops that fixed height under `@media (max-width:980px)`,
+    `flex:1` has nothing to grow into and collapses to ~0, leaving the case
+    table invisible and unscrollable -- only the header/KPI text above it
+    stayed visible. Regression guard: the mobile breakpoint must size these
+    three by content (`flex:none`) instead of leaving them flexed against an
+    undefined ancestor height."""
+
+    def test_narrow_viewport_lets_the_table_area_size_to_content(self):
+        from src.reporting.analyst_dashboard import _CSS
+
+        media_block = re.search(
+            r"@media \(max-width:980px\)\{(.*?)\n\}", _CSS, re.S,
+        )
+        self.assertIsNotNone(media_block, "mobile breakpoint not found in _CSS")
+        block = media_block.group(1)
+        for selector in (".main", ".col-table", ".tablewrap"):
+            self.assertIn(f"{selector}{{flex:none", block,
+                          f"{selector} must not keep flex:1 once .shell's height is auto")
+
+
 if __name__ == "__main__":
     unittest.main()

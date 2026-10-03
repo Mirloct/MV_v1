@@ -200,6 +200,8 @@ def _strings(value: Any) -> tuple:
 
 #: ``"section.key"`` -> (``PipelineConfig`` attribute, coercer). Extend here only.
 CONFIG_KEYS: dict[str, tuple[str, Callable[[Any], Any]]] = {
+    "diagnostic.run_suite": ("run_diagnostic_suite", _bool),
+    "diagnostic.auto_install_suite": ("diagnostic_auto_install_suite", _bool),
     "diagnostic.segment_column": ("diagnostic_segment_column", _text),
     "diagnostic.entity_view": ("diagnostic_entity_view", _bool),
     "diagnostic.stability_refits": ("diagnostic_stability_refits", _pos_int),

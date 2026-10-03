@@ -288,11 +288,8 @@ def build_analyst_dashboard(
 
     month_label = {p: p for p in all_periods}  # ISO date is already the label
 
-    # One row per configured field, index-aligned with each profile's own
-    # "identities" list (built from the same `identity_columns`, same order)
-    # so `openProfile` can fill value `i` into label `i` without a name
-    # lookup. Empty when `identity_columns` is `()` -- the card then simply
-    # shows no identity row at all, never a crash.
+    # Index-aligned with each profile's "identities" list so `openProfile`
+    # fills value `i` into label `i` directly.
     identity_rows_html = "".join(
         f'<div class="midentity"><span>{html.escape(str(col))}</span>'
         f'<b id="mIdentity_{i}">No disponible</b></div>'
@@ -941,7 +938,12 @@ tbody td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12.5px
 .download-btn:hover{opacity:.86}.download-btn:disabled{opacity:.4;cursor:not-allowed}
 
 @media (max-width:980px){
+  /* flex:1 (basis:0) collapses to ~0 once .shell has no fixed height to
+  distribute -- flex:none sizes these by content instead so the page scrolls. */
   .shell{height:auto;max-height:none}
+  .main{flex:none;overflow:visible}
+  .col-table{flex:none;overflow:visible}
+  .tablewrap{flex:none;overflow:visible;max-height:none}
   .kpis{flex-direction:column}
   .kpi{border-left:0;border-top:1px solid var(--border)}
   .kpi:first-child{border-top:0}

@@ -1,10 +1,19 @@
 """Startup dependency check: parses requirements.txt, compares against what is
-actually installed, and -- by default -- only reports a fix, never applies one.
+actually installed, and -- by default -- installs whatever is missing or
+outdated directly, rather than stopping the run over it (explicit user
+request, 2026-10-02: never raise and cut execution, fix it in code instead).
 
 Data sources / inputs: temporary requirements.txt fixtures, a stub logger, and
 mocked `importlib.metadata`/`subprocess` calls (no real package is ever
 installed or queried from the live environment).
 Created: 2026-10-01
+Last modified: 2026-10-02
+Changelog:
+- 2026-10-02: `auto_install` default flipped to `True`. Every test that only
+  wants to exercise the detection logic now passes `auto_install=False`
+  explicitly, instead of relying on the old default -- otherwise, a test
+  with an unmocked `subprocess` would try to actually run `pip install` for
+  a fake package during the suite.
 """
 from __future__ import annotations
 
@@ -107,25 +116,54 @@ class CheckDependenciesTests(Base):
             self.assertTrue(check_dependencies(path, logger=self.log))
         self.assertNotIn("pip install", self.log.text())
 
-    def test_a_missing_package_fails_and_names_the_fix(self):
+    def test_a_missing_package_with_auto_install_off_fails_and_names_the_fix(self):
         path = self.write_requirements("torch>=2.2\n")
 
         with mock.patch(
             "src.utils.dependency_check.metadata.version",
             side_effect=metadata.PackageNotFoundError("torch"),
         ):
-            self.assertFalse(check_dependencies(path, logger=self.log))
+            self.assertFalse(check_dependencies(path, logger=self.log, auto_install=False))
         self.assertIn("no instalado", self.log.text())
         self.assertIn("pip install --upgrade", self.log.text())
         self.assertIn('"torch>=2.2"', self.log.text())
 
-    def test_an_outdated_package_fails_and_states_the_installed_version(self):
+    def test_an_outdated_package_with_auto_install_off_states_the_installed_version(self):
         path = self.write_requirements("numpy>=1.26\n")
         with mock.patch(
             "src.utils.dependency_check.metadata.version", return_value="1.20.0",
         ):
-            self.assertFalse(check_dependencies(path, logger=self.log))
+            self.assertFalse(check_dependencies(path, logger=self.log, auto_install=False))
         self.assertIn("instalado 1.20.0", self.log.text())
+
+    def test_auto_install_defaults_to_true_without_passing_it_explicitly(self):
+        # Explicit user request: a missing/outdated dependency is fixed in
+        # code by default, never left for a human to run a command -- so
+        # OMITTING `auto_install` must behave exactly like passing `True`.
+        # version() is called twice: once for the initial check (outdated),
+        # once for the post-install re-check (now satisfied).
+        path = self.write_requirements("numpy>=1.26\n")
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch(
+            "src.utils.dependency_check.metadata.version",
+            side_effect=["1.20.0", "1.26.0"],
+        ), mock.patch("subprocess.run", return_value=completed) as run:
+            self.assertTrue(check_dependencies(path, logger=self.log))
+            run.assert_called_once()
+
+    def test_pip_exit_zero_but_version_still_short_is_caught(self):
+        # pip returning 0 does not guarantee the floor is actually met (a
+        # conflicting pin elsewhere in the environment could win) -- the
+        # post-install re-check must catch that instead of trusting the exit
+        # code alone.
+        path = self.write_requirements("numpy>=1.26\n")
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch(
+            "src.utils.dependency_check.metadata.version", return_value="1.20.0",
+        ), mock.patch("subprocess.run", return_value=completed):
+            self.assertFalse(check_dependencies(path, logger=self.log, auto_install=True))
+        self.assertIn("pip terminó sin error pero", self.log.text())
+        self.assertIn("1.20.0", self.log.text())
 
     def test_a_newer_than_required_version_passes(self):
         path = self.write_requirements("numpy>=1.26\n")
@@ -146,7 +184,8 @@ class CheckDependenciesTests(Base):
         path = self.write_requirements("numpy>=1.26\n")
         completed = mock.Mock(returncode=0, stdout="", stderr="")
         with mock.patch(
-            "src.utils.dependency_check.metadata.version", return_value="1.20.0",
+            "src.utils.dependency_check.metadata.version",
+            side_effect=["1.20.0", "1.26.0"],
         ), mock.patch("subprocess.run", return_value=completed) as run:
             self.assertTrue(
                 check_dependencies(path, logger=self.log, auto_install=True)

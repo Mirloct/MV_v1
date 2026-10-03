@@ -104,22 +104,27 @@ layout was dropped — keep filenames unique when adding a figure.
 - tqdm, joblib, rich, psutil (progress, parallelism/persistence, console dashboard)
 - pyyaml (config files)
 
-**Startup dependency check (2026-10-01).** `run_pipeline` (`main.py`) calls
+**Startup dependency check (2026-10-01, installs automatically by default
+since 2026-10-02).** `run_pipeline` (`main.py`) calls
 `src.utils.dependency_check.check_dependencies` right after `_ensure_dirs()`,
 before any phase does real work: parses `requirements.txt` (plain
 `name>=X.Y` lines only), compares against what is actually installed via
-`importlib.metadata.version`, and on a missing/outdated package logs the
-exact `pip install --upgrade` command that fixes everything at once, then
-stops the run (`SystemExit`) -- never an opaque `ImportError` several phases
-in. Never installs anything by default (upgrading a third-party package in
-the caller's environment has real blast radius beyond this run);
-`--auto-install-deps` (default OFF) opts into actually running `pip`.
-`--skip-dependency-check` (default OFF) disables the check entirely for a
-pre-vetted environment. Runs this early specifically because most
-third-party imports in this codebase are deferred to inside the functions
-that need them, not at module top, so a fix applied here can still take
-effect for the rest of THIS run. Tests: `tests/test_dependency_check.py`
-(12 tests) plus one CLI-wiring test in `test_config_file.py`.
+`importlib.metadata.version`, and on a missing/outdated package installs it
+directly via `pip install --upgrade` (`auto_install=True` is the default --
+explicit user request: never raise and stop the run over something this
+check can fix itself). After `pip` reports success, it re-checks
+`importlib.metadata.version` rather than trusting the exit code alone (a
+conflicting pin elsewhere in the environment could make the resolver land on
+a version that still does not satisfy the floor). `--no-auto-install-deps`
+switches to check-only -- log the problem and the exact `pip install`
+command, then stop (`SystemExit`) -- for the rare case where mutating the
+active Python environment is not wanted at all. `--skip-dependency-check`
+(default OFF) disables the check entirely for a pre-vetted environment.
+Runs this early specifically because most third-party imports in this
+codebase are deferred to inside the functions that need them, not at module
+top, so a fix applied here can still take effect for the rest of THIS run.
+Tests: `tests/test_dependency_check.py` (14 tests) plus one CLI-wiring test
+in `test_config_file.py`.
 
 ## Data contract
 

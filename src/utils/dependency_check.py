@@ -1,15 +1,15 @@
 """Pre-flight check that every package `requirements.txt` floors is actually
 installed at or above that floor, run once at the very start of the pipeline
-(`main.run_pipeline`) -- before any phase does real work -- so a missing or
-outdated library fails fast with the exact fix, not an opaque ``ImportError``
-several phases in.
+(`main.run_pipeline`) -- before any phase does real work.
 
-Deliberately read-only by default: upgrading a third-party package in the
-caller's Python environment is a side effect with real blast radius (it can
-affect other projects sharing the same interpreter), so this only ever
-prints/logs the `pip install` command that would fix every problem at once
-and lets the caller decide -- ``auto_install=True`` (wired to
-``--auto-install-deps``) is an explicit opt-in to actually run it.
+By explicit design (and explicit user request, 2026-10-02): a missing or
+outdated dependency is fixed automatically, in code, by installing it via
+`pip` -- it never stops the run with an error for a human to act on
+afterwards. `auto_install=True` is the default for exactly that reason.
+Passing `auto_install=False` switches to check-only (log the problem and the
+`pip install` command, let the caller decide) for the rare case where
+mutating the active Python environment is not wanted at all (`main.py`'s
+`--no-auto-install-deps`).
 
 Only plain ``name>=X.Y`` lines are understood (every line in this project's
 own `requirements.txt` today); anything else (a different operator, a
@@ -59,6 +59,19 @@ def _version_tuple(version: str) -> tuple:
     return tuple(int(p) for p in m.group(0).split(".")) if m else (0,)
 
 
+def _find_issues(requirements: list) -> list:
+    issues: list[DependencyIssue] = []
+    for name, required in requirements:
+        try:
+            installed = metadata.version(name)
+        except metadata.PackageNotFoundError:
+            issues.append(DependencyIssue(name, required, None))
+            continue
+        if _version_tuple(installed) < _version_tuple(required):
+            issues.append(DependencyIssue(name, required, installed))
+    return issues
+
+
 def _pip_install_command(issues: list) -> str:
     pins = " ".join(f'"{i.name}>={i.required}"' for i in issues)
     return f'"{sys.executable}" -m pip install --upgrade {pins}'
@@ -68,15 +81,15 @@ def check_dependencies(
     requirements_path: str,
     *,
     logger=None,
-    auto_install: bool = False,
+    auto_install: bool = True,
 ) -> bool:
-    """``True`` when every package in ``requirements_path`` is installed at or
-    above its floor version.
+    """``True`` when every package in ``requirements_path`` ends up installed
+    at or above its floor version.
 
-    Logs every problem found plus the single ``pip install`` command that
-    fixes all of them at once. With ``auto_install=True`` it also runs that
-    command (see the module docstring for why that is opt-in, never the
-    default) and returns whether the install succeeded.
+    With ``auto_install=True`` (the default), a missing/outdated package is
+    installed directly via ``pip`` -- the run is never stopped over something
+    this function can fix itself. ``auto_install=False`` only logs the
+    problem and the exact ``pip install`` command, leaving it to the caller.
 
     A missing ``requirements_path`` only warns and returns ``True`` -- an
     unusual deployment without the manifest is not this check's problem to
@@ -90,15 +103,7 @@ def check_dependencies(
         return True
 
     requirements = _parse_requirements(requirements_path)
-    issues: list[DependencyIssue] = []
-    for name, required in requirements:
-        try:
-            installed = metadata.version(name)
-        except metadata.PackageNotFoundError:
-            issues.append(DependencyIssue(name, required, None))
-            continue
-        if _version_tuple(installed) < _version_tuple(required):
-            issues.append(DependencyIssue(name, required, installed))
+    issues = _find_issues(requirements)
 
     if not issues:
         log.info(
@@ -113,20 +118,19 @@ def check_dependencies(
             "no instalado" if issue.installed is None
             else f"instalado {issue.installed}"
         )
-        log.error(
+        log.warning(
             "Dependencia insuficiente: %s requiere >= %s (%s).",
             issue.name, issue.required, state,
         )
     command = _pip_install_command(issues)
-    log.error("Instala las dependencias faltantes con:\n    %s", command)
 
     if not auto_install:
+        log.error("Instala las dependencias faltantes con:\n    %s", command)
         return False
 
     log.warning(
-        "--auto-install-deps: instalando automáticamente %d paquete(s) en "
-        "%s (esto modifica el entorno Python activo).",
-        len(issues), sys.executable,
+        "Instalando automáticamente %d dependencia(s) en %s:\n    %s",
+        len(issues), sys.executable, command,
     )
     import subprocess
 
@@ -137,15 +141,36 @@ def check_dependencies(
             capture_output=True, text=True, timeout=1800,
         )
     except Exception as exc:  # noqa: BLE001 - a failed install must not raise here
-        log.error("No se pudo ejecutar pip: %s", exc)
+        log.error(
+            "No se pudo ejecutar pip (%s). Instala manualmente con:\n    %s",
+            exc, command,
+        )
         return False
     if completed.returncode != 0:
         tail = (completed.stderr or completed.stdout or "").strip().splitlines()
         log.error(
-            "pip devolvió código %d al instalar dependencias: %s",
-            completed.returncode, " | ".join(tail[-5:]),
+            "pip devolvió código %d al instalar dependencias (%s). Instala "
+            "manualmente con:\n    %s",
+            completed.returncode, " | ".join(tail[-5:]), command,
         )
         return False
+
+    # A 0 exit code from pip does not guarantee the resolver landed on a
+    # version that actually satisfies our floor (a conflicting pin elsewhere
+    # in the environment could win) -- trust the installed metadata after the
+    # fact, not the exit code alone.
+    still_bad = _find_issues([(i.name, i.required) for i in issues])
+    if still_bad:
+        log.error(
+            "pip terminó sin error pero %d paquete(s) siguen sin satisfacer su "
+            "mínimo tras instalar (%s). Instala manualmente con:\n    %s",
+            len(still_bad),
+            ", ".join(f"{i.name} (queda {i.installed or 'no instalado'})"
+                      for i in still_bad),
+            command,
+        )
+        return False
+
     log.info("Dependencias instaladas correctamente: %s",
               ", ".join(f"{i.name}>={i.required}" for i in issues))
     return True

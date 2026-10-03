@@ -122,17 +122,17 @@ class PipelineConfig:
     # Every run starts by checking that `requirements.txt`'s packages are
     # installed at or above their stated minimum (src/utils/dependency_check.py)
     # -- a missing/outdated library otherwise surfaces as an opaque ImportError
-    # several phases in, instead of failing immediately with the exact fix.
+    # several phases in, instead of being fixed immediately. By explicit
+    # request, a missing/outdated dependency is installed automatically, in
+    # code, via `pip` -- the run is never stopped over something this check
+    # can fix itself, so `auto_install_deps` defaults to True.
+    # `--no-auto-install-deps` switches to check-only (log the problem and the
+    # exact `pip install` command, then stop) for the rare case where
+    # mutating the active Python environment is not wanted at all.
     # `skip_dependency_check` disables the check entirely (a pre-vetted
     # Docker image, an air-gapped environment where pip has no index access).
-    # `auto_install_deps` is the opposite direction: by default the check only
-    # PRINTS the `pip install` command and stops, never installing anything on
-    # its own -- upgrading third-party packages in the caller's Python
-    # environment is a side effect with real blast radius (it can affect other
-    # projects sharing the same interpreter), so running it is an explicit
-    # opt-in, not a default.
     skip_dependency_check: bool = False
-    auto_install_deps: bool = False
+    auto_install_deps: bool = True
     numeric_transform: str = "yeo-johnson"
     categorical_encoding: str = "onehot"
     # Categories below this fraction of rows collapse into one "infrequent"
@@ -768,14 +768,14 @@ def run_pipeline(config: PipelineConfig) -> dict:
     # -- Phase 1: environment / logging ------------------------------------- #
     logger = setup_logging()
     _ensure_dirs()
-    # Fails fast, before any phase does real work, rather than letting a
-    # missing/outdated package surface as an opaque ImportError several phases
-    # in. Checked here specifically because most third-party imports in this
-    # codebase are deferred to inside the functions that need them (not at
-    # module top), so this still runs before most of requirements.txt has
-    # actually been imported into the process -- an `--auto-install-deps` fix
-    # applied here can still take effect for the rest of THIS run, not only
-    # the next one.
+    # Runs before any phase does real work, so a missing/outdated package is
+    # fixed right here (installed automatically, by default) rather than
+    # surfacing as an opaque ImportError several phases in. Checked here
+    # specifically because most third-party imports in this codebase are
+    # deferred to inside the functions that need them (not at module top), so
+    # this still runs before most of requirements.txt has actually been
+    # imported into the process -- the install applied here can still take
+    # effect for the rest of THIS run, not only the next one.
     if not config.skip_dependency_check:
         requirements_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "requirements.txt"
@@ -784,9 +784,9 @@ def run_pipeline(config: PipelineConfig) -> dict:
             requirements_path, logger=logger, auto_install=config.auto_install_deps,
         ):
             raise SystemExit(
-                "Dependencias insuficientes para ejecutar el pipeline -- revisa "
-                "execution.log para el comando `pip install` exacto, o vuelve a "
-                "correr con --auto-install-deps para instalarlas automáticamente."
+                "No se pudieron asegurar las dependencias del pipeline -- revisa "
+                "execution.log para el detalle (pip falló o --no-auto-install-deps "
+                "está activo) y el comando `pip install` exacto para resolverlo a mano."
             )
     # Mirrors ERROR/CRITICAL records for the report's "Qué no se ejecutó o
     # falló" section. Warnings stay out of the report by operator request;
@@ -2878,12 +2878,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "runs). Use on a pre-vetted environment (a pinned Docker image, "
                              "an air-gapped machine without pip index access) where the check "
                              "itself is unnecessary or cannot succeed.")
-    parser.add_argument("--auto-install-deps", action="store_true", default=False,
+    parser.add_argument("--auto-install-deps", action=argparse.BooleanOptionalAction,
+                        default=True,
                         help="If the dependency check above finds a missing or outdated "
                              "package, install it automatically (`pip install --upgrade`) "
-                             "instead of stopping with the command printed to "
-                             "execution.log (default: OFF). This modifies the active Python "
-                             "environment -- opt in explicitly if that is what you want here.")
+                             "(default ON -- a missing/outdated dependency is fixed directly "
+                             "instead of stopping the run). --no-auto-install-deps switches to "
+                             "check-only: log the problem and the exact `pip install` command, "
+                             "then stop, without modifying the active Python environment.")
     parser.add_argument("--diagnostic-experiment-contamination-grid", type=float, nargs="*",
                         default=None, metavar="C",
                         help="Isolation Forest operating points (top-c%% of the score) compared "

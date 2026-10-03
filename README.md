@@ -479,7 +479,7 @@ python main.py --config otra.yaml                # otro archivo de configuració
 python main.py --diagnostic-experiment-capacity-grid 4 8 16  # refits VAE opt-in
 python main.py --no-auto-install-suite  # valida ifvae_diag, pero no lo instala
 python main.py --analyst-identity-columns puesto area  # uno o más campos bajo el ID
-python main.py --auto-install-deps  # si falta una dependencia de requirements.txt, instálala
+python main.py --no-auto-install-deps  # si falta una dependencia, solo avisa y detiene (default: la instala)
 python main.py --skip-dependency-check  # omite el chequeo de dependencias (entorno ya validado)
 python main.py --sensitivity-high-zero-cutoff 0.90  # regla de registros casi vacíos
 python main.py --no-run-sensitivity-analysis  # omite la Fase 9d post-entrenamiento

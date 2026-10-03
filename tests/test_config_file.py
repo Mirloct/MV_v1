@@ -169,16 +169,17 @@ class TestCliWiring(Base):
                           frozenset(cfg.cli_explicit))
         self.assertEqual(cfg.identification_columns, ("puesto", "area"))   # the file never wins
 
-    def test_dependency_check_flags_default_off_and_wire_through(self):
-        # Both default OFF: the check always runs (skip=False) and never
-        # mutates the environment on its own (auto_install=False) unless the
-        # operator opts in explicitly on the command line.
+    def test_dependency_check_flags_default_to_checking_and_auto_installing(self):
+        # The check always runs by default (skip=False) and fixes a
+        # missing/outdated dependency directly (auto_install=True) rather
+        # than stopping the run over it -- explicit user request. Both can be
+        # reversed from the command line.
         cfg = self._cfg()
         self.assertFalse(cfg.skip_dependency_check)
-        self.assertFalse(cfg.auto_install_deps)
-        cfg = self._cfg("--skip-dependency-check", "--auto-install-deps")
-        self.assertTrue(cfg.skip_dependency_check)
         self.assertTrue(cfg.auto_install_deps)
+        cfg = self._cfg("--skip-dependency-check", "--no-auto-install-deps")
+        self.assertTrue(cfg.skip_dependency_check)
+        self.assertFalse(cfg.auto_install_deps)
 
 
 class TestIdentificationColumnsFile(Base):

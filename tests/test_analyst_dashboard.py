@@ -191,6 +191,20 @@ class ResponsiveLayoutTests(unittest.TestCase):
             self.assertIn(f"{selector}{{flex:none", block,
                           f"{selector} must not keep flex:1 once .shell's height is auto")
 
+    def test_the_wide_table_keeps_its_own_horizontal_scrollbar(self):
+        # Regression: a first fix set .tablewrap to plain `overflow:visible`,
+        # which also killed its horizontal scroll -- #priorityTable has
+        # min-width:980px (wider than any viewport this breakpoint applies
+        # to), so without overflow-x:auto that overflow bleeds up into
+        # .shell's overflow:hidden (unchanged, desktop-only concern) and the
+        # right-hand columns become unreachable with no scrollbar anywhere.
+        from src.reporting.analyst_dashboard import _CSS
+
+        media_block = re.search(r"@media \(max-width:980px\)\{(.*?)\n\}", _CSS, re.S)
+        block = media_block.group(1)
+        self.assertIn(".tablewrap{flex:none;overflow-x:auto", block)
+        self.assertNotIn(".tablewrap{flex:none;overflow:visible", block)
+
 
 if __name__ == "__main__":
     unittest.main()

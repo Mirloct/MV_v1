@@ -51,11 +51,16 @@ CONTRACT_VERSION = "1.0.0"
 #: `basis`/`note` fields the sections below emit.
 METHODOLOGY_NOTES = {
     "latent-active-fraction": (
-        "Un tercio de las dimensiones latentes activas (criterio de Burda, "
-        "Grosse y Salakhutdinov, IWAE, ICLR 2016) es el mismo umbral que ya "
-        "usa el chequeo de colapso posterior de este proyecto "
-        "(`src.models.vae.collapse_verdict`) -- se reutiliza aquí, no se "
-        "inventa uno nuevo."
+        "La prueba de 'dimensión activa' en sí (A_j = Var_x(E_q[z_j|x]) > "
+        "0.01) es de Burda, Grosse y Salakhutdinov (IWAE, ICLR 2016). El "
+        "corte de un tercio de dimensiones activas para declarar colapso NO "
+        "es de ese paper -- los autores reportan conteos de unidades activas "
+        "sin fijar una línea de aprobado/reprobado, porque la fracción "
+        "aceptable depende de la tarea. Es una convención de este proyecto "
+        "(documentada como tal en `src.models.vae._COLLAPSE_ACTIVE_FRACTION`), "
+        "reutilizada aquí sin inventar un segundo umbral -- el mismo chequeo "
+        "de colapso posterior (`collapse_verdict`) que ya usa el resto del "
+        "pipeline."
     ),
     "drift-fdr": (
         "El desplazamiento poblacional se marca con corrección "
@@ -67,14 +72,18 @@ METHODOLOGY_NOTES = {
     ),
     "stability-no-universal-cutoff": (
         "No se fija un umbral universal de 'estable' para el Jaccard "
-        "multisemilla. La evidencia (Studying the Stability of "
-        "Representation Learning, arXiv:2402.11404, 2024) muestra que los "
-        "espacios/rankings de modelos tipo autoencoder son, en la práctica, "
-        "considerablemente menos estables entre semillas que los ensambles "
-        "de árboles -- un Jaccard bajo en el VAE frente al IF es un patrón "
-        "ya documentado en la literatura, no necesariamente un defecto de "
-        "esta corrida. Solo se marca el caso degenerado (solapamiento casi "
-        "nulo, < 0.05), no un rango intermedio arbitrario."
+        "multisemilla. La evidencia (Mabadeje & Pyrcz, 'Evaluating the "
+        "Stability of Deep Learning Latent Feature Spaces', arXiv:2402.11404, "
+        "2024 -- 500 realizaciones de autoencoder, usando disimilitud de "
+        "Jaccard como una de sus métricas) documenta inestabilidad inherente "
+        "en los espacios latentes de modelos tipo autoencoder entre "
+        "corridas/realizaciones de entrenamiento. Esa fuente no compara "
+        "directamente contra ensambles de árboles; que el VAE de este "
+        "proyecto muestre un Jaccard más bajo que el Isolation Forest es una "
+        "observación propia de esta corrida, consistente con esa "
+        "inestabilidad ya documentada en autoencoders, no una medición "
+        "comparativa tomada de ese paper. Solo se marca el caso degenerado "
+        "(solapamiento casi nulo, < 0.05), no un rango intermedio arbitrario."
     ),
     "min-sample-note": (
         "Los estadísticos de rango (Spearman) y de conjuntos (Jaccard) sobre "

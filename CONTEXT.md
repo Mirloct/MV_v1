@@ -1095,9 +1095,12 @@ report chapters — a reconciliation of "no interpretation in the ficha" with
   public attributes, and scored with the suite's own `top_k_stability`. VAE
   refits are full training runs — the single most expensive part of Phase 9c.
   **No universal "stable ≥ X" Jaccard cutoff is asserted**: published evidence
-  (arXiv:2402.11404) shows autoencoder embeddings are routinely far less stable
-  than tree ensembles, so only the degenerate case (mean Jaccard < 0.05) is
-  flagged and everything else is reported numerically, comparatively.
+  (Mabadeje & Pyrcz, arXiv:2402.11404, 2024) documents inherent instability in
+  autoencoder latent spaces across training realizations -- it does not
+  compare against tree ensembles directly, so a lower VAE-vs-IF Jaccard in
+  this project's own runs is an observation consistent with that instability,
+  not a finding taken from the paper. Only the degenerate case (mean Jaccard
+  < 0.05) is flagged; everything else is reported numerically, comparatively.
 - *Sensitivity grid* `(0.90, 0.95, 0.99)` and *entity view* — ON by default.
 - *Segmentation* — `--diagnostic-segment-column` (default `segment`; `""`
   disables). A configured column absent from the panel logs a warning and makes

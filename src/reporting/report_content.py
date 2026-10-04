@@ -51,8 +51,12 @@ SERIES_COLORS = {
 #: metric key -> ("qué es", "cómo leer este número")
 METRIC_GLOSSARY: dict[str, tuple[str, str]] = {
     "roc_auc": (
-        "Probabilidad de que una anomalía real elegida al azar quede "
-        "clasificada por encima de una fila normal elegida al azar.",
+        "En palabras simples: toma al azar un caso que SÍ es una anomalía real y "
+        "uno que NO lo es, y pregúntale al modelo cuál de los dos le parece más "
+        "sospechoso. El ROC-AUC es la probabilidad de que el modelo elija "
+        "correctamente al caso anómalo. En términos técnicos, es la probabilidad "
+        "de que una anomalía real elegida al azar quede clasificada por encima "
+        "de una fila normal elegida al azar.",
         "0.5 = azar puro, 1.0 = clasificación perfecta. En un panel muy "
         "desbalanceado, el ROC-AUC resulta engañosamente alto: la enorme "
         "mayoría de filas normales lo domina, por lo que un valor cercano a "
@@ -60,16 +64,25 @@ METRIC_GLOSSARY: dict[str, tuple[str, str]] = {
         "junto al PR-AUC, nunca de forma aislada.",
     ),
     "pr_auc": (
-        "Área bajo la curva de precisión-recall (precisión promedio).",
-        "El indicador honesto para eventos raros. Su línea base es la "
-        "propia tasa de anomalías (~2%), no 0.5 -- por lo que un PR-AUC de "
-        "0.14 frente a una tasa base del 2% es aproximadamente 7 veces "
-        "mejor que el azar, aunque el número parezca pequeño. Compárese con "
-        "la tasa base mostrada en las tarjetas del dataset, no con 1.0.",
+        "En palabras simples: mide qué tan bien el modelo encuentra las pocas "
+        "anomalías reales que existen sin, en el intento, inundar la lista de "
+        "alertas con casos normales. Es el indicador más honesto cuando lo que "
+        "se busca es raro (pocas anomalías entre muchos casos normales). En "
+        "términos técnicos, es el área bajo la curva de precisión-recall "
+        "(precisión promedio).",
+        "Su línea base es la propia tasa de anomalías (~2%), no 0.5 -- por lo "
+        "que un PR-AUC de 0.14 frente a una tasa base del 2% es "
+        "aproximadamente 7 veces mejor que el azar, aunque el número parezca "
+        "pequeño. Compárese con la tasa base mostrada en las tarjetas del "
+        "dataset, no con 1.0.",
     ),
     "best_f1": (
-        "Mejor media armónica alcanzable entre precisión y recall, sobre "
-        "todos los umbrales posibles.",
+        "En palabras simples: es el mejor balance posible entre dos cosas que "
+        "compiten entre sí -- \"de las alertas que lancé, cuántas eran reales\" "
+        "y \"de las anomalías reales que había, cuántas atrapé\" -- probando "
+        "todos los puntos de corte posibles y quedándose con el mejor. En "
+        "términos técnicos, es la mejor media armónica alcanzable entre "
+        "precisión y recall, sobre todos los umbrales posibles.",
         "Un techo optimista: se elige con retrospectiva sobre las mismas "
         "filas que se están evaluando, por lo que el umbral realmente "
         "desplegado rendirá peor. Útil como cota superior de lo que esta "
@@ -77,76 +90,104 @@ METRIC_GLOSSARY: dict[str, tuple[str, str]] = {
         "esperado.",
     ),
     "mcc": (
-        "Coeficiente de correlación de Matthews entre las etiquetas "
-        "predichas y las reales.",
+        "En palabras simples: un único número que resume qué tan bien el "
+        "modelo distingue anomalías de casos normales, tomando en cuenta los "
+        "cuatro resultados posibles (acertar en ambos sentidos y fallar en "
+        "ambos sentidos), no solo los aciertos. En términos técnicos, es el "
+        "coeficiente de correlación de Matthews entre las etiquetas predichas "
+        "y las reales.",
         "De -1 a +1, donde 0 es azar. A diferencia del F1, considera las "
         "cuatro celdas de la matriz de confusión, por lo que no favorece "
         "artificialmente a un modelo que simplemente marca muy pocas "
         "filas.",
     ),
     "precision_at_10pct": (
-        "Del 10% de filas con mayor puntaje, la fracción que son realmente "
-        "anómalas.",
+        "En palabras simples: si un analista revisa el 10% de los casos con "
+        "mayor puntaje de sospecha, ¿cuántos de esos resultan de verdad ser "
+        "anomalías? En términos técnicos, es la fracción de filas realmente "
+        "anómalas dentro del 10% con mayor puntaje.",
         "Es la tasa de acierto del analista: de cada 10 casos en la cola de "
         "revisión, cuántos son reales. Directamente comparable con la tasa "
         "base de anomalías -- estar por encima de ella significa que el "
         "modelo aporta valor frente a revisar al azar.",
     ),
     "recall_at_10pct": (
-        "De todas las anomalías reales, la fracción capturada dentro del "
-        "10% superior de puntajes.",
+        "En palabras simples: de TODAS las anomalías reales que existen en los "
+        "datos, ¿qué porción aparece en esa misma lista del 10% con mayor "
+        "puntaje? En términos técnicos, es la fracción de anomalías reales "
+        "capturada dentro del 10% superior de puntajes.",
         "Cobertura de la cola de revisión. 0.60 significa que seis de cada "
         "diez anomalías reales serían vistas por un analista que revisa el "
         "decil superior; las otras cuatro se pierden por completo con ese "
         "presupuesto.",
     ),
     "lift_at_10pct": (
-        "Cuántas veces mejor que el azar es el 10% superior de puntajes.",
+        "En palabras simples: ¿cuántas veces más anomalías encuentra un "
+        "analista revisando la lista priorizada por el modelo, comparado con "
+        "revisar la misma cantidad de casos elegidos al azar? En términos "
+        "técnicos, es cuántas veces mejor que el azar es el 10% superior de "
+        "puntajes.",
         "Lift 3.0 = el decil superior contiene tres veces la densidad de "
         "anomalías del panel completo. Es la métrica que responde más "
         "directamente '¿vale la pena clasificar frente a revisar casos al "
         "azar?' -- 1.0 significa que no se agrega valor.",
     ),
     "silhouette": (
-        "Qué tan limpiamente se separan las filas marcadas del resto en el "
-        "espacio de features.",
+        "En palabras simples: ¿qué tan separado se ve el grupo de casos "
+        "marcados del resto, fijándose solo en la forma/distancia de los "
+        "datos -- sin usar ninguna etiqueta de verdad, porque aquí no hay "
+        "ninguna? En términos técnicos, mide qué tan limpiamente se separan "
+        "las filas marcadas del resto en el espacio de features.",
         "Proxy sin etiquetas, de -1 a +1. Mide separación geométrica, NO "
         "corrección: un modelo puede aislar un clúster compacto y bien "
         "separado de las filas equivocadas. Es evidencia de estructura, "
         "nunca evidencia de exactitud.",
     ),
     "calinski_harabasz": (
-        "Razón entre la dispersión entre grupos y la dispersión dentro de "
-        "los grupos para la partición marcada.",
+        "En palabras simples: otra forma de medir si el grupo marcado se ve "
+        "distinto del resto, comparando qué tan apartados están los grupos "
+        "entre sí frente a qué tan compacto es cada uno por dentro. En "
+        "términos técnicos, es la razón entre la dispersión entre grupos y la "
+        "dispersión dentro de los grupos para la partición marcada.",
         "No acotado y dependiente de la escala -- más alto es mejor, pero "
         "solo es comparable entre corridas sobre los mismos datos y el "
         "mismo conjunto de features. No debe leerse como una puntuación de "
         "calidad en términos absolutos.",
     ),
     "rank_stability": (
-        "Coincidencia entre las filas mejor clasificadas bajo distintas "
+        "En palabras simples: si se repitiera el entrenamiento cambiando solo "
+        "la semilla aleatoria, ¿saldría básicamente la misma lista de casos "
+        "sospechosos, o cambiaría mucho? En términos técnicos, mide la "
+        "coincidencia entre las filas mejor clasificadas bajo distintas "
         "semillas aleatorias.",
         "Cercano a 1.0 significa que la cola de alertas es reproducible y "
         "no un artefacto de un único sorteo aleatorio. Es una verificación "
         "de confiabilidad del modelo, no una medida de si acierta.",
     ),
     "n_flagged": (
-        "Cantidad de filas por encima del umbral de alerta calibrado.",
+        "En palabras simples: cuántos casos, en total, terminaron generando "
+        "una alerta en esta corrida. En términos técnicos, es la cantidad de "
+        "filas por encima del umbral de alerta calibrado.",
         "Volumen operativo, no calidad: indica cuánto trabajo genera la "
         "cola de revisión, y debe leerse contra la capacidad de revisión "
         "disponible.",
     ),
     "threshold_value": (
-        "El punto de corte de puntaje calibrado por encima del cual una "
-        "fila genera una alerta.",
+        "En palabras simples: el puntaje de sospecha a partir del cual un "
+        "caso se considera lo bastante anómalo como para generar una alerta. "
+        "En términos técnicos, es el punto de corte de puntaje calibrado por "
+        "encima del cual una fila genera una alerta.",
         "Ajustado únicamente sobre el bloque de validación (nunca sobre "
         "test), de modo que aplicarlo a test mide lo que realmente haría el "
         "despliegue. Ver la sección de verificaciones estadísticas para el "
         "método de estimación.",
     ),
     "test_alert_rate": (
-        "Fracción de filas fuera de tiempo (OOT) que el umbral calibrado "
-        "marca.",
+        "En palabras simples: de los casos del período más reciente (fuera "
+        "de tiempo, nunca usado para entrenar ni calibrar), qué porcentaje "
+        "terminó generando una alerta con el umbral ya fijado. En términos "
+        "técnicos, es la fracción de filas fuera de tiempo (OOT) que el "
+        "umbral calibrado marca.",
         "Debería situarse cerca de la tasa de falsas alarmas objetivo para "
         "la que se calibró el umbral. Una brecha grande indica que la "
         "distribución del puntaje cambió entre validación y test -- una "
@@ -278,7 +319,10 @@ FIGURE_NOTES: dict[str, str] = {
 STATISTICAL_CHECKS: list[tuple[str, str, str, str]] = [
     (
         "División cronológica (fuera de tiempo)",
-        "Los bloques de entrenamiento, validación y test se cortan "
+        "En palabras simples: el modelo aprende con el pasado y se evalúa "
+        "con el futuro, nunca al revés -- igual que en la vida real, donde "
+        "no se puede usar el futuro para predecirlo. En términos técnicos, "
+        "los bloques de entrenamiento, validación y test se cortan "
         "estrictamente por período, nunca al azar: el modelo se ajusta con "
         "meses anteriores y se evalúa sobre meses posteriores.",
         "Una división aleatoria permite seleccionar el modelo usando filas "
@@ -292,10 +336,15 @@ STATISTICAL_CHECKS: list[tuple[str, str, str, str]] = [
     ),
     (
         "Preprocesamiento ajustado solo con filas de entrenamiento",
-        "Las medianas de imputación, los momentos del escalador, los "
-        "exponentes de Yeo-Johnson y las categorías one-hot se estiman "
-        "únicamente con el bloque de entrenamiento, y luego se aplican sin "
-        "cambios a validación y test.",
+        "En palabras simples: todos los ajustes que se le hacen a los "
+        "datos antes de entrenar (rellenar huecos, poner todo en la misma "
+        "escala, etc.) se calculan mirando solo el pasado, igual que el "
+        "modelo -- nunca se le da, ni indirectamente, una pista de cómo se "
+        "ven los datos del futuro. En términos técnicos, las medianas de "
+        "imputación, los momentos del escalador, los exponentes de "
+        "Yeo-Johnson y las categorías one-hot se estiman únicamente con el "
+        "bloque de entrenamiento, y luego se aplican sin cambios a "
+        "validación y test.",
         "Ajustar un escalador con todos los períodos filtra información del "
         "futuro hacia la transformación de filas pasadas. La fuga es sutil "
         "-- no se toca ninguna etiqueta -- pero igual traspasa conocimiento "
@@ -306,7 +355,11 @@ STATISTICAL_CHECKS: list[tuple[str, str, str, str]] = [
     ),
     (
         "Features de panel causales (solo hacia atrás)",
-        "Los features de rezago, diferencia y z-score de historia propia "
+        "En palabras simples: la información que el modelo usa sobre la "
+        "historia de cada entidad (p. ej. cómo cambió su saldo en los "
+        "meses anteriores) nunca incluye datos de meses que, para esa "
+        "fila, todavía no habían pasado. En términos técnicos, los "
+        "features de rezago, diferencia y z-score de historia propia "
         "dentro de cada entidad miran estrictamente hacia atrás, y los "
         "horizontes se validan contra la profundidad de la ventana de "
         "entrenamiento antes de usarse.",
@@ -323,8 +376,12 @@ STATISTICAL_CHECKS: list[tuple[str, str, str, str]] = [
     ),
     (
         "Integridad de claves del panel balanceado",
-        "Cada par (entidad, período) aparece exactamente una vez, y cada "
-        "valor de período se interpreta como una fecha real -- incluyendo "
+        "En palabras simples: cada entidad aparece exactamente una vez "
+        "por mes, sin registros duplicados, y las fechas se leen "
+        "correctamente -- de lo contrario, comparar un mismo cliente entre "
+        "meses distintos no tendría sentido. En términos técnicos, cada "
+        "par (entidad, período) aparece exactamente una vez, y cada valor "
+        "de período se interpreta como una fecha real -- incluyendo "
         "formatos compactos yyyyMM.",
         "Las claves duplicadas vuelven ambiguos los features de rezago y "
         "diferencia, y duplican silenciosamente entidades al unir con la "
@@ -336,8 +393,11 @@ STATISTICAL_CHECKS: list[tuple[str, str, str, str]] = [
     ),
     (
         "Matriz de features finita",
-        "La matriz entregada a cada detector no contiene NaN ni valores "
-        "infinitos, verificado inmediatamente antes del ajuste.",
+        "En palabras simples: justo antes de entrenar, se revisa que no "
+        "haya valores imposibles (huecos sin marcar, infinitos) en los "
+        "datos que va a ver el modelo. En términos técnicos, la matriz "
+        "entregada a cada detector no contiene NaN ni valores infinitos, "
+        "verificado inmediatamente antes del ajuste.",
         "Ambos detectores fallan de forma distinta y poco útil ante "
         "entradas no finitas: scikit-learn lanza un error en las "
         "profundidades del constructor de árboles, y el VAE propaga NaN "
@@ -349,10 +409,17 @@ STATISTICAL_CHECKS: list[tuple[str, str, str, str]] = [
     ),
     (
         "Umbral calibrado en validación, aplicado a test",
-        "El punto de corte de alerta se estima ajustando una distribución "
-        "Generalizada de Pareto a la cola de los puntajes de validación "
-        "(peaks-over-threshold) para una tasa de falsas alarmas objetivo, o "
-        "mediante un percentil simple como alternativa.",
+        "En palabras simples: el punto de corte para decidir qué cuenta "
+        "como alerta se elige mirando un bloque de datos, y luego se "
+        "aplica tal cual a un bloque distinto que nunca se usó para "
+        "elegirlo -- así, la tasa de alertas que se reporta es la que de "
+        "verdad se vería en producción, no un número ajustado a la "
+        "medida de los mismos datos que se están evaluando. En términos "
+        "técnicos, el punto de corte de alerta se estima ajustando una "
+        "distribución Generalizada de Pareto a la cola de los puntajes de "
+        "validación (peaks-over-threshold) para una tasa de falsas "
+        "alarmas objetivo, o mediante un percentil simple como "
+        "alternativa.",
         "Elegir el umbral sobre las mismas filas con las que se evalúa es "
         "una decisión retrospectiva que no puede repetirse en producción. "
         "Se usa teoría de valores extremos porque la cantidad de interés "
@@ -363,9 +430,11 @@ STATISTICAL_CHECKS: list[tuple[str, str, str, str]] = [
     ),
     (
         "Medición de superposición de individuos",
-        "La proporción de entidades fuera de tiempo (OOT) que también "
-        "están presentes en entrenamiento se mide y registra en cada "
-        "corrida.",
+        "En palabras simples: se mide cuántas de las entidades evaluadas "
+        "al final ya habían sido vistas por el modelo durante el "
+        "entrenamiento. En términos técnicos, la proporción de entidades "
+        "fuera de tiempo (OOT) que también están presentes en "
+        "entrenamiento se mide y registra en cada corrida.",
         "Se reporta como diagnóstico, deliberadamente no como "
         "aprobado/reprobado. En un panel sintético balanceado, un "
         "solapamiento del 100% es la propiedad diseñada, no un defecto. Se "
@@ -378,9 +447,13 @@ STATISTICAL_CHECKS: list[tuple[str, str, str, str]] = [
     ),
     (
         "Estabilidad de la clasificación entre semillas",
-        "El solapamiento entre las filas mejor clasificadas producidas "
-        "bajo distintas semillas aleatorias, calculado como una métrica de "
-        "confiabilidad sin etiquetas.",
+        "En palabras simples: se repite el ajuste del modelo cambiando "
+        "solo el número aleatorio inicial (la \"semilla\"), y se compara "
+        "si la lista de casos sospechosos sale parecida o muy distinta "
+        "cada vez. En términos técnicos, es el solapamiento entre las "
+        "filas mejor clasificadas producidas bajo distintas semillas "
+        "aleatorias, calculado como una métrica de confiabilidad sin "
+        "etiquetas.",
         "Ambos detectores son estocásticos. Si la cola de alertas cambia "
         "sustancialmente con la semilla, entonces la cola de una corrida "
         "particular es en parte un artefacto del azar y no una propiedad de "

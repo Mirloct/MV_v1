@@ -126,3 +126,27 @@ class IForestSplitsRecommendationSectionTests(unittest.TestCase):
             self.assertIn("Ninguna de las 5 variables", out)
             self.assertIn("0% de participación", out)
             self.assertNotIn("Candidata a eliminar", out)
+
+    def test_a_missing_feature_count_renders_a_placeholder_not_the_word_none(self):
+        # Adversarial: _iforest_splits_block only requires top_clear/top_noisy
+        # to be non-empty, so a payload missing n_features_total is possible
+        # in principle -- the prose must not silently print "None".
+        from src.reporting.report import _iforest_splits_section_md
+
+        ctx = self._ctx(n_features_total=None)
+        out = _iforest_splits_section_md(ctx)
+        self.assertNotIn("None", out)
+        self.assertIn("1 de las ? variables", out)
+
+    def test_a_pipe_character_in_a_feature_name_does_not_corrupt_the_table(self):
+        # Adversarial: _md_table joined cells with a literal "|" and no
+        # escaping; a feature name carrying one would split into extra columns.
+        from src.reporting.report import _iforest_splits_section_md
+
+        ctx = self._ctx(unused_features=["weird|column"])
+        out = _iforest_splits_section_md(ctx)
+        self.assertIn("weird\\|column", out)
+        # The escaped row must still have exactly 3 columns (Variable,
+        # Evidencia, Recomendación) -- 4 unescaped "|" separators per row.
+        row_line = next(l for l in out.splitlines() if "weird" in l)
+        self.assertEqual(row_line.count("|") - row_line.count("\\|"), 4)

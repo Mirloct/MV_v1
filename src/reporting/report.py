@@ -402,6 +402,7 @@ def _iforest_splits_recommendation_rows(block: dict) -> list[tuple[str, str, str
 def _iforest_splits_recommendation_paragraph(block: dict) -> str:
     unused = block.get("unused_features") or []
     n_total = block.get("n_features_total")
+    n_total = "?" if n_total is None else n_total
     if unused:
         return (
             f"{len(unused)} de las {n_total} variables del modelo nunca participaron "
@@ -438,16 +439,22 @@ def _iforest_splits_section_md(context: dict) -> str:
     return "\n".join(parts)
 
 
+def _md_cell(value) -> str:
+    """A literal `|` breaks a markdown table row; escape it rather than
+    trust every cell (feature/column names from real data included)."""
+    return str(value).replace("|", "\\|")
+
+
 def _md_table(headers: Sequence[str], rows: list[tuple[str, ...]]) -> str:
     """Generic n-column markdown table."""
     if not rows:
         return "_none_\n"
     out = [
-        "| " + " | ".join(str(h) for h in headers) + " |",
+        "| " + " | ".join(_md_cell(h) for h in headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
     ]
     for row in rows:
-        out.append("| " + " | ".join(str(c) for c in row) + " |")
+        out.append("| " + " | ".join(_md_cell(c) for c in row) + " |")
     return "\n".join(out) + "\n"
 
 
@@ -1465,7 +1472,9 @@ def _statistical_checks_html() -> str:
         "reproducirse con datos en vivo. Las verificaciones a continuación existen "
         "específicamente para evitarlo, y todas se ejecutan en cada corrida -- las "
         "bloqueantes detienen el pipeline por completo en lugar de dejar que una "
-        "corrida comprometida llegue a este reporte.</p>"
+        "corrida comprometida llegue a este reporte. Cada \"Qué verifica\" empieza "
+        "en palabras simples y termina con la definición técnica, de nuevo pensado "
+        "para ambos tipos de lector.</p>"
         + "".join(rows) + "</div>"
     )
 
@@ -1574,11 +1583,14 @@ def _metric_glossary_html(models: dict) -> str:
     return (
         "<h2 id='indicators'>Cómo leer cada indicador</h2>"
         "<div class='card'><p class='lead'>Solo se listan los indicadores que esta "
-        "corrida realmente produjo. Las métricas de detección de anomalías no se "
-        "leen como las métricas de clasificación habituales, porque la clase "
-        "positiva es rara -- la tercera columna es la que importa, ya que dice qué "
-        "significa el número en contexto, incluyendo cuando una cifra que luce "
-        "débil es en realidad sólida.</p>"
+        "corrida realmente produjo. La columna \"Qué es\" empieza con una "
+        "explicación en palabras simples (\"En palabras simples: ...\") y termina "
+        "con la definición técnica, para que sirva tanto a quien ve estos números "
+        "por primera vez como a quien ya conoce la jerga. Las métricas de "
+        "detección de anomalías no se leen como las métricas de clasificación "
+        "habituales, porque la clase positiva es rara -- la tercera columna es la "
+        "que importa, ya que dice qué significa el número en contexto, "
+        "incluyendo cuando una cifra que luce débil es en realidad sólida.</p>"
         "<div class='table-wrap'><table class='glossary'>"
         "<thead><tr><th>Indicador</th><th>Qué es</th><th>Cómo leerlo</th></tr>"
         "</thead><tbody>" + "".join(rows) + "</tbody></table></div></div>"

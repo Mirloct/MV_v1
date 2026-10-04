@@ -939,11 +939,14 @@ tbody td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12.5px
 
 @media (max-width:980px){
   /* flex:1 (basis:0) collapses to ~0 once .shell has no fixed height to
-  distribute -- flex:none sizes these by content instead so the page scrolls. */
+  distribute -- flex:none sizes these by content instead so the page scrolls.
+  .tablewrap keeps overflow-x:auto (not plain visible): #priorityTable has
+  min-width:980px, wider than the viewport here, and still needs its own
+  horizontal scrollbar instead of bleeding into .shell's overflow:hidden. */
   .shell{height:auto;max-height:none}
   .main{flex:none;overflow:visible}
   .col-table{flex:none;overflow:visible}
-  .tablewrap{flex:none;overflow:visible;max-height:none}
+  .tablewrap{flex:none;overflow-x:auto;overflow-y:visible}
   .kpis{flex-direction:column}
   .kpi{border-left:0;border-top:1px solid var(--border)}
   .kpi:first-child{border-top:0}

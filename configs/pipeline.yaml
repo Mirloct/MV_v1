@@ -20,8 +20,9 @@ diagnostic:
   # auto_install_suite: true
 
   # Columna del panel para el desglose de la sección 8 "Por segmento".
-  # Default 'segment'; si no existe, intenta 'despuestocolaboradoragrupado'.
-  # Explícita (sin '#') y ausente: la corrida se detiene al inicio. '' desactiva.
+  # Default: 'segment'.
+  # Si 'segment' no existe, cae sola a 'despuestocolaboradoragrupado'.
+  # Activada explícita (sin '#') y ausente en el panel: detiene la corrida, sin fallback.
   # segment_column: region
 
   # Vista agregada por entidad en el capítulo diagnóstico.

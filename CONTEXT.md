@@ -262,8 +262,19 @@ modeling/evaluation module:
   indicators=True` (default) is what keeps that recoverable, via a 0/1
   flag per column that had a NaN. Disabling indicators while keeping
   zero-imputation is the combination to avoid.
-- **Defaults with a reason**: missing-indicator features are ON (upstream
-  missingness is MNAR/informative — an anomaly cue). Within-entity panel
+- **Missing-indicator features, configurable (2026-10-05)**: ON by default
+  (upstream missingness is MNAR/informative — an anomaly cue in this
+  project's synthetic generator specifically, see `src/data/synthetic.py::_inject_missingness`
+  for `account_balance`/`income`). `PipelineConfig.add_missing_indicators`
+  (`--add-missing-indicators`/`--no-add-missing-indicators`, no
+  `configs/pipeline.yaml` entry — preprocessing knobs are CLI-only, matching
+  `impute_numeric`/`panel_features`) lets an operator turn this off entirely
+  when missingness in their real data carries no such signal, or when a
+  `missing__*` name reaching the final business-facing output (dashboard
+  "most influential variables", SHAP) is unwanted regardless. Disabling it
+  removes the flag feature; the original column is still there, imputed.
+  Tests: `tests/test_missing_indicators.py`.
+- **Defaults with a reason**: within-entity panel
   features (lag/diff/own-history z-score/seasonality) exist to serve the
   `local` and `contextual` anomaly definitions and default ON in
   `fit_transform_panel`/`PanelFeatureEngineer` directly — but `main.py`'s CLI

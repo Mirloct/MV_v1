@@ -61,7 +61,6 @@ __all__ = [
     "SignedLog1p",
     "RareCategoryGrouper",
     "FrequencyEncoder",
-    "MissingnessIndicator",
     "PanelFeatureEngineer",
     "AutoNumericTransformer",
     "make_numeric_transformer",
@@ -311,43 +310,6 @@ class FrequencyEncoder(BaseEstimator, TransformerMixin):
     def get_feature_names_out(self, input_features=None):
         input_features = _check_feature_names_in(self, input_features)
         return np.asarray([f"{c}_freq" for c in input_features], dtype=object)
-
-
-class MissingnessIndicator(BaseEstimator, TransformerMixin):
-    """Emit a 0/1 flag per column that carried NaNs in the training data.
-
-    Upstream MNAR missingness is *informative* (large balances are redacted
-    before release), so the fact that a value is missing is itself an anomaly
-    cue. This transformer preserves that signal after imputation has erased it.
-    With ``only_missing=True`` (default) it keeps flags only for columns that
-    actually had missing values at fit time, so it adds nothing for complete
-    columns.
-    """
-
-    def __init__(self, only_missing: bool = True):
-        self.only_missing = only_missing
-
-    def fit(self, X, y=None):
-        Xdf = RareCategoryGrouper._as_frame(X)
-        self.feature_names_in_ = np.asarray(Xdf.columns, dtype=object)
-        self.n_features_in_ = Xdf.shape[1]
-        na_any = Xdf.isna().any(axis=0)
-        if self.only_missing:
-            self.columns_ = [c for c in Xdf.columns if bool(na_any.get(c, False))]
-        else:
-            self.columns_ = list(Xdf.columns)
-        return self
-
-    def transform(self, X):
-        check_is_fitted(self, "columns_")
-        Xdf = RareCategoryGrouper._as_frame(X)
-        if not self.columns_:
-            return np.empty((len(Xdf), 0), dtype=np.float32)
-        return Xdf[self.columns_].isna().to_numpy(dtype=np.float32)
-
-    def get_feature_names_out(self, input_features=None):
-        check_is_fitted(self, "columns_")
-        return np.asarray([f"{c}__missing" for c in self.columns_], dtype=object)
 
 
 class PanelFeatureEngineer(BaseEstimator, TransformerMixin):
@@ -790,11 +752,8 @@ def _make_numeric_imputer(impute_numeric: str) -> SimpleImputer:
     The trade-off is real and worth naming: a zero is a *value*, not a
     "missing" symbol. In a column where 0 already means something (an empty
     balance, no transactions) a filled zero is indistinguishable from a
-    genuine one. That is why `add_missing_indicators` defaults to True --
-    the 0/1 flag per NaN-bearing column keeps "this was absent" recoverable,
-    so the pair (zero fill + indicator) loses no information even though the
-    fill alone would. Turning indicators off while keeping zero fill is the
-    combination to avoid.
+    genuine one -- that distinction is accepted as lost, by explicit project
+    decision (no separate missing-value indicator feature is added).
     """
     if _normalize_name(impute_numeric) in ("zero", "zeros", "constant"):
         return SimpleImputer(
@@ -898,7 +857,6 @@ def build_preprocessing_pipeline(
     categorical_encoding: str = "onehot",
     impute_numeric: str = "zero",
     impute_categorical: str = "most_frequent",
-    add_missing_indicators: bool = True,
     add_panel_features: bool = True,
     rare_min_frequency: float = 0.001,
     panel_feature_cols: Optional[Sequence[str]] = None,
@@ -926,8 +884,6 @@ def build_preprocessing_pipeline(
             it costs. `main.py` exposes ``--no-zero-impute`` to switch to
             ``"median"`` without editing code.
         impute_categorical: "most_frequent" or "constant" (fills "__missing__").
-        add_missing_indicators: Append a 0/1 flag per NaN-bearing column
-            (defaults on -- upstream MNAR missingness is informative).
         add_panel_features: Append within-entity lag/diff/own-z + seasonality
             features (defaults on; toggle off to ablate).
         rare_min_frequency: Categories below this fraction are collapsed (into
@@ -975,10 +931,6 @@ def build_preprocessing_pipeline(
         ("cat", _make_categorical_pipeline(categorical_encoding, impute_categorical, rare_min_frequency), cat_selector),
         ("bool", FunctionTransformer(_to_float32, feature_names_out="one-to-one"), bool_selector),
     ]
-    if add_missing_indicators:
-        transformers.append(
-            ("missing", MissingnessIndicator(only_missing=True), _numeric_non_cyclical_selector)
-        )
 
     column_transform = ColumnTransformer(
         transformers=transformers,

@@ -247,10 +247,10 @@ modeling/evaluation module:
   dependency.
 - **Name-selectable transforms**: `numeric_transform` (one of
   `NUMERIC_TRANSFORMS`) and `categorical_encoding` (one of
-  `CATEGORICAL_ENCODINGS`), plus the imputation / missing-indicator /
-  panel-feature toggles, are all plain string/bool args so an Optuna study
-  can tune each as a categorical hyperparameter. The pipeline is
-  fit/transform-able and joblib-picklable for reuse at inference.
+  `CATEGORICAL_ENCODINGS`), plus the imputation / panel-feature toggles, are
+  all plain string/bool args so an Optuna study can tune each as a
+  categorical hyperparameter. The pipeline is fit/transform-able and
+  joblib-picklable for reuse at inference.
 - **Numeric imputation defaults to `"zero"`** (`SimpleImputer(strategy=
   "constant", fill_value=0.0)`), alongside `"median"`/`"mean"`/
   `"most_frequent"` (`--no-zero-impute` restores `"median"`). Zero estimates
@@ -258,22 +258,23 @@ modeling/evaluation module:
   drift with the fit window the way a recomputed median does. The
   trade-off: a zero is a real value, not a "missing" symbol, so on a column
   where 0 already means something (empty balance, zero transactions) an
-  imputed zero is indistinguishable from a genuine one — `add_missing_
-  indicators=True` (default) is what keeps that recoverable, via a 0/1
-  flag per column that had a NaN. Disabling indicators while keeping
-  zero-imputation is the combination to avoid.
-- **Missing-indicator features, configurable (2026-10-05)**: ON by default
-  (upstream missingness is MNAR/informative — an anomaly cue in this
-  project's synthetic generator specifically, see `src/data/synthetic.py::_inject_missingness`
-  for `account_balance`/`income`). `PipelineConfig.add_missing_indicators`
-  (`--add-missing-indicators`/`--no-add-missing-indicators`, no
-  `configs/pipeline.yaml` entry — preprocessing knobs are CLI-only, matching
-  `impute_numeric`/`panel_features`) lets an operator turn this off entirely
-  when missingness in their real data carries no such signal, or when a
-  `missing__*` name reaching the final business-facing output (dashboard
-  "most influential variables", SHAP) is unwanted regardless. Disabling it
-  removes the flag feature; the original column is still there, imputed.
-  Tests: `tests/test_missing_indicators.py`.
+  imputed zero is indistinguishable from a genuine one -- accepted as lost,
+  by explicit project decision (see next bullet).
+- **No missing-value indicator feature, by explicit project decision
+  (removed 2026-10-09)**: `MissingnessIndicator` used to add a 0/1
+  `missing__<col>` feature for every numeric column that had a NaN at fit
+  time, specifically so "value is really 0" stayed distinguishable from
+  "value was absent" after zero-imputation. Removed outright -- not made
+  optional -- after the user flagged `missing__*` names surfacing among the
+  "most influential variables" in the dashboard and judged the feature
+  should not exist in this project at all, full stop. There is now no code
+  path, config flag, or CLI argument that can produce a `missing__*` column;
+  `impute_numeric="zero"` alone decides what a NaN becomes, with no
+  companion feature. `FEATURE_FAMILY_PREFIXES` (`ifvae_contract.py`) no
+  longer lists a `missing__` entry. `mixed_view.py`'s `"flag"` role (its own
+  `missing__*` classifier) is now permanently unreachable -- left in place,
+  documented as vestigial, rather than reworking the VAE's encoder-sizing
+  math for a dead branch; see that module's docstring.
 - **Defaults with a reason**: within-entity panel
   features (lag/diff/own-history z-score/seasonality) exist to serve the
   `local` and `contextual` anomaly definitions and default ON in

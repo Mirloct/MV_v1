@@ -138,20 +138,9 @@ class PipelineConfig:
     rare_min_frequency: float = 0.001
     # Numeric NaN fill. "zero" (default) is statistic-free: nothing is
     # estimated from the data, so it cannot leak across the train/test
-    # boundary or shift when the fit window changes. Paired with
-    # `add_missing_indicators` below, which keeps "this value was absent"
-    # recoverable -- a filled 0 is otherwise indistinguishable from a real 0
-    # in columns where zero means something. `--no-zero-impute` switches to
-    # "median".
+    # boundary or shift when the fit window changes. `--no-zero-impute`
+    # switches to "median".
     impute_numeric: str = "zero"
-    # One 0/1 feature per numeric column that had any missing value in the
-    # training fit, flagging "this value was absent" (named `missing__<col>`).
-    # ON by default: with `impute_numeric="zero"`, a filled 0 is otherwise
-    # indistinguishable from a real 0. Only worth it when missingness itself
-    # is informative in your data; `--no-add-missing-indicators` turns it off
-    # if it is not, or if seeing `missing__*` names in the output is unwanted
-    # regardless. See CONTEXT.md "Missing-indicator features".
-    add_missing_indicators: bool = True
     # Within-entity lag/diff/ratio/own-z + seasonality features. Off by default:
     # this pipeline's own real-data usage computes those features in a separate
     # upstream flow, so generating them here would duplicate/conflict with that.
@@ -1076,7 +1065,6 @@ def run_pipeline(config: PipelineConfig) -> dict:
             rare_min_frequency=config.rare_min_frequency,
             impute_numeric=config.impute_numeric,
             add_panel_features=config.panel_features,
-            add_missing_indicators=config.add_missing_indicators,
             random_state=config.seed,
             return_pipeline=True,
         )
@@ -2214,7 +2202,6 @@ def run_pipeline(config: PipelineConfig) -> dict:
                         "rare_min_frequency": config.rare_min_frequency,
                         "impute_numeric": config.impute_numeric,
                         "add_panel_features": config.panel_features,
-                        "add_missing_indicators": config.add_missing_indicators,
                         "random_state": config.seed,
                     },
                 )
@@ -2751,15 +2738,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "Zero-fill is the default because it estimates nothing "
                              "from the data (so it cannot leak across the train/test "
                              "split); use this when a filled 0 would be confused with "
-                             "a real 0 and the missingness indicators are not enough.")
-    parser.add_argument("--add-missing-indicators", action=argparse.BooleanOptionalAction,
-                        default=True,
-                        help="Add a 0/1 `missing__<col>` feature for every numeric column "
-                             "that had any NaN in the training fit (default ON -- pairs with "
-                             "zero-fill so 'was absent' stays distinguishable from a real "
-                             "0). Only worth it when missingness itself is informative in "
-                             "your data. --no-add-missing-indicators turns it off, so no "
-                             "`missing__*` column is ever created or shown.")
+                             "a real 0 in a column where that distinction matters.")
     parser.add_argument("--live-view", action=argparse.BooleanOptionalAction,
                         default=True,
                         help="Open a local-only live progress view (127.0.0.1, no external "
@@ -3130,7 +3109,6 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         categorical_encoding=args.categorical_encoding,
         rare_min_frequency=args.rare_min_frequency,
         impute_numeric=("median" if args.no_zero_impute else "zero"),
-        add_missing_indicators=args.add_missing_indicators,
         supervised=args.supervised,
         live_view=args.live_view,
         console_ui=args.console_ui,

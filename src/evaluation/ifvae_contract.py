@@ -269,14 +269,13 @@ def _artifact_entry(directory: str, filename: str) -> dict:
 
 #: Prefix -> feature-family label. The prefixes are this project's own
 #: preprocessing output convention (`src/preprocessing/pipeline.py` emits
-#: `num__`, `cat__`, `cyc__`, `bool__`, `missing__`), so this is a metadata
-#: mapping, not an interpretation of any individual feature.
+#: `num__`, `cat__`, `cyc__`, `bool__`), so this is a metadata mapping, not
+#: an interpretation of any individual feature.
 FEATURE_FAMILY_PREFIXES = (
     ("num__", "Numérico de negocio"),
     ("cat__", "Categórico de negocio"),
     ("cyc__", "Calendario / cíclico"),
     ("bool__", "Booleano de negocio"),
-    ("missing__", "Indicador de faltante"),
 )
 FEATURE_FAMILY_PANEL_MARKERS = ("_lag", "_diff", "_ratio", "_own_z")
 FEATURE_FAMILY_PANEL = "Panel / rezago"

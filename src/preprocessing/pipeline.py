@@ -173,7 +173,10 @@ _DEFAULT_RATIO_FEATURES: tuple[tuple[str, str, str], ...] = (
 #   "onehot"    -> sparse OneHotEncoder with native infrequent-category folding
 #                  (widest output; memory-safe via sparsity at 1M rows).
 #   "ordinal"   -> RareCategoryGrouper then OrdinalEncoder (one integer column
-#                  per feature; unknown -> -1, missing -> -2).
+#                  per feature; unknown -> -1). RareCategoryGrouper folds every
+#                  value into a known category or "__rare__" before the encoder
+#                  sees it, and the imputer upstream fills every null, so the
+#                  encoder itself never has to invent a missing-value code.
 #   "frequency" -> FrequencyEncoder (one column per feature holding the training
 #                  relative frequency; compact for very high cardinality).
 CATEGORICAL_ENCODINGS: tuple[str, ...] = ("onehot", "ordinal", "frequency")
@@ -776,13 +779,14 @@ def _make_numeric_pipeline(numeric_transform, impute_numeric, random_state) -> P
 
 
 def _make_categorical_pipeline(
-    categorical_encoding, impute_categorical, rare_min_frequency
+    categorical_encoding, rare_min_frequency
 ) -> Pipeline:
     encoding = _normalize_name(categorical_encoding)
-    if impute_categorical == "constant":
-        imputer = SimpleImputer(strategy="constant", fill_value="__missing__", keep_empty_features=True)
-    else:
-        imputer = SimpleImputer(strategy="most_frequent", keep_empty_features=True)
+    # Always "most_frequent": no caller ever requests a constant/"__missing__"
+    # fill (there is no config knob or CLI flag that could), and a dedicated
+    # missing-value sentinel category is exactly the kind of bookkeeping
+    # artifact this project does not want (see CONTEXT.md on `missing__*`).
+    imputer = SimpleImputer(strategy="most_frequent", keep_empty_features=True)
 
     if encoding == "onehot":
         encoder = OneHotEncoder(
@@ -799,10 +803,18 @@ def _make_categorical_pipeline(
                 ("rare", RareCategoryGrouper(min_frequency=rare_min_frequency)),
                 (
                     "encode",
+                    # `unknown_value=-1` is still load-bearing: RareCategoryGrouper
+                    # is fit on the same (training) rows as this encoder, so if no
+                    # training row ever fell below `min_frequency`, "__rare__"
+                    # never entered this step's own learned vocabulary either --
+                    # a genuinely new category appearing only at OOT time would
+                    # then be unknown *to the encoder*, not just to the grouper,
+                    # and raise without this fallback. No `encoded_missing_value`:
+                    # the imputer above already fills every null before this step
+                    # ever runs, so the encoder never sees a NaN to encode.
                     OrdinalEncoder(
                         handle_unknown="use_encoded_value",
                         unknown_value=-1,
-                        encoded_missing_value=-2,
                         dtype=np.float32,
                     ),
                 ),
@@ -856,7 +868,6 @@ def build_preprocessing_pipeline(
     numeric_transform: str = "yeo-johnson",
     categorical_encoding: str = "onehot",
     impute_numeric: str = "zero",
-    impute_categorical: str = "most_frequent",
     add_panel_features: bool = True,
     rare_min_frequency: float = 0.001,
     panel_feature_cols: Optional[Sequence[str]] = None,
@@ -883,7 +894,6 @@ def build_preprocessing_pipeline(
             :func:`_make_numeric_imputer` for why zero is the default and what
             it costs. `main.py` exposes ``--no-zero-impute`` to switch to
             ``"median"`` without editing code.
-        impute_categorical: "most_frequent" or "constant" (fills "__missing__").
         add_panel_features: Append within-entity lag/diff/own-z + seasonality
             features (defaults on; toggle off to ablate).
         rare_min_frequency: Categories below this fraction are collapsed (into
@@ -928,7 +938,7 @@ def build_preprocessing_pipeline(
         # Cyclical seasonality bypasses the scaler entirely -- see
         # `_cyclical_selector` for why fitting a scaler on it is unsafe.
         ("cyc", "passthrough", _cyclical_selector),
-        ("cat", _make_categorical_pipeline(categorical_encoding, impute_categorical, rare_min_frequency), cat_selector),
+        ("cat", _make_categorical_pipeline(categorical_encoding, rare_min_frequency), cat_selector),
         ("bool", FunctionTransformer(_to_float32, feature_names_out="one-to-one"), bool_selector),
     ]
 

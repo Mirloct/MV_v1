@@ -1070,9 +1070,9 @@ class VAEDetector:
         if Xd.shape[1] != self.layout.n_columns:
             raise ValueError(f"the mixed VAE expects {self.layout.n_columns} columns "
                              f"({self.layout.fingerprint()}); got {Xd.shape[1]}.")
-        num_pos = np.concatenate([self.layout.positions("num"), self.layout.positions("bool"), self.layout.positions("flag")])
+        num_pos = np.concatenate([self.layout.positions("num"), self.layout.positions("bool")])
         if len(num_pos) and not np.isfinite(Xd[:, num_pos]).all():
-            raise ValueError("the mixed VAE input holds NaN/inf in a numeric, binary or missing-flag column: impute "
+            raise ValueError("the mixed VAE input holds NaN/inf in a numeric or binary column: impute "
                              "before fitting/scoring (only categorical nulls are allowed, as the MISSING token).")
         bpos = self.layout.positions("bool")
         if len(bpos) and len(Xd) and not np.all(np.isin(np.unique(Xd[:, bpos]), (0.0, 1.0))):

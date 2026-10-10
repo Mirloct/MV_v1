@@ -39,12 +39,12 @@ SETTINGS = dict(
 
 class TestFeatureFamilies(unittest.TestCase):
     def test_rules_from_real_column_names(self):
-        names = ["cat__segment_retail", "bool__flag", "missing__income__missing", "cyc__x_month_sin",
+        names = ["cat__segment_retail", "bool__flag", "cyc__x_month_sin",
                  "num__income_lag1", "num__balance_diff3", "num__age_own_z", "num__txn_amount_to_income",
                  "num__age", "iforest_score"]
         fam = feature_families(names, derived=["iforest_score"], ratio_names=["txn_amount_to_income"])
         self.assertEqual([fam[n] for n in names], [
-            "cat", "bool", "missing", "cyc", "panel_hist", "panel_hist", "panel_hist",
+            "cat", "bool", "cyc", "panel_hist", "panel_hist", "panel_hist",
             "ratios_negocio", "num_base", "derivada"])
 
     def test_capacity_points_never_repeat_the_production_hidden_shape(self):

@@ -271,10 +271,38 @@ modeling/evaluation module:
   path, config flag, or CLI argument that can produce a `missing__*` column;
   `impute_numeric="zero"` alone decides what a NaN becomes, with no
   companion feature. `FEATURE_FAMILY_PREFIXES` (`ifvae_contract.py`) no
-  longer lists a `missing__` entry. `mixed_view.py`'s `"flag"` role (its own
-  `missing__*` classifier) is now permanently unreachable -- left in place,
-  documented as vestigial, rather than reworking the VAE's encoder-sizing
-  math for a dead branch; see that module's docstring.
+  longer lists a `missing__` entry. **Complementary cleanup (2026-10-09,
+  second pass):** every remaining trace of the mechanism was also removed,
+  not just left vestigial -- `mixed_view.py`'s `"flag"` role (and its
+  `_classify` branch), `mixed_vae.py`'s encoder-input width term and
+  `idx_flag` buffer/concat, `vae.py`'s input-validation column set, and
+  `ifvae_experiments.py`'s `"missing"` feature family (classifier branch
+  plus the two hardcoded family tuples in the ablation experiment) are gone
+  outright rather than kept as an always-empty/always-`NOT_APPLICABLE` dead
+  path. None of this changes the encoder's actual input width (the removed
+  term was always `+0`) or any architecture fingerprint (fingerprints hash
+  the *realized* layout roles, which never included `"flag"`, not the
+  `ROLES` tuple) -- it is pure removal of code that could never fire.
+  Two related categorical-side artifacts were removed in the same pass:
+  `impute_categorical="constant"` (filled nulls with the sentinel category
+  `"__missing__"` before encoding) was dropped from
+  `build_preprocessing_pipeline`/`_make_categorical_pipeline` -- it was never
+  reachable (no config key or CLI flag ever set it away from the
+  `"most_frequent"` default), and it was the categorical twin of the same
+  "invented missingness marker" the numeric indicator was. The ordinal
+  encoder's `encoded_missing_value=-2` sentinel was dropped too, for the
+  same reason: the imputer immediately upstream in the same sub-pipeline
+  fills every null before the encoder ever runs, so that code path could
+  never fire either. **Not removed:** the ordinal encoder's
+  `unknown_value=-1` stays, because it is not dead code -- `RareCategoryGrouper`
+  is fit on the same training rows as the encoder, so if no training row
+  ever fell below `min_frequency`, the `"__rare__"` bucket never entered the
+  *encoder's* own learned vocabulary either; a genuinely new category
+  appearing only at OOT time then maps to `"__rare__"` (correctly, by the
+  grouper) but is unknown *to the encoder*, which would raise without this
+  fallback. Removing it would trade a confusing sentinel for a crash on real
+  OOT data under `--categorical-encoding ordinal` (not the default), which is
+  a worse outcome, so it was kept and documented in place.
 - **Defaults with a reason**: within-entity panel
   features (lag/diff/own-history z-score/seasonality) exist to serve the
   `local` and `contextual` anomaly definitions and default ON in
@@ -1296,7 +1324,7 @@ degrades to `NOT_APPLICABLE` with a warning.
 variables. **Default `onehot`** (the original MLP over one-hot columns) until every acceptance criterion passes; `embedding` builds the
 mixed-type VAE (`src/models/mixed_vae.py`, `architecture = mixed_v1`). Contract:
 
-- **Two views.** IF view unchanged. VAE view (`src/preprocessing/mixed_view.py::MixedViewBuilder`): continuous / binary / missing-flag columns
+- **Two views.** IF view unchanged. VAE view (`src/preprocessing/mixed_view.py::MixedViewBuilder`): continuous / binary columns
   from the same causal preprocessing + ONE integer index column per categorical variable built from the raw panel column (tokens `0` = MISSING,
   `1` = UNKNOWN, `2..` = vocabulary sorted alphabetically; vocabulary learned on the train rows only, levels rarer than `rare_min_frequency` →
   UNKNOWN). No one-hot column enters the VAE (`assert_no_onehot`, check `vae.no_onehot_input`). Stacking appends the standardised IF score
@@ -1434,6 +1462,30 @@ Measured on the synthetic generator (`generate_synthetic_panel`):
   `artifacts/tuning/best_params_vae.yaml`).
 - **Checkpoints/weights**: trained model artifacts (`.pth`, `.pkl`) go under
   `artifacts/models/`.
+- **On-demand suite, no retraining (`--reuse-trained` / `suite_plus_sensitivity.py`,
+  added 2026-10-09)**: `python main.py` always tunes/fits before running the
+  suite -- there was no way to regenerate the report/dashboard/Excel/diagnostic
+  suite/sensitivity analysis from an already-trained model without paying for
+  Optuna + VAE training again. `PipelineConfig.reuse_trained` (CLI
+  `--reuse-trained`, forces `tune=False` in `config_from_args` -- reuse and
+  tuning are mutually exclusive, not independent) makes Phase 6/7 call
+  `IsolationForestDetector.load(IFOREST_MODEL)` / `VAEDetector.load(VAE_MODEL,
+  expect_architecture=..., expect_fingerprint=...)` instead of
+  `tune_*`/`.fit()`; every other phase (preprocessing, evaluation, OOT export,
+  Phase 9c/9d diagnostics and sensitivity, interpretability, report) runs
+  unchanged, consuming the loaded detector exactly as it would a freshly
+  fitted one. `_read_best_params(IFOREST_BEST_PARAMS/VAE_BEST_PARAMS)` --
+  already written at the end of every tuning run -- still populates the
+  reported "effective" hyperparameters. **Fails loudly, never falls back to
+  training**: missing checkpoint file -> `RuntimeError` naming the path and
+  telling the user to run `python main.py` once first; column-count mismatch
+  (IF) or an architecture/fingerprint mismatch (VAE, via
+  `IncompatibleCheckpointError`) -> the run stops instead of scoring with a
+  detector that no longer matches the current data/preprocessing config.
+  `suite_plus_sensitivity.py` (project root) is a thin wrapper that calls
+  `main.main()` with `--reuse-trained` injected into argv -- same
+  `run_pipeline`, not a duplicated flow; every other `main.py` flag (e.g.
+  `--quick`) passes through unchanged.
 - **Environment setup**: run `python setup_validator.py` before doing
   anything else in a new environment; it checks Python version and
   dependencies and attempts to auto-install anything missing. `pyarrow`

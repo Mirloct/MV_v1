@@ -147,6 +147,11 @@ class PipelineConfig:
     # Still available for the synthetic-data workflow via --panel-features.
     panel_features: bool = False
     tune: bool = True
+    # On-demand suite mode: load the already-tuned, already-fitted detectors
+    # from `artifacts/models/` instead of tuning/fitting new ones (see
+    # `--reuse-trained`). `config_from_args` forces `tune=False` whenever this
+    # is on -- reuse and tune are mutually exclusive, not independent knobs.
+    reuse_trained: bool = False
     iforest_trials: int = 15
     vae_trials: int = 10
     vae_epochs: int = 15
@@ -631,11 +636,11 @@ def _mixed_vae_config(config: "PipelineConfig"):
 
 def _metric_matrix(detector, X_model):
     """Distance-based views (silhouette, PCA/UMAP) must not read category *indices* as magnitudes:
-    for the mixed VAE they use the continuous / binary / missing-flag block only."""
+    for the mixed VAE they use the continuous / binary block only."""
     layout = getattr(detector, "layout", None)
     if layout is None:
         return X_model
-    keep = np.concatenate([layout.positions("num"), layout.positions("bool"), layout.positions("flag")])
+    keep = np.concatenate([layout.positions("num"), layout.positions("bool")])
     return np.asarray(X_model)[:, np.sort(keep)]
 
 
@@ -1305,6 +1310,22 @@ def run_pipeline(config: PipelineConfig) -> dict:
                                "stale best-params YAML from an earlier run is ignored.",
                 evidence=IFOREST_BEST_PARAMS,
             )
+        if if_detector is None and config.reuse_trained:
+            if not os.path.isfile(IFOREST_MODEL):
+                raise RuntimeError(
+                    f"--reuse-trained: no saved Isolation Forest at {IFOREST_MODEL!r}. "
+                    "Run `python main.py` once without --reuse-trained first so it exists."
+                )
+            if_detector = IsolationForestDetector.load(IFOREST_MODEL)
+            n_expected = getattr(if_detector.model_, "n_features_in_", None)
+            if n_expected is not None and X_in.shape[1] != n_expected:
+                raise ValueError(
+                    f"the saved Isolation Forest expects {n_expected} features; the current "
+                    f"preprocessing produced {X_in.shape[1]}. The data or preprocessing "
+                    "config changed since it was trained -- rerun without --reuse-trained."
+                )
+            if_tuning_ok = True
+            logger.info("--reuse-trained: loaded Isolation Forest from %s (no fit/tune this run).", IFOREST_MODEL)
         if if_detector is None:
             if_detector = IsolationForestDetector(
                 random_state=config.seed, **fallback_if_params
@@ -1443,9 +1464,9 @@ def run_pipeline(config: PipelineConfig) -> dict:
     X_vae, vae_feature_names = X, feature_names
     stack_info = None
     # -- VAE view. IF keeps its own matrix (`X_if`, one-hot withheld). `onehot`: the VAE gets the
-    # full matrix as before. `embedding`: continuous + binary + missing-flag columns taken from the
-    # same causal preprocessing, plus ONE integer index per categorical variable (MISSING / UNKNOWN
-    # tokens; vocabularies learned on the train rows only) -- no one-hot column enters the VAE.
+    # full matrix as before. `embedding`: continuous + binary columns taken from the same causal
+    # preprocessing, plus ONE integer index per categorical variable (MISSING / UNKNOWN tokens;
+    # vocabularies learned on the train rows only) -- no one-hot column enters the VAE.
     vae_layout = vae_builder = vae_mixed_cfg = None
     _stack_scaler = None
     if config.vae_categorical_representation == "embedding":
@@ -1468,10 +1489,10 @@ def run_pipeline(config: PipelineConfig) -> dict:
             vae_feature_names = list(vae_layout.columns)
             assert_no_onehot(vae_layout)
             logger.info(
-                "VAE view: %d columns (%d numeric, %d binary, %d missing-flag, %d categorical index) "
+                "VAE view: %d columns (%d numeric, %d binary, %d categorical index) "
                 "instead of %d one-hot-expanded columns; cardinalities %s; layout %s",
                 vae_layout.n_columns, len(vae_layout.names("num")), len(vae_layout.names("bool")),
-                len(vae_layout.names("flag")), len(vae_layout.names("cat")), len(feature_names),
+                len(vae_layout.names("cat")), len(feature_names),
                 {s.name: s.cardinality for s in vae_layout.cat_specs()}, vae_layout.fingerprint(),
             )
             observability.check(
@@ -1589,6 +1610,18 @@ def run_pipeline(config: PipelineConfig) -> dict:
                                "earlier run is ignored.",
                 evidence=VAE_BEST_PARAMS,
             )
+        if vae_detector is None and config.reuse_trained:
+            if not os.path.isfile(VAE_MODEL):
+                raise RuntimeError(
+                    f"--reuse-trained: no saved VAE at {VAE_MODEL!r}. "
+                    "Run `python main.py` once without --reuse-trained first so it exists."
+                )
+            # `expect_architecture`/`expect_fingerprint` make this loud, not silent, if the
+            # data/preprocessing config changed since the checkpoint was written: a mismatch
+            # raises IncompatibleCheckpointError here instead of scoring with a stale layout.
+            vae_detector = VAEDetector.load(VAE_MODEL, expect_architecture=_vae_arch, expect_fingerprint=_vae_fp)
+            vae_tuning_ok = True
+            logger.info("--reuse-trained: loaded VAE from %s (no fit/tune this run).", VAE_MODEL)
         if vae_detector is None:
             vae_detector = VAEDetector(
                 random_state=config.seed, epochs=config.vae_epochs, **config.vae_params, **_vae_kwargs
@@ -2570,7 +2603,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 f"Transformación numérica={config.numeric_transform}, "
                 f"codificación categórica={config.categorical_encoding}, "
                 f"features de panel={'activado' if config.panel_features else 'desactivado'}, "
-                f"tuning={'activado' if config.tune else 'desactivado'}."
+                f"tuning={'activado' if config.tune else ('reutiliza modelo ya entrenado' if config.reuse_trained else 'desactivado')}."
             ),
         }
         try:
@@ -2768,6 +2801,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "synthetic-data workflow).")
     parser.add_argument("--tune", action=argparse.BooleanOptionalAction, default=None,
                         help="Optuna tuning of both detectors (default on; --no-tune to disable).")
+    parser.add_argument("--reuse-trained", action="store_true", default=False,
+                        help="On-demand suite mode: load the Isolation Forest and VAE already "
+                             "saved under artifacts/models/ (and their best_params_*.yaml) "
+                             "instead of tuning/fitting new ones. Forces --no-tune. Fails loudly "
+                             "if no trained model is found, or if the saved VAE's architecture "
+                             "doesn't match the current data/config -- it never silently falls "
+                             "back to training. See suite_plus_sensitivity.py for a dedicated "
+                             "entry point that sets this automatically.")
     parser.add_argument("--iforest-trials", type=int, default=None,
                         help="Isolation Forest Optuna trials (default 15).")
     parser.add_argument("--vae-trials", type=int, default=None,
@@ -3113,7 +3154,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         live_view=args.live_view,
         console_ui=args.console_ui,
         panel_features=args.panel_features,
-        tune=resolve("tune"),
+        tune=(False if args.reuse_trained else resolve("tune")),
+        reuse_trained=args.reuse_trained,
         iforest_trials=resolve("iforest_trials"),
         vae_trials=resolve("vae_trials"),
         vae_epochs=resolve("vae_epochs"),

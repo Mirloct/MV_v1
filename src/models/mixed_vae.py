@@ -13,7 +13,7 @@ observed category -- whatever its cardinality.
 
 Design
 ------
-* Encoder input = ``[numeric | binary | missing-flags | embedding(cat_1) | ... | embedding(cat_k)]``
+* Encoder input = ``[numeric | binary | embedding(cat_1) | ... | embedding(cat_k)]``
   -> MLP trunk -> ``mu``, ``logvar`` (same trunk shape rules as :class:`~src.models.vae.VAEModel`).
 * Decoder = MLP trunk from ``z`` with three kinds of heads: a linear head for the numeric variables,
   a logit head for the binary ones and one logit vector *per original categorical variable*.
@@ -221,7 +221,7 @@ class MixedVAEModel(nn.Module):
         self.layout, self.config = layout, config
         self.latent_dim = int(latent_dim)
         self.hidden_dims = [int(h) for h in hidden_dims]
-        for role in ("num", "bool", "flag", "cat"):
+        for role in ("num", "bool", "cat"):
             self.register_buffer(f"idx_{role}", torch.as_tensor(layout.positions(role), dtype=torch.long))
         specs = layout.cat_specs()
         self.cardinalities = [s.cardinality for s in specs]
@@ -229,7 +229,7 @@ class MixedVAEModel(nn.Module):
         self.embedding_dims = [emb_dims[s.column] for s in specs]
         self.embeddings = nn.ModuleList([nn.Embedding(c, d) for c, d in zip(self.cardinalities, self.embedding_dims)])
         self.n_num, self.n_bool = len(layout.names("num")), len(layout.names("bool"))
-        enc_in = self.n_num + self.n_bool + len(layout.names("flag")) + sum(self.embedding_dims)
+        enc_in = self.n_num + self.n_bool + sum(self.embedding_dims)
         if enc_in < 1:
             raise ValueError("the mixed layout has no input columns.")
         self.encoder = _mlp([enc_in, *self.hidden_dims], activation, dropout)
@@ -250,7 +250,7 @@ class MixedVAEModel(nn.Module):
         return torch.minimum(torch.clamp(idx, min=0), hi.unsqueeze(0))
 
     def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        parts = [x[:, self.idx_num], x[:, self.idx_bool], x[:, self.idx_flag]]
+        parts = [x[:, self.idx_num], x[:, self.idx_bool]]
         cat = self._cat_indices(x)
         parts += [emb(cat[:, j]) for j, emb in enumerate(self.embeddings)]
         h = self.encoder(torch.cat(parts, dim=1))

@@ -16,11 +16,6 @@ Column roles
 ------------
 ``num``   continuous, reconstructed (Huber/MSE) and scored.
 ``bool``  binary, reconstructed with a BCE-with-logits head and scored.
-``flag``  vestigial since 2026-10-09 -- used to be the missing-value indicator of a
-          numeric variable (``missing__*``), removed by project decision. Nothing upstream
-          produces a ``missing__*`` column anymore, so `_classify` below never returns this
-          role; it stays listed in :data:`ROLES` only because the VAE's encoder sizing
-          already treats an always-empty role as a no-op.
 ``cat``   one integer index per original categorical variable; embedded by the encoder,
           reconstructed with one softmax head over its vocabulary, scored by its NLL.
 
@@ -53,12 +48,7 @@ MISSING_TOKEN, UNKNOWN_TOKEN = "<MISSING>", "<UNKNOWN>"
 MISSING_INDEX, UNKNOWN_INDEX, N_TOKENS = 0, 1, 2
 MIXED_VIEW_VERSION = "mixed_view_v1"
 
-#: "flag" (`missing__*`) is vestigial since 2026-10-09: the numeric
-#: missing-value indicator that used to produce those columns was removed
-#: by project decision, so `_classify` below can never return "flag" again.
-#: Kept rather than torn out because `src/models/mixed_vae.py`'s encoder
-#: sizing already treats an always-empty role as a no-op.
-ROLES = ("num", "bool", "flag", "cat")
+ROLES = ("num", "bool", "cat")
 _SUPPORTED_POLICIES = ("explicit_token",)
 
 
@@ -212,15 +202,13 @@ def _classify(name: str) -> Optional[str]:
         return None
     if name.startswith("bool__"):
         return "bool"
-    if name.startswith("missing__"):
-        return "flag"
     return "num"
 
 
 class MixedViewBuilder:
     """Fit the VAE view on the fit rows, then transform any rows (train, validation, OOT, perturbed).
 
-    Numeric / binary / flag columns are *taken from the matrix the pipeline already built*
+    Numeric / binary columns are *taken from the matrix the pipeline already built*
     (same causal transforms, same scalers fitted on the train block); only the categorical
     variables are re-derived, from the **raw** panel columns, so nulls are visible as MISSING
     instead of having been imputed away.

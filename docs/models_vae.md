@@ -202,7 +202,7 @@ any categorical variable.
 **Two views of the data (the IF is untouched).**
 
 * *IF view* — as before (`split_matrix_for_model`: one-hot columns withheld).
-* *VAE view* (`src/preprocessing/mixed_view.py`) — the continuous, binary and missing-flag columns are taken from
+* *VAE view* (`src/preprocessing/mixed_view.py`) — the continuous and binary columns are taken from
   the very same causal preprocessing; each categorical variable becomes **one integer index column**, built from the
   *raw* panel column so nulls are visible. Index `0` = MISSING, `1` = UNKNOWN (a level the fit rows did not have, or one
   rarer than `rare_min_frequency`), `2..` = the vocabulary **sorted alphabetically** (independent of the row order).
@@ -210,8 +210,8 @@ any categorical variable.
   never a silent normal category. No `cat__<level>` dummy column reaches the VAE (`assert_no_onehot`, observability
   check `vae.no_onehot_input`). `categorical_encoding` is not changed for anyone else.
   **Null in a binary column.** The pipeline only casts booleans to float, so a null arrives as `NaN`, and a binary column
-  has neither a MISSING token nor a missing-flag. The view scores it as `False` (found by the end-to-end run: the
-  sensitivity "null" scenario on a boolean input otherwise aborted the whole phase). A `NaN` in a *numeric* or flag column
+  has no MISSING token. The view scores it as `False` (found by the end-to-end run: the
+  sensitivity "null" scenario on a boolean input otherwise aborted the whole phase). A `NaN` in a *numeric* column
   is still refused by the detector: those are imputed upstream. The one-hot architecture does not have this guard — it lets
   the `NaN` through and **every** score of that scenario is `NaN` (1500 of 1500 in the synthetic run, scenario
   `null::is_digital_active`). The post-training sensitivity phase therefore skips any scenario with non-finite scores
@@ -221,7 +221,7 @@ any categorical variable.
 
 **Architecture** (`src/models/mixed_vae.py`, `architecture = mixed_v1`).
 
-* Encoder input: `[numeric | binary | missing-flags | embedding(cat_1) … embedding(cat_k)]` → MLP trunk → `mu`, `logvar`.
+* Encoder input: `[numeric | binary | embedding(cat_1) … embedding(cat_k)]` → MLP trunk → `mu`, `logvar`.
   Embedding width per variable: `auto` = `round(1.6 · cardinality^0.56)` clipped to `[min_dimension, max_dimension]`
   (or `fixed`).
 * Decoder heads: numeric (linear), binary (logits) and **one logit vector per original categorical variable**. Embedding
@@ -231,8 +231,6 @@ any categorical variable.
   on the number of categories nor on the number of columns the one-hot used to generate. β and the KL ramp are unchanged.
   Training history records numeric / boolean / categorical loss, the loss of **each original categorical variable**, KL and
   the total (`history_[i]["train_parts"]`, `["val_parts"]`).
-* Missing-value flags (`missing__*`) are encoder inputs only: they are not original variables, so they are neither
-  reconstructed nor scored.
 
 **Anomaly score and `recon_topk`.** Exactly **one contribution per original variable**: Huber/MSE (numeric), BCE
 (binary), negative log-likelihood of the observed category (categorical; MISSING/UNKNOWN keep their own identifiable
@@ -272,8 +270,8 @@ and as the control of the A/B comparison. **The production default stays `onehot
 **Consumers.** Reconstruction-error attribution and per-row explanations rank variables by the **normalised** contribution (train reference) — ranking raw
 values would let the NLL of a uniform 40-level variable (log 40) sit in the top-5 of every row — and use the original variable names, and for a categorical
 variable the observed category and its reconstructed probability (`segment=retail (p=0.031)`; commas inside a category become `;` because the dashboard splits on
-commas). The attribution chart axis says "contribución normalizada media por variable original". Limits: the missing-value flags are encoder inputs only, so an
-unexpected missing numeric no longer has its own reconstructed term (it did as a one-hot-era matrix column); the vendored suite's drift statistics see category
+commas). The attribution chart axis says "contribución normalizada media por variable original". Limits: there is no missing-value indicator feature at all
+(removed project-wide 2026-10-09; a zero-imputed numeric and a genuinely-zero one are indistinguishable, by explicit decision); the vendored suite's drift statistics see category
 *indices* as numbers (read them with care for categoricals). `categorical_sources` is exactly the pipeline's categorical branch (`object`/`category` dtypes), so
 embeddings cover the same variables one-hot did; levels are matched by their string form (`1` and `'1'` are the same level); the sensitivity study re-encodes
 perturbed frames with the same vocabularies (nulls → MISSING); the §9 families (capacity, beta/KL, loss by type — now expressed in
@@ -322,7 +320,7 @@ flowchart TD
     P --> X[X: matriz one-hot, causal]
     X --> IFV[Vista IF: sin one-hot<br/>split_matrix_for_model]
     IFV --> IF[Isolation Forest]
-    X --> NB[num / bool / missing-flags<br/>mismas transformaciones]
+    X --> NB[num / bool<br/>mismas transformaciones]
     D --> CB[MixedViewBuilder.fit en train:<br/>vocabulario ordenado, tokens MISSING=0, UNKNOWN=1]
     NB --> M[Matriz mixta: N columnas, 1 índice por categórica]
     CB --> M

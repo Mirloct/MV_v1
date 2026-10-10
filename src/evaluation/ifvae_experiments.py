@@ -100,9 +100,9 @@ def feature_families(
     """``{feature name: family}`` from the real column names.
 
     Families: ``derivada`` (stacked IF score, VAE only), ``cat`` (one-hot, VAE only),
-    ``bool``, ``missing`` (missing-value flags), ``cyc`` (month sin/cos),
-    ``panel_hist`` (lag/diff/ratio horizons and ``_own_z``), ``ratios_negocio``
-    (the engineer's ratio columns) and ``num_base`` (every other numeric).
+    ``bool``, ``cyc`` (month sin/cos), ``panel_hist`` (lag/diff/ratio horizons and
+    ``_own_z``), ``ratios_negocio`` (the engineer's ratio columns) and ``num_base``
+    (every other numeric).
     """
     derived_set, ratio_set = set(derived), set(ratio_names)
     out: dict[str, str] = {}
@@ -113,8 +113,6 @@ def feature_families(
             fam = "cat"
         elif name.startswith("bool__"):
             fam = "bool"
-        elif name.startswith("missing__"):
-            fam = "missing"
         elif name.startswith("cyc__"):
             fam = "cyc"
         elif _RE_PANEL_HIST.match(name):
@@ -580,7 +578,7 @@ def _ablation(ctx: dict, fam_if: dict[str, str], fam_vae: dict[str, str], budget
     rows: list[dict] = []
     names_if = ctx["if_feature_names"]
     present_if = sorted(set(fam_if.values()))
-    all_fams = ("cat", "bool", "missing", "cyc", "panel_hist", "ratios_negocio", "num_base", "derivada")
+    all_fams = ("cat", "bool", "cyc", "panel_hist", "ratios_negocio", "num_base", "derivada")
     for fam in all_fams:
         name = f"{label} (IF): sin {fam}"
         if fam in ("cat", "derivada"):
@@ -644,7 +642,7 @@ def _ablation(ctx: dict, fam_if: dict[str, str], fam_vae: dict[str, str], budget
                                              show_elbo=False))   # other input dimension: not comparable
         except Exception as exc:  # noqa: BLE001
             rows.append(_row(name, STATUS_FAILED, reason=f"{type(exc).__name__}: {exc}"))
-    for fam in ("bool", "missing", "cyc", "ratios_negocio", "num_base"):
+    for fam in ("bool", "cyc", "ratios_negocio", "num_base"):
         if fam in present_vae:
             rows.append(_row(f"{label} (VAE): sin {fam}", STATUS_NOT_REQUESTED,
                              reason="Solo se reentrena el VAE sin cat, derivada y panel_hist "

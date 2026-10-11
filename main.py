@@ -687,6 +687,26 @@ def _flagged_rows_for_split_count(
     return result
 
 
+def _oot_rows_by_score_desc(oot_mask: np.ndarray, scores: np.ndarray) -> np.ndarray:
+    """Integer positions of ``oot_mask``'s ``True`` rows, sorted by ``scores`` descending.
+
+    `explain_rows_iforest` (SHAP-based) only explains as many rows as fit in its
+    time budget, *in the order it is given them* -- its own docstring says to pass
+    it "the rows that actually need an answer... not the whole panel". Handing it
+    OOT rows in panel order means a budget cut-off truncates an arbitrary
+    chronological/entity-ordered prefix, which has no reason to overlap with the
+    P90+ rows the OOT deliverable and dashboard actually display -- on a large
+    real OOT block this silently leaves every reviewed individual with an empty
+    "top 5 variables" column, because the rows that *did* get explained within
+    budget are scattered elsewhere in panel order, not the ones anyone is looking
+    at. Sorting by score first means a cut-off (if one happens) drops the LEAST
+    anomalous rows, so the rows that actually end up in the review queue are
+    explained first and preferentially survive any truncation.
+    """
+    oot_idx = np.flatnonzero(oot_mask)
+    return oot_idx[np.argsort(-scores[oot_idx])]
+
+
 def _model_metrics(supervised, labels, scores, oot_mask, X, label_types=None) -> dict:
     """Assemble supervised (OOT + overall) and unsupervised metrics into one dict.
 
@@ -1408,10 +1428,14 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     if oot_mask.any():
                         from src.interpretability import explain_rows_iforest
 
+                        # Explain highest-score-first (see `_oot_rows_by_score_desc`):
+                        # a budget cut-off then drops the least anomalous rows, not an
+                        # arbitrary panel-order prefix unrelated to who gets reviewed.
+                        priority_idx = _oot_rows_by_score_desc(oot_mask, if_scores)
                         top_vars = explain_rows_iforest(
-                            if_detector, X_if[oot_mask], feature_names=names_if,
+                            if_detector, X_if[priority_idx], feature_names=names_if,
                         )
-                        if_scored_df.loc[oot_mask, "top_5_variables"] = top_vars
+                        if_scored_df.loc[if_scored_df.index[priority_idx], "top_5_variables"] = top_vars
                         dashboard_explanation_tables["iforest"] = (
                             if_scored_df.loc[oot_mask]
                             .sort_values("anomaly_score", ascending=False)
@@ -1899,21 +1923,31 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     if oot_row_mask.any():
                         if name == "iforest":
                             from src.interpretability import explain_rows_iforest
+
+                            # Explain highest-score-first (see
+                            # `_oot_rows_by_score_desc`): a budget cut-off then drops
+                            # the least anomalous rows, not an arbitrary panel-order
+                            # prefix unrelated to who actually gets reviewed.
+                            assign_idx = _oot_rows_by_score_desc(oot_row_mask, scores)
                             with log_phase("interpretability.explain_rows_iforest"):
                                 top_vars = explain_rows_iforest(
-                                    detector, X_model[oot_row_mask], feature_names=names_model,
+                                    detector, X_model[assign_idx], feature_names=names_model,
                                 )
                         else:
                             from src.interpretability import explain_rows_vae
                             categorical_columns = df.select_dtypes(
                                 include=["object", "category"]
                             ).columns.tolist()
+                            # No budget/truncation risk for the VAE path (always
+                            # exactly computable -- see `explain_rows_vae`'s
+                            # docstring), so panel order is fine as-is here.
+                            assign_idx = np.flatnonzero(oot_row_mask)
                             with log_phase("interpretability.explain_rows_vae"):
                                 top_vars = explain_rows_vae(
                                     detector, X_model[oot_row_mask], feature_names=names_model,
                                     categorical_columns=categorical_columns,
                                 )
-                        scored_df.loc[oot_row_mask, "top_5_variables"] = top_vars
+                        scored_df.loc[scored_df.index[assign_idx], "top_5_variables"] = top_vars
                         dashboard_explanation_tables[name] = (
                             scored_df.loc[oot_row_mask]
                             .sort_values("anomaly_score", ascending=False)

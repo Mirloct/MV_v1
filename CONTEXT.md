@@ -617,22 +617,22 @@ P95 checkpoint, stacking, or the VAE deliverable.
   ranking — it never answers "what drove this specific person's score."
   `explain_rows_iforest` (`src/interpretability/iforest_explain.py`) and
   `explain_rows_vae` (`vae_explain.py`) are the per-row complement: given
-  exactly the rows to explain (not subsampled — an alert queue, not a
-  population sample), they return one comma-joined string of the top-`k`
-  feature names **per row**, in the same order. `main.py` (Phase 9) computes
-  this for exactly the OOT rows (`oot_period`-derived mask, the same
-  population `export_oot_top_anomalies` selects from — not the whole panel)
-  right after scoring and attaches it to `scored_df` as **`top_5_variables`**
-  before the Excel export, so it rides along as an ordinary column (it lands
-  last, after the raw feature columns, since `export_oot_top_anomalies`
-  preserves `scored_df`'s column order).
+  exactly the rows to explain (not subsampled), they return one comma-joined
+  string of the top-`k` feature names **per row**, in the same order. `main.py`
+  computes this for the OOT rows (`oot_period`-derived mask) right after
+  scoring and attaches it to `scored_df` as **`top_5_variables`** before the
+  Excel export, so it rides along as an ordinary column (it lands last, after
+  the raw feature columns, since `export_oot_top_anomalies` preserves
+  `scored_df`'s column order).
   - **Isolation Forest**: reuses `shap.TreeExplainer` via the *same*
     isolated-child-process, hard-kill-guarded path as `shap_summary_
     iforest`'s path 1 (`_run_with_hard_kill`) — the same tree-depth-driven
-    slowness applies here too, just against a much smaller, fixed row set.
-    Ranked by `|SHAP value|` per row. Never blocks the deliverable: on any
-    failure or a hard-kill, affected rows get `None` rather than raising,
-    and a warning names how many rows were left unexplained.
+    slowness applies here too, against the full OOT block rather than a
+    capped subsample, so it is the one explanation path that can run out of
+    its time budget before finishing. Ranked by `|SHAP value|` per row. Never
+    blocks the deliverable: on any failure or a hard-kill, affected rows get
+    `None` rather than raising, and a warning names how many rows were left
+    unexplained.
   - **VAE**: always exactly computable, no fallback needed — per-row
     squared reconstruction error `(x_ij - x̂_ij)^2`, ranked per row. When
     `categorical_columns` is given (`main.py` always passes it), one-hot
@@ -640,10 +640,29 @@ P95 checkpoint, stacking, or the VAE deliverable.
     (same `group_name_by_source` mechanism as the aggregate diagnostic
     above), so the column never leaks a raw one-hot slice name like
     `cat__region_North` — it reports `region`.
-  - Verified: injecting a deliberately extreme value into a known column
-    makes that column top the explanation for that exact row (both
-    detectors); a full pipeline run's real OOT export carries a fully
-    populated (0 nulls), per-row-differentiated `top_5_variables` column.
+  - **Bug found and fixed 2026-10-11: explain the highest-score rows first.**
+    `explain_rows_iforest` truncates to whatever fits its time budget **in
+    the order it is handed rows** (documented in its own docstring: pass it
+    "the rows that actually need an answer... not the whole panel"). `main.py`
+    was calling it with the OOT rows in plain panel order (chronological/by
+    entity), not the P90/P95 rows the dashboard and Excel actually surface.
+    On the small synthetic panel (~1500 OOT rows) explaining all of them
+    always fit inside the 90s soft budget, so this never showed up in testing
+    — on a real panel large enough that it does not fit, the truncated
+    prefix has no reason to overlap with whichever entities end up in the
+    review queue (rows there are picked by *score*, not panel position), so
+    every reviewed individual could show an empty `top_5_variables` for IF
+    specifically (never for the VAE, which has no budget/truncation at all).
+    Reproduced directly before fixing: 4000 rows, the 40 truly anomalous ones
+    placed at the end of panel order, budget forced tight enough to truncate
+    — 0/40 got explained in panel order, 40/40 once ordered by score first.
+    Fixed with `_oot_rows_by_score_desc(oot_mask, scores)` (`main.py`):
+    sorts the OOT rows by score descending before calling
+    `explain_rows_iforest`, so a truncation (if one still happens) drops the
+    *least* anomalous rows instead of an arbitrary panel-order slice. Applied
+    at both call sites (Phase 6d stacked-mode path, and the generic Phase 9
+    per-model loop used in parallel mode); the VAE path is unchanged (no
+    truncation risk to correct for).
 
 ## Observability, assumption gate, and tuning early-stopping
 
@@ -1339,6 +1358,17 @@ mixed-type VAE (`src/models/mixed_vae.py`, `architecture = mixed_v1`). Contract:
 - **Identity.** `architecture_fingerprint` (variables + order, vocabularies/cardinalities, embedding dims, loss types/weights, token policy, code
   version) is part of checkpoint compatibility, the Optuna study name and the YAML. One-hot payloads/checkpoints are **rejected**, never loaded
   partially (`IncompatibleCheckpointError`; `VAEDetector.load(expect_architecture=, expect_fingerprint=)`).
+  `MIXED_ARCHITECTURE_VERSION` (`mixed_vae.py`) must be bumped on any change to the mixed input/schema itself, not just the fingerprinted
+  config -- **bug found and fixed 2026-10-11**: removing the vestigial `"flag"` role from `mixed_view.ROLES` (the 2026-10-09 `missing__*`
+  cleanup) changed what a valid serialized `MixedLayout` can contain, but the version constant stayed `"1"`, so a payload saved before that
+  removal (from a panel with numeric NaNs, which used to produce `"flag"`-role columns) would pass the version check and then hit
+  `MixedLayout.__post_init__`'s bare `ValueError("unknown column role(s) ['flag']...")` instead of the documented, catchable
+  `IncompatibleCheckpointError` -- `VAEDetector.load`'s own docstring promises the latter for every incompatibility. Fixed two ways: bumped
+  to `"2"` (routes genuinely old payloads through the existing version check), and wrapped `MixedLayout.from_dict(...)` in
+  `VAEDetector.load` with the same `try/except ValueError -> IncompatibleCheckpointError` pattern already used two lines below for
+  `MixedVAEConfig.from_dict` -- defense in depth for the next time a role is retired from `ROLES`. Regression test:
+  `tests/test_mixed_vae.py::TestCheckpoints::test_a_role_retired_from_mixed_view_ROLES_is_also_refused_not_a_bare_valueerror` (confirmed RED
+  against the `from_dict` fix alone before restoring it, independent of the version bump).
 - **Everywhere else.** Tuning (with and without labels, partial labels with `NaN`), the sensitivity study (perturbed frames re-encoded with the same
   vocabularies), attribution/explanations (original names; categorical shown as `variable=category (p=…)`) and the six §9 families (loss by type in
   original variables + MISSING/UNKNOWN rows + a one-hot control; ablation with a sub-layout; per-origin vocabularies in the backtest) work with both

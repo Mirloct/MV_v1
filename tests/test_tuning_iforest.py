@@ -65,6 +65,46 @@ class TunerBase(unittest.TestCase):
         return study, yaml.safe_load(open(os.path.join(self.d, f"{name}.yaml"), encoding="utf-8"))
 
 
+class TestBlockedSplit(unittest.TestCase):
+    """`_blocked_split` blocks the holdout on whole entities (`groups`), never
+    individual rows, so an entity's own history never leaks across the split."""
+
+    def test_every_row_of_an_entity_lands_on_the_same_side(self):
+        n_per_entity = 6
+        n_entities = 40
+        groups = np.repeat(np.arange(n_entities), n_per_entity)
+        n = groups.size
+        fit_idx, eval_idx = ifm._blocked_split(n, groups, holdout_frac=0.25, random_state=0)
+        # Partition, no overlap, every row placed exactly once.
+        self.assertEqual(set(fit_idx.tolist()) & set(eval_idx.tolist()), set())
+        self.assertEqual(set(fit_idx.tolist()) | set(eval_idx.tolist()), set(range(n)))
+        fit_groups = set(groups[fit_idx].tolist())
+        eval_groups = set(groups[eval_idx].tolist())
+        # No entity straddles both sides.
+        self.assertEqual(fit_groups & eval_groups, set())
+        self.assertAlmostEqual(len(eval_groups) / n_entities, 0.25, delta=0.03)
+
+    def test_holdout_fraction_of_groups_is_respected_at_various_scales(self):
+        for n_entities, holdout_frac in ((4, 0.25), (100, 0.1), (7, 0.5)):
+            groups = np.repeat(np.arange(n_entities), 3)
+            n = groups.size
+            fit_idx, eval_idx = ifm._blocked_split(n, groups, holdout_frac, random_state=1)
+            n_eval_groups = len(set(groups[eval_idx].tolist()))
+            expected = min(max(1, round(holdout_frac * n_entities)), n_entities - 1)
+            self.assertEqual(n_eval_groups, expected)
+
+    def test_no_groups_falls_back_to_a_plain_row_split(self):
+        fit_idx, eval_idx = ifm._blocked_split(400, None, holdout_frac=0.2, random_state=2)
+        self.assertEqual(set(fit_idx.tolist()) & set(eval_idx.tolist()), set())
+        self.assertEqual(len(eval_idx), 80)
+
+    def test_a_single_group_degrades_to_the_plain_row_split(self):
+        groups = np.zeros(200, dtype=int)
+        fit_idx, eval_idx = ifm._blocked_split(200, groups, holdout_frac=0.2, random_state=3)
+        self.assertEqual(set(fit_idx.tolist()) & set(eval_idx.tolist()), set())
+        self.assertEqual(len(fit_idx) + len(eval_idx), 200)
+
+
 class TestSearchSpaceAndDeploy(TunerBase):
     def test_only_psi_and_max_features_are_searched(self):
         X, _, valid = _panel()
@@ -387,3 +427,57 @@ class TestPipelineConfigWiring(unittest.TestCase):
             self._config("--iforest-max-samples-range", "4096", "1024")
         with self.assertRaises(SystemExit):
             self._config("--tune-min-positive-rows", "0")
+
+
+class TestReuseAndSuiteFlags(unittest.TestCase):
+    """`--reuse-trained`/`--no-suite`/`--best-params` (main.py, added 2026-10-09/11)
+    were only validated end-to-end via real pipeline runs (minutes each) -- no
+    fast unit test pinned `config_from_args`'s own resolution of them, so a
+    future edit to that function could silently drift without any test
+    noticing. `--best-params` is specifically sugar for `--reuse-trained
+    --no-suite` combined; these tests pin that equivalence directly."""
+
+    @staticmethod
+    def _config(*argv):
+        import main
+
+        return main.config_from_args(main.build_arg_parser().parse_args(list(argv)))
+
+    def test_defaults_tune_and_run_the_suite(self):
+        cfg = self._config()
+        self.assertTrue(cfg.tune)
+        self.assertFalse(cfg.reuse_trained)
+        self.assertTrue(cfg.run_diagnostic_suite)
+        self.assertTrue(cfg.run_sensitivity_analysis)
+
+    def test_reuse_trained_forces_tune_off_but_leaves_the_suite_on(self):
+        cfg = self._config("--reuse-trained")
+        self.assertTrue(cfg.reuse_trained)
+        self.assertFalse(cfg.tune)
+        self.assertTrue(cfg.run_diagnostic_suite)
+        self.assertTrue(cfg.run_sensitivity_analysis)
+
+    def test_no_suite_forces_both_suite_phases_off_but_leaves_tuning_on(self):
+        cfg = self._config("--no-suite")
+        self.assertFalse(cfg.reuse_trained)
+        self.assertTrue(cfg.tune)
+        self.assertFalse(cfg.run_diagnostic_suite)
+        self.assertFalse(cfg.run_sensitivity_analysis)
+
+    def test_best_params_is_exactly_reuse_trained_plus_no_suite(self):
+        combined = self._config("--best-params")
+        separate = self._config("--reuse-trained", "--no-suite")
+        for field in ("tune", "reuse_trained", "run_diagnostic_suite", "run_sensitivity_analysis"):
+            self.assertEqual(getattr(combined, field), getattr(separate, field), field)
+        self.assertTrue(combined.reuse_trained)
+        self.assertFalse(combined.tune)
+        self.assertFalse(combined.run_diagnostic_suite)
+        self.assertFalse(combined.run_sensitivity_analysis)
+
+    def test_no_suite_wins_over_an_explicit_request_to_keep_one_phase_on(self):
+        # --no-suite is documented to force both off "regardless of those
+        # flags' own value" -- pin that it actually overrides, not merges.
+        cfg = self._config("--no-suite", "--run-diagnostic-suite")
+        self.assertFalse(cfg.run_diagnostic_suite)
+        cfg2 = self._config("--run-sensitivity-analysis", "--no-suite")
+        self.assertFalse(cfg2.run_sensitivity_analysis)

@@ -5,9 +5,9 @@ model-ready feature matrix while keeping the ``(entity_id, period)`` keys aside
 so the evaluation module can join detector scores back to the hidden ground
 truth. Every knob that changes the *shape* of the transform -- the numeric
 transformation, the categorical encoding, the imputation strategy, whether to
-add missingness indicators or panel-derived features -- is a plain string/bool
-argument to :func:`build_preprocessing_pipeline`, so an Optuna study can treat
-each as a categorical hyperparameter.
+add panel-derived features -- is a plain string/bool argument to
+:func:`build_preprocessing_pipeline`, so an Optuna study can treat each as a
+categorical hyperparameter.
 
 Design
 ------
@@ -20,9 +20,8 @@ The returned object is a two-step sklearn :class:`~sklearn.pipeline.Pipeline`:
    encoding. Keeping this a separate toggleable step means it can be ablated.
 2. ``column_transform`` -- a :class:`~sklearn.compose.ColumnTransformer` that
    routes numeric / categorical / boolean columns (selected by dtype at fit
-   time) into their respective sub-pipelines and, when enabled, emits a
-   missingness-indicator branch. One-hot output is sparse so wide long-tail
-   categoricals do not blow up memory at 1M rows.
+   time) into their respective sub-pipelines. One-hot output is sparse so wide
+   long-tail categoricals do not blow up memory at 1M rows.
 
 The whole thing is ``fit``/``transform``-able and joblib-picklable, so it can be
 persisted and reused unchanged at inference.
@@ -1094,11 +1093,11 @@ def _warn_on_extreme_magnitudes(X, feature_names: list, log: logging.Logger) -> 
         Xc = X.tocsr()
         if Xc.nnz == 0:
             return
-        col_max = np.zeros(Xc.shape[1], dtype=float)
-        Xabs = abs(Xc).tocsc()
-        for j in range(Xc.shape[1]):
-            seg = Xabs.data[Xabs.indptr[j]:Xabs.indptr[j + 1]]
-            col_max[j] = seg.max() if seg.size else 0.0
+        # scipy's sparse .max(axis=0) already accounts for unstored (implicit
+        # zero) entries, so this is exactly the per-column "max of absolute
+        # value, treating absence as 0.0" the old explicit Python loop computed
+        # -- just done in C instead of one indptr slice + .max() per column.
+        col_max = np.asarray(abs(Xc).max(axis=0).todense()).ravel()
     else:
         Xd = np.asarray(X, dtype=float)
         if Xd.size == 0:

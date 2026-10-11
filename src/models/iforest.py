@@ -341,8 +341,7 @@ def _blocked_split(
     shuffled = rng.permutation(uniq)
     n_eval_groups = max(1, int(round(holdout_frac * uniq.size)))
     n_eval_groups = min(n_eval_groups, uniq.size - 1)
-    eval_groups = set(shuffled[:n_eval_groups].tolist())
-    is_eval = np.fromiter((g in eval_groups for g in groups), dtype=bool, count=n_samples)
+    is_eval = np.isin(groups, shuffled[:n_eval_groups])
     return np.flatnonzero(~is_eval), np.flatnonzero(is_eval)
 
 

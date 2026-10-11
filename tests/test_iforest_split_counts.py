@@ -180,5 +180,43 @@ class FlaggedRowsForSplitCountTests(unittest.TestCase):
         self.assertTrue(any("split_count_analysis" in m for m in captured.output))
 
 
+class OotRowsByScoreDescTests(unittest.TestCase):
+    """Regression: `explain_rows_iforest` (SHAP-based) only explains as many rows
+    as fit its time budget, in the order it is handed them. Passing it OOT rows
+    in panel order meant a budget cut-off on a large real OOT block truncated an
+    arbitrary chronological/entity-ordered prefix -- unrelated to which
+    individuals the P90+ review queue actually surfaces, so a real run could see
+    EVERY reviewed individual with an empty top-5-variables column for
+    Isolation Forest (never for the VAE, which is always exactly computable).
+    `_oot_rows_by_score_desc` orders the OOT rows by score first, so a
+    truncation (if one still happens) drops the least anomalous rows."""
+
+    def test_returns_oot_positions_only_sorted_by_score_descending(self):
+        oot_mask = np.array([True, False, True, True, False, True])
+        scores = np.array([1.0, 99.0, 5.0, 3.0, 99.0, 9.0])
+        result = main._oot_rows_by_score_desc(oot_mask, scores)
+        # Position 1 and 4 (score 99) are NOT in oot_mask and must never appear.
+        self.assertEqual(set(result.tolist()), {0, 2, 3, 5})
+        self.assertEqual(result.tolist(), [5, 2, 3, 0])   # by score: 9, 5, 3, 1
+
+    def test_a_budget_cutoff_keeps_the_highest_scores_first(self):
+        # Simulates explain_rows_iforest's own truncation: only the first N
+        # of the ordering it is given ever get a real explanation.
+        rng = np.random.default_rng(0)
+        n = 500
+        oot_mask = np.ones(n, dtype=bool)
+        scores = rng.normal(size=n)
+        order = main._oot_rows_by_score_desc(oot_mask, scores)
+        budget_n = 50
+        explained = set(order[:budget_n].tolist())
+        # The 50 highest-scoring rows overall must be exactly the ones kept.
+        top_50_by_score = set(np.argsort(-scores)[:budget_n].tolist())
+        self.assertEqual(explained, top_50_by_score)
+
+    def test_empty_mask_returns_empty_array(self):
+        result = main._oot_rows_by_score_desc(np.zeros(10, dtype=bool), np.zeros(10))
+        self.assertEqual(result.size, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

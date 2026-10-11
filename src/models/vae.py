@@ -1362,7 +1362,15 @@ class VAEDetector:
                 raise IncompatibleCheckpointError(
                     f"{path}: mixed-VAE architecture version {payload.get('architecture_version')!r} != "
                     f"{MIXED_ARCHITECTURE_VERSION!r}; refusing to load an older/newer network.")
-            layout = MixedLayout.from_dict(payload["layout"])
+            try:
+                layout = MixedLayout.from_dict(payload["layout"])
+            except ValueError as exc:
+                # Belt and braces alongside the version check above: a payload whose
+                # version matches but whose serialized roles no longer fit the current
+                # `mixed_view.ROLES` (e.g. a role retired after this payload was saved)
+                # must still fail as a documented, catchable incompatibility -- not a
+                # bare ValueError from MixedLayout.__post_init__.
+                raise IncompatibleCheckpointError(f"{path}: {exc}; refusing a partial load.") from exc
             try:
                 mixed_config = MixedVAEConfig.from_dict(payload["mixed_config"])
             except ValueError as exc:

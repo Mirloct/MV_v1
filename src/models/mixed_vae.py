@@ -57,7 +57,14 @@ __all__ = [
 ONEHOT_ARCHITECTURE = "onehot_v1"          # the original MLP VAE over the one-hot matrix
 MIXED_ARCHITECTURE = "mixed_v1"
 #: Bump on ANY change of the mixed architecture or loss definition: old checkpoints are then rejected.
-MIXED_ARCHITECTURE_VERSION = "1"
+#: "2" (2026-10-11): the vestigial "flag" role (missing-value indicator columns, removed project-wide
+#: 2026-10-09) was dropped from `mixed_view.ROLES` and the encoder's input wiring. A payload saved
+#: before that removal, from a panel with numeric NaNs, can have `"flag"` entries in its serialized
+#: `MixedLayout.roles` -- `MixedLayout.__post_init__` now rejects any role outside `ROLES` with a plain
+#: `ValueError`, which `VAEDetector.load` does NOT translate to `IncompatibleCheckpointError` the way it
+#: does for every other incompatibility it checks. Bumping the version routes that case through the
+#: version check instead (line ~1361 in vae.py), which already raises `IncompatibleCheckpointError`.
+MIXED_ARCHITECTURE_VERSION = "2"
 #: -log(1e-6): the largest per-variable NLL. Documented numeric floor of the categorical contribution.
 NLL_CAP = float(-math.log(1e-6))
 

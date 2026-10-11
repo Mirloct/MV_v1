@@ -262,6 +262,26 @@ class TestCheckpoints(Base):
         with self.assertRaises(IncompatibleCheckpointError):
             VAEDetector.load(path, expect_architecture="mixed_v1")
 
+    def test_a_role_retired_from_mixed_view_ROLES_is_also_refused_not_a_bare_valueerror(self):
+        """Regression: the removed vestigial "flag" role (missing-value indicator
+        columns, dropped 2026-10-09) left a gap where a payload whose
+        `architecture_version` still matched but whose serialized layout named a
+        role no longer in `mixed_view.ROLES` raised `MixedLayout.__post_init__`'s
+        bare `ValueError` instead of the documented, catchable
+        `IncompatibleCheckpointError` -- exercised here independently of the
+        version bump (src/models/mixed_vae.py `MIXED_ARCHITECTURE_VERSION`) that
+        also now routes genuinely old payloads through the version check instead."""
+        _, _, _, fit, b, M = self.build()
+        path = self.fit_detector(b, M, fit).save(os.path.join(self.d, "mx.pt"))
+        payload = torch.load(path, weights_only=False)
+        # Keep architecture_version current -- this tests the from_dict() guard
+        # on its own, not the (now also fixed) version-staleness path.
+        payload["layout"]["roles"][0] = "flag"
+        torch.save(payload, path)
+        with self.assertRaises(IncompatibleCheckpointError) as ctx:
+            VAEDetector.load(path)
+        self.assertIn("unknown column role", str(ctx.exception))
+
     def test_resume_ignores_a_one_hot_or_other_layout_checkpoint_in_the_directory(self):
         _, _, _, fit, b, M = self.build()
         onehot = VAEDetector(epochs=2, random_state=1, **TINY)

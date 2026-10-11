@@ -469,12 +469,16 @@ esté fitteando).
 
 **El costo, dicho explícitamente.** Un cero es un *valor*, no un símbolo de
 "faltante". En una columna donde 0 ya significa algo (saldo vacío, cero
-transacciones) un cero imputado es indistinguible de uno real. Por eso
-`add_missing_indicators=True` sigue siendo el default del pipeline — el flag
-0/1 por columna con NaN mantiene "esto estaba ausente" recuperable, así que el
-par (imputación cero + indicador) no pierde información aunque la imputación
-sola sí la perdería. Apagar los indicadores mientras se mantiene la
-imputación cero es la combinación a evitar.
+transacciones) un cero imputado es indistinguible de uno real. Este proyecto
+tuvo un indicador 0/1 por columna con NaN (`missing__<col>`) que mantenía
+"esto estaba ausente" recuperable como feature aparte — **eliminado por
+completo el 2026-10-09**, por decisión explícita del usuario ("lo de missing
+no debe existir, no se debe agregar y no debe formar parte del proyecto"), no
+solo desactivable. La pérdida de información que el indicador mitigaba queda
+aceptada como permanente: `impute_numeric="zero"` decide el relleno solo, sin
+ningún feature compañero. Ver `CONTEXT.md` ("No missing-value indicator
+feature, by explicit project decision") y `CHANGELOG.md` (entradas
+2026-10-05/2026-10-09) para la historia completa.
 
 ### 5.2 Entregable OOT: percentil con banda, período incluido
 

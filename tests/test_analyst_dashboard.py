@@ -108,6 +108,19 @@ class AnalystDashboardTests(unittest.TestCase):
         self.assertIn("fecha_cambio_estado", html)
         self.assertIn("hora_cambio_estado", html)
 
+    def test_identity_value_renders_inline_next_to_the_id_in_the_row(self):
+        """Explicit user request: the identity field (e.g. `despuestocolaborador`)
+        must show beside the ID in each case row, not only inside the profile
+        modal. `only-if`'s latest `puesto` is `"Gerente"` (2026-09 row)."""
+        html = self._build()
+        row_match = re.search(r'<tr data-id="only-if"[^>]*>.*?</tr>', html, re.S)
+        self.assertIsNotNone(row_match, "row for only-if not found")
+        row = row_match.group(0)
+        self.assertIn('class="identitycell"', row)
+        self.assertIn(">Gerente<", row)
+        # The header must name the configured field so the column is self-explanatory.
+        self.assertIn("<th>puesto</th>", html)
+
 
 class MultipleIdentityColumnsTests(unittest.TestCase):
     """Explicit user request: the case card must be able to show SEVERAL
@@ -168,6 +181,30 @@ class MultipleIdentityColumnsTests(unittest.TestCase):
         self.assertNotIn('id="mIdentity_0"', html)
         self.assertNotIn('<div class="midentity">', html)
 
+    def test_multiple_fields_render_inline_joined_in_one_cell(self):
+        """Several configured fields show in ONE inline cell next to the ID,
+        joined (not one column per field) -- `area`'s own latest non-empty
+        value ("Riesgos", from 2026-08) independently of `puesto`'s."""
+        html = self._build(["puesto", "area"])
+        row_match = re.search(r'<tr data-id="only-if"[^>]*>.*?</tr>', html, re.S)
+        row = row_match.group(0)
+        self.assertIn('class="identitycell"', row)
+        self.assertIn("Gerente", row)
+        self.assertIn("Riesgos", row)
+        self.assertIn("<th>puesto / area</th>", html)
+
+    def test_an_empty_list_renders_no_identity_column_in_the_row_either(self):
+        """Same contract as the modal's own empty-list test above, but for the
+        inline row/header added next to the ID -- an empty
+        `dashboard.identity_columns` must not add a dangling header or an
+        empty/broken column, and must not change the "no results" colspan."""
+        html = self._build([])
+        self.assertNotIn('class="identitycell"', html)
+        self.assertNotIn("<th>puesto</th>", html)
+        # Header cell count for the ID/band/score/.../case-status row is
+        # unchanged (8) when no identity column is configured.
+        self.assertIn("colspan='8'", html)
+
 
 class ResponsiveLayoutTests(unittest.TestCase):
     """`.main`/`.col-table`/`.tablewrap` use `flex:1` (`flex-basis:0`) to
@@ -190,6 +227,20 @@ class ResponsiveLayoutTests(unittest.TestCase):
         for selector in (".main", ".col-table", ".tablewrap"):
             self.assertIn(f"{selector}{{flex:none", block,
                           f"{selector} must not keep flex:1 once .shell's height is auto")
+
+    def test_identity_column_has_no_fixed_width_that_would_break_narrow_viewports(self):
+        """The inline identity cell added next to the ID must size by content
+        (overflow-wrap, no hardcoded width wider than a phone viewport) --
+        same contract as `.idc` beside it -- so it cannot reintroduce the
+        table-invisible-on-mobile regression these other tests guard."""
+        from src.reporting.analyst_dashboard import _CSS
+
+        match = re.search(r"\.identitycell\{([^}]*)\}", _CSS)
+        self.assertIsNotNone(match, ".identitycell rule not found in _CSS")
+        rule = match.group(1)
+        self.assertIn("overflow-wrap:anywhere", rule)
+        self.assertNotRegex(rule, r"width:\s*[2-9]\d\d+px",
+                             ".identitycell must not hardcode a wide fixed width")
 
     def test_the_wide_table_keeps_its_own_horizontal_scrollbar(self):
         # Regression: a first fix set .tablewrap to plain `overflow:visible`,

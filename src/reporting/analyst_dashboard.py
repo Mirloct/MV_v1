@@ -211,6 +211,18 @@ def build_analyst_dashboard(
     recurrent_counts = {"if_only": 0, "vae_only": 0, "intersection": 0}
     row_html_list: list[str] = []
     profiles: dict = {}
+    # Explicit user request: show the configured identity field(s) (e.g.
+    # `despuestocolaborador`) beside the ID in every case row, not only
+    # inside the profile modal. `identity_columns` is config-driven and may
+    # legitimately be empty -- in that case the whole column (header + per-row
+    # cell) is omitted rather than rendered blank, so an empty config never
+    # leaves a dangling/empty column in the table.
+    has_identity = bool(identity_columns)
+    identity_th = (
+        f"<th>{html.escape(' / '.join(str(c) for c in identity_columns))}</th>"
+        if has_identity else ""
+    )
+    n_header_cols = 8 + (1 if has_identity else 0)
 
     for i, eid in enumerate(entity_ids, start=1):
         if_pctl = float(if_percentile_by_entity.get(eid, float("nan")))
@@ -241,6 +253,15 @@ def build_analyst_dashboard(
         profile_key = f"p{i}"
         safe_eid = html.escape(eid, quote=True)
         safe_top5 = html.escape(shown_top5, quote=True)
+        identities = _identities_for(eid)
+        identity_td = ""
+        if has_identity:
+            # Each field's own latest non-empty value, joined -- a field with
+            # no value anywhere in this entity's history shows "—" rather
+            # than silently shrinking the join (so a missing 2nd field is
+            # never mistaken for just one field being configured).
+            joined = " · ".join(item["value"] or "—" for item in identities)
+            identity_td = f'<td class="identitycell">{html.escape(joined, quote=True)}</td>'
 
         row_html_list.append(f"""
         <tr data-id="{safe_eid}" data-tab="{tab}" data-profile="{profile_key}"
@@ -249,6 +270,7 @@ def build_analyst_dashboard(
             onkeypress="if(event.key==='Enter')openProfile('{profile_key}')">
           <td class="idx">{i}</td>
           <td class="idc">{safe_eid}</td>
+          {identity_td}
           <td><span class="band band-{band or 'p90'}">{band_label}</span></td>
           <td class="scorecell">{_pct_bar(if_pctl, 'if')}</td>
           <td class="scorecell">{_pct_bar(vae_pctl, 'vae')}</td>
@@ -272,7 +294,7 @@ def build_analyst_dashboard(
 
         profiles[profile_key] = {
             "id": eid, "band": band,
-            "identities": _identities_for(eid),
+            "identities": identities,
             "tab": tab,
             "if_score": if_score, "vae_score": vae_score,
             "if_pctl": if_pctl, "vae_pctl": vae_pctl,
@@ -344,7 +366,6 @@ def build_analyst_dashboard(
           <div class="panel-title">Individuos priorizados<span class="hint">clic en una fila &rarr; perfil completo</span></div>
           <span class="badge" id="rowCountBadge">mostrando {n_rows:,} de {n_total_oot:,}</span>
         </div>
-        <p class="tablenote"><b>Definición fija:</b> la cola priorizada contiene scores &ge; percentil 95 del bloque OOT completo. Las pestañas separan quién fue priorizado solo por Isolation Forest, solo por el detector IF+VAE, o por ambos. El estado operativo del caso es independiente del modelo y el perfil permite descargar todo el historial disponible del individuo, no solo OOT.</p>
         <div class="tabs" role="tablist" aria-label="Coincidencia entre detectores">
           <button class="tabbtn" role="tab" data-tab-target="if_only" onclick="setActiveTab('if_only')">Solo IF <span>{counts['if_only']:,}</span></button>
           <button class="tabbtn" role="tab" data-tab-target="vae_only" onclick="setActiveTab('vae_only')">Solo IF+VAE <span>{counts['vae_only']:,}</span></button>
@@ -362,7 +383,7 @@ def build_analyst_dashboard(
           <table id="priorityTable">
             <thead>
               <tr>
-                <th></th><th>ID</th><th>Banda</th>
+                <th></th><th>ID</th>{identity_th}<th>Banda</th>
                 <th>Percentil IF</th><th>Percentil VAE</th>
                 <th>Top-5 variables (salida del modelo)</th><th>Meses ({n_months})</th><th>Estado del caso</th>
               </tr>
@@ -544,7 +565,7 @@ function filterTable(query){{
       if (!emptyRow){{
         emptyRow = document.createElement("tr");
         emptyRow.id = "noMatchRow";
-        emptyRow.innerHTML = "<td colspan='8' class='no-match'>"
+        emptyRow.innerHTML = "<td colspan='{n_header_cols}' class='no-match'>"
           + "Ningún individuo coincide con el filtro.</td>";
         document.getElementById("priorityTableBody").appendChild(emptyRow);
       }}
@@ -792,10 +813,6 @@ body{background:var(--paper);color:var(--ink);
 .hint{font-family:"Public Sans",sans-serif;font-weight:500;font-size:10.5px;color:var(--ink-mute)}
 .badge{font-family:"IBM Plex Mono",monospace;font-size:10px;font-weight:500;color:var(--ink-soft);
   background:var(--surface-2);border:1px solid var(--border);padding:3px 9px;border-radius:20px}
-.tablenote{margin:0 24px 12px;padding:11px 14px;background:var(--if-soft);border-left:3px solid var(--if);
-  border-radius:6px;font-size:11.5px;line-height:1.55;color:var(--ink-soft);flex-shrink:0}
-.tablenote b{color:var(--ink)}
-
 .tabs{margin:0 24px 10px;display:flex;gap:7px;flex-wrap:wrap;flex-shrink:0}
 .tabbtn{border:1px solid var(--border);border-radius:8px;padding:7px 11px;color:var(--ink-soft);
   background:var(--surface);font-size:11.5px;font-weight:700;display:flex;align-items:center;gap:7px}
@@ -836,6 +853,7 @@ tbody tr[hidden]{display:none}
 tbody td{padding:9px 10px;border-bottom:1px solid var(--border);font-size:12.5px;vertical-align:middle}
 .idx{width:30px;color:var(--ink-mute);font-family:"IBM Plex Mono",monospace;font-size:11px}
 .idc{font-family:"IBM Plex Mono",monospace;font-weight:600;overflow-wrap:anywhere;min-width:120px}
+.identitycell{color:var(--ink-soft);font-size:11.5px;overflow-wrap:anywhere;min-width:110px}
 .no-match{text-align:center;color:var(--ink-mute);font-size:12.5px;padding:22px 10px !important;
   cursor:default}
 

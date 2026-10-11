@@ -14,6 +14,15 @@ best_params_*.yaml`) instead of tuning/fitting new ones, then runs every
 other phase exactly as a full run would -- same report, same dashboard, same
 Excel deliverables, same diagnostic suite, same sensitivity analysis.
 
+Of the four ways to run this project:
+
+* `python main.py`                   -- full flow: tune, fit, suite.
+* `python suite_plus_sensitivity.py`  -- (this script) reuse the trained
+                                         model, DO run the suite.
+* `python train_no_suite.py`         -- tune/fit normally, skip the suite.
+* `python best_params_no_suite.py`   -- reuse the trained model AND skip
+                                         the suite.
+
 Usage::
 
     python suite_plus_sensitivity.py              # same flags main.py accepts

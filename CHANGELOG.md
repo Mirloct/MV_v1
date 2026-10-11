@@ -3205,3 +3205,29 @@ Ningún test fija el texto exacto de `METHODOLOGY_NOTES` (solo las claves `basis
 **Documentación.** `README.md` (sección nueva "Ejecutar solo la suite/sensibilidad, sin reentrenar"), `docs/guia_practica.md` (sección nueva "Ya tengo un modelo entrenado"), `CONTEXT.md` ("On-demand suite, no retraining"). El reporte final (`report.py` context) distingue ahora `tuning=desactivado` (sin tuneo, detector por defecto) de `tuning=reutiliza modelo ya entrenado` (`--reuse-trained`) en vez de mostrar el mismo texto para dos situaciones distintas.
 
 **Pruebas.** `py -m pytest -q --ignore=tools` → **362 passed** sin cambios (el mecanismo se ejecuta en Fase 6/7 de `run_pipeline`, que las pruebas unitarias no invocan de punta a punta -- la validación real es la corrida completa descrita arriba).
+
+---
+
+## 2026-10-11 — Cuarto entry point: `--no-suite` / `--best-params`, dos ejes independientes
+
+**Pedido del usuario:** de las tres formas de correr el proyecto que pidió, dos ya existían de hecho (`main.py` completo, y `suite_plus_sensitivity.py` = reusar lo entrenado + correr la suite, del bloque anterior). Pidió explícitamente que existieran además: (a) un script que corra todo MENOS la suite (tunea/ajusta normal, pero sin el capítulo de diagnóstico ni la sensibilidad), y (b) un script que reuse el modelo con sus hiperparámetros óptimos y tampoco corra la suite. Pidió validar primero si ya existían antes de construir nada.
+
+**Lo que ya existía, sin saberlo el usuario.** `run_diagnostic_suite` y `run_sensitivity_analysis` (`PipelineConfig`, con sus propios `--run-diagnostic-suite`/`--no-run-diagnostic-suite` y `--run-sensitivity-analysis`/`--no-run-sensitivity-analysis`) ya gateaban independientemente la Fase 9c y la Fase 9d respectivamente -- escenario (a) ya era alcanzable combinando `python main.py --no-run-diagnostic-suite --no-run-sensitivity-analysis`, sin escribir una línea de código nuevo. Lo que faltaba era la conveniencia (una sola bandera, un script dedicado) y la combinación con `--reuse-trained` para el escenario (b).
+
+**El cambio.** Dos banderas nuevas en `main.py`, ambas azúcar sintáctica sobre mecanismos existentes, resueltas una vez al principio de `config_from_args` (`reuse_trained = args.reuse_trained or args.best_params`; `no_suite = args.no_suite or args.best_params`):
+- `--no-suite` (`store_true`): fuerza `run_diagnostic_suite=False` y `run_sensitivity_analysis=False` juntas, sin importar el valor propio de esas dos banderas -- "la suite" como la piensa el usuario (Fase 9c + 9d) en una sola bandera, no un mecanismo nuevo.
+- `--best-params` (`store_true`): azúcar sobre `--reuse-trained --no-suite` combinadas -- el camino más rápido posible a los entregables centrales (evaluación, Excel de OOT, reporte, dashboard) desde un modelo ya entrenado.
+
+Dos scripts nuevos, mismo patrón de ~20 líneas que `suite_plus_sensitivity.py` (importan `main.main`, inyectan su propia bandera en el argv, reenvían el resto tal cual): `train_no_suite.py` (`--no-suite`) y `best_params_no_suite.py` (`--best-params`). Ahora son cuatro scripts cubriendo las cuatro combinaciones de los dos ejes independientes (reusar × suite), ninguno con lógica duplicada -- los cuatro llaman al mismo `run_pipeline`:
+
+| | Corre la suite | No corre la suite |
+|---|---|---|
+| **Tunea/ajusta** | `main.py` | `train_no_suite.py` |
+| **Reusa lo entrenado** | `suite_plus_sensitivity.py` | `best_params_no_suite.py` |
+
+**Verificado con corridas reales de punta a punta** (`--quick`, sobre los datos sintéticos ya existentes), no solo con tests unitarios -- un cambio de plomería de CLI/config no tiene una prueba unitaria razonable, así que la validación es que el pipeline completo termine bien y haga exactamente lo que dice:
+1. `python train_no_suite.py --quick` -> tuneo+ajuste real de ambos detectores (igual que una corrida completa), termina con éxito (`EXIT_CODE=0`), y el resumen final confirma `IF-VAE diagnostic suite: (not run)` / `Sensitivity analysis: (not run)` -- ninguna línea de Fase 9c/9d en el log.
+2. `python best_params_no_suite.py --quick`, contra los checkpoints frescos que dejó la corrida anterior -> `--reuse-trained: loaded Isolation Forest...` (Fase 6 en 1.89 s) y `...loaded VAE...` (Fase 7 en 1.45 s), termina con éxito, mismo resumen final con ambas fases de la suite en `(not run)`.
+3. `py -m pytest -q --ignore=tools` → **362 passed**, sin cambios -- confirma que nada del resto del proyecto se rompió.
+
+**Documentación.** `README.md` (reemplazada la sección de un solo script por "Las 4 formas de correr el proyecto", con tabla), `docs/guia_practica.md` (misma reestructuración, tabla equivalente), `CONTEXT.md` ("Four entry points, two independent axes"). `docs/documentation.html` regenerado desde las fuentes `.md`.

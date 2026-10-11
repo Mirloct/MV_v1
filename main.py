@@ -149,8 +149,11 @@ class PipelineConfig:
     tune: bool = True
     # On-demand suite mode: load the already-tuned, already-fitted detectors
     # from `artifacts/models/` instead of tuning/fitting new ones (see
-    # `--reuse-trained`). `config_from_args` forces `tune=False` whenever this
-    # is on -- reuse and tune are mutually exclusive, not independent knobs.
+    # `--reuse-trained`, or the combined `--best-params` -- see
+    # `config_from_args`, which also folds `--no-suite`/`--best-params` into
+    # `run_diagnostic_suite`/`run_sensitivity_analysis` below). `config_from_args`
+    # forces `tune=False` whenever this is on -- reuse and tune are mutually
+    # exclusive, not independent knobs.
     reuse_trained: bool = False
     iforest_trials: int = 15
     vae_trials: int = 10
@@ -208,7 +211,9 @@ class PipelineConfig:
     # and adds real runtime -- most of it from `diagnostic_stability_refits`
     # below, which refits both detectors several times. Pass
     # --no-run-diagnostic-suite to skip it (e.g. on a machine without the
-    # package installed).
+    # package installed). Also forced off by `--no-suite`/`--best-params`
+    # (see `config_from_args`), which turn this off together with
+    # `run_sensitivity_analysis` as "the suite" in one shot.
     run_diagnostic_suite: bool = True
     # Threshold grid the diagnostic chapter's sensitivity section sweeps.
     # Defaults to this project's own P90/P95/P99 operating points (the same
@@ -280,7 +285,8 @@ class PipelineConfig:
     diagnostic_backtest_min_fit_periods: int = 4
     # Post-training robustness analysis. It reuses the already fitted
     # preprocessor and detectors (never refits) and introduces labels only for
-    # post-hoc performance comparison when they exist.
+    # post-hoc performance comparison when they exist. Also forced off by
+    # `--no-suite`/`--best-params` -- see `run_diagnostic_suite` above.
     run_sensitivity_analysis: bool = True
     sensitivity_max_test_rows: int = 5000
     sensitivity_combination_top_k: int = 6
@@ -2809,6 +2815,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                              "doesn't match the current data/config -- it never silently falls "
                              "back to training. See suite_plus_sensitivity.py for a dedicated "
                              "entry point that sets this automatically.")
+    parser.add_argument("--no-suite", action="store_true", default=False,
+                        help="Skip the IF-VAE diagnostic suite (Phase 9c) and the post-training "
+                             "sensitivity analysis (Phase 9d); every other phase (tuning/fitting, "
+                             "evaluation, OOT Excel exports, report, dashboard) runs as usual. "
+                             "Shorthand for --no-run-diagnostic-suite --no-run-sensitivity-analysis "
+                             "combined -- forces both off regardless of those flags' own value. "
+                             "See train_no_suite.py for a dedicated entry point.")
+    parser.add_argument("--best-params", action="store_true", default=False,
+                        help="Shorthand for --reuse-trained --no-suite combined: load the "
+                             "already-tuned, already-fitted detectors and produce the core "
+                             "deliverables (evaluation, OOT Excel, report, dashboard) without "
+                             "tuning, fitting, or running the diagnostic/sensitivity suite. "
+                             "See best_params_no_suite.py for a dedicated entry point.")
     parser.add_argument("--iforest-trials", type=int, default=None,
                         help="Isolation Forest Optuna trials (default 15).")
     parser.add_argument("--vae-trials", type=int, default=None,
@@ -3133,6 +3152,11 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
     if args.quick and args.full:
         raise SystemExit("--quick and --full are mutually exclusive.")
     preset = _QUICK if args.quick else (_FULL if args.full else {})
+    # --best-params is sugar for --reuse-trained --no-suite combined; either the
+    # shorthand or the two underlying flags (also combinable on their own) have
+    # the same effect from here on.
+    reuse_trained = args.reuse_trained or args.best_params
+    no_suite = args.no_suite or args.best_params
 
     def resolve(name):
         explicit = getattr(args, name)
@@ -3154,8 +3178,8 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         live_view=args.live_view,
         console_ui=args.console_ui,
         panel_features=args.panel_features,
-        tune=(False if args.reuse_trained else resolve("tune")),
-        reuse_trained=args.reuse_trained,
+        tune=(False if reuse_trained else resolve("tune")),
+        reuse_trained=reuse_trained,
         iforest_trials=resolve("iforest_trials"),
         vae_trials=resolve("vae_trials"),
         vae_epochs=resolve("vae_epochs"),
@@ -3171,12 +3195,12 @@ def config_from_args(args: argparse.Namespace) -> PipelineConfig:
         threshold_percentile=args.threshold_percentile,
         threshold_target_far=args.threshold_target_far,
         stack_iforest_into_vae=args.stack_iforest_into_vae,
-        run_diagnostic_suite=args.run_diagnostic_suite,
+        run_diagnostic_suite=(False if no_suite else args.run_diagnostic_suite),
         diagnostic_entity_view=args.diagnostic_entity_view,
         diagnostic_auto_install_suite=args.auto_install_suite,
         skip_dependency_check=args.skip_dependency_check,
         auto_install_deps=args.auto_install_deps,
-        run_sensitivity_analysis=args.run_sensitivity_analysis,
+        run_sensitivity_analysis=(False if no_suite else args.run_sensitivity_analysis),
         sensitivity_max_test_rows=args.sensitivity_max_test_rows,
         sensitivity_combination_top_k=args.sensitivity_combination_top_k,
         sensitivity_random_subsets_per_level=args.sensitivity_random_subsets,

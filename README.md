@@ -486,37 +486,45 @@ python main.py --no-run-sensitivity-analysis  # omite la Fase 9d post-entrenamie
 python main.py --help
 ```
 
-### Ejecutar solo la suite/sensibilidad, sin reentrenar — `suite_plus_sensitivity.py`
+### Las 4 formas de correr el proyecto
 
-Si ya existe un modelo entrenado (`artifacts/models/iforest.joblib`,
-`artifacts/models/vae_best.pt` -- o sus variantes `_dev/` para datos sintéticos)
-y sus hiperparámetros óptimos (`artifacts/tuning/best_params_iforest.yaml`,
-`best_params_vae.yaml`, escritos automáticamente al final de cada tuneo),
-no hace falta correr Optuna ni reentrenar para regenerar el reporte, el
-dashboard, los Excel de OOT, la suite de diagnóstico IF-VAE o el análisis de
-sensibilidad -- eso es exactamente lo que vuelve a hacer `python main.py` desde
-cero cada vez.
+"La suite" = el capítulo de diagnóstico cruzado IF-VAE (Fase 9c) + el análisis
+de sensibilidad post-entrenamiento (Fase 9d) -- los dos pasos más costosos
+después del tuneo mismo. "Reusar lo entrenado" = cargar el Isolation Forest y
+el VAE ya guardados en `artifacts/models/` (y sus `best_params_*.yaml` en
+`artifacts/tuning/`) en vez de tunear/ajustar de nuevo. Las cuatro
+combinaciones son cuatro puntos de entrada, cada uno un nombre de conveniencia
+sobre banderas de `main.py` -- ninguno duplica lógica, los cuatro llaman al
+mismo `run_pipeline`:
+
+| Script | Banderas equivalentes | Tunea/ajusta | Corre la suite |
+|---|---|---|---|
+| `python main.py` | (ninguna, es el default) | Sí | Sí |
+| `python train_no_suite.py` | `main.py --no-suite` | Sí | No |
+| `python suite_plus_sensitivity.py` | `main.py --reuse-trained` | No (reusa) | Sí |
+| `python best_params_no_suite.py` | `main.py --best-params` | No (reusa) | No |
 
 ```bash
-python suite_plus_sensitivity.py            # carga los modelos ya entrenados, corre el resto igual
-python suite_plus_sensitivity.py --quick    # idem, contra el preset --quick
+python main.py --quick                      # flujo completo: tunea, ajusta, corre la suite
+python train_no_suite.py --quick             # tunea/ajusta igual, sin la suite (más rápido, mismos detectores)
+python suite_plus_sensitivity.py --quick     # reusa el modelo ya entrenado, corre la suite igual
+python best_params_no_suite.py --quick       # reusa el modelo ya entrenado, sin la suite (el más rápido)
 ```
 
-Es `python main.py --reuse-trained` bajo un nombre de conveniencia -- acepta
-las mismas banderas que `main.py` (las reenvía tal cual) y solo cambia qué
-pasa en las Fases 6/7: en vez de tunear+ajustar, carga el detector ya guardado
-y **fuerza `--no-tune`** (reuso y tuneo son mutuamente excluyentes, no dos
-perillas independientes). Todo lo demás -- carga de datos, preprocesamiento,
-evaluación, exportación a Excel, diagnóstico, sensibilidad, reporte -- corre
-exactamente igual que en una corrida completa, porque usa el mismo
-`run_pipeline` de `main.py`, no una copia.
+Cada script acepta las mismas banderas que `main.py` y las reenvía tal cual
+(por ejemplo `--quick`/`--full`/`--top-n`); solo agregan la bandera propia
+(`--no-suite`, `--reuse-trained` o `--best-params`, que es exactamente
+`--reuse-trained --no-suite` combinadas) antes de llamarlo. `--no-suite`
+apaga `run_diagnostic_suite` y `run_sensitivity_analysis` juntos, sin tocar
+ninguna otra fase (carga de datos, preprocesamiento, evaluación, Excel de
+OOT, reporte, dashboard, atribución de features siguen corriendo igual).
 
-**Falla fuerte, nunca entrena en silencio como respaldo:** si todavía no hay
-un modelo guardado, se detiene pidiendo correr `python main.py` una vez
-primero; si los datos o el preprocesamiento cambiaron desde que el modelo se
-entrenó (otra cantidad de columnas, u otra huella de arquitectura para el VAE
-mixto), se detiene con un error explícito en vez de puntuar con un modelo que
-ya no corresponde a los datos actuales.
+**Reusar lo entrenado falla fuerte, nunca entrena en silencio como
+respaldo:** si todavía no hay un modelo guardado, se detiene pidiendo correr
+`python main.py` una vez primero; si los datos o el preprocesamiento
+cambiaron desde que el modelo se entrenó (otra cantidad de columnas, u otra
+huella de arquitectura para el VAE mixto), se detiene con un error explícito
+en vez de puntuar con un modelo que ya no corresponde a los datos actuales.
 
 La suite `ifvae_diag` está activa y se auto-instala desde la copia vendorizada
 del repositorio cuando hace falta; no requiere un `pip install` manual. Para una

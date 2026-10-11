@@ -91,26 +91,42 @@ python main.py --quick --no-tune --no-auto-install-suite
 En ese modo la fase diagnóstica informa claramente que la suite no está
 disponible; no intenta descargar un paquete por nombre desde internet.
 
-### Ya tengo un modelo entrenado -- solo quiero el reporte/la suite/sensibilidad
+### Las 4 formas de correr el proyecto
 
-`python main.py` siempre tunea y ajusta antes de correr el resto. Si ya hay un
-modelo guardado (`artifacts/models/iforest.joblib`, `artifacts/models/vae_best.pt`,
-o sus variantes `_dev/` con datos sintéticos) y sus hiperparámetros óptimos
-(`artifacts/tuning/best_params_*.yaml`, escritos al final de cada tuneo), no
-hace falta pagar el tuneo/entrenamiento otra vez solo para regenerar el reporte,
-el dashboard, los Excel o la suite de diagnóstico/sensibilidad:
+`python main.py` tunea, ajusta y corre todo, incluida "la suite" (el capítulo
+de diagnóstico cruzado IF-VAE, Fase 9c, + el análisis de sensibilidad
+post-entrenamiento, Fase 9d -- los pasos más caros después del tuneo mismo).
+Dos ejes independientes, cuatro combinaciones, cuatro scripts -- ninguno
+duplica lógica, los cuatro llaman al mismo `run_pipeline` de `main.py`:
+
+| Quiero... | Comando | Tunea/ajusta | Corre la suite |
+|---|---|---|---|
+| Todo, como siempre | `python main.py` | Sí | Sí |
+| Entrenar de nuevo pero sin la suite (más rápido) | `python train_no_suite.py` | Sí | No |
+| Reusar el modelo ya entrenado, con la suite | `python suite_plus_sensitivity.py` | No | Sí |
+| Reusar el modelo ya entrenado, sin la suite (el más rápido) | `python best_params_no_suite.py` | No | No |
 
 ```powershell
+python train_no_suite.py --quick
 python suite_plus_sensitivity.py --quick
+python best_params_no_suite.py --quick
 ```
 
-Es `python main.py --reuse-trained` bajo un nombre corto: carga los detectores
-ya guardados en vez de tunear/ajustar, y corre todo lo demás exactamente igual
-que una corrida completa. Si todavía no hay un modelo guardado, o si los datos
-cambiaron desde que se entrenó (otra cantidad de columnas, otra huella de
-arquitectura del VAE mixto), el comando se detiene con un error explícito en
-vez de entrenar en silencio o puntuar con un modelo que ya no corresponde a
-los datos actuales -- en ese caso corré `python main.py` una vez primero.
+Cada uno es `main.py` con una bandera de conveniencia ya puesta:
+`--no-suite` (apaga Fase 9c + 9d juntas, sin tocar el resto), `--reuse-trained`
+(carga el IF/VAE ya guardados en `artifacts/models/` en vez de tunear/ajustar)
+o `--best-params` (las dos anteriores combinadas). Si ya hay un modelo
+guardado (`artifacts/models/iforest.joblib`, `artifacts/models/vae_best.pt`,
+o sus variantes `_dev/` con datos sintéticos) y sus hiperparámetros óptimos
+(`artifacts/tuning/best_params_*.yaml`, escritos al final de cada tuneo), los
+dos scripts de "reusar" evitan pagar el tuneo/entrenamiento otra vez.
+
+**Reusar lo entrenado falla fuerte, nunca entrena en silencio como
+respaldo.** Si todavía no hay un modelo guardado, o si los datos cambiaron
+desde que se entrenó (otra cantidad de columnas, otra huella de arquitectura
+del VAE mixto), el comando se detiene con un error explícito en vez de
+entrenar en silencio o puntuar con un modelo que ya no corresponde a los
+datos actuales -- en ese caso corré `python main.py` una vez primero.
 
 ## Labels revisados: cómo preparar la tabla y qué esperar
 

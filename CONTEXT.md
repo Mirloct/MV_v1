@@ -1486,6 +1486,30 @@ Measured on the synthetic generator (`generate_synthetic_panel`):
   `main.main()` with `--reuse-trained` injected into argv -- same
   `run_pipeline`, not a duplicated flow; every other `main.py` flag (e.g.
   `--quick`) passes through unchanged.
+- **Four entry points, two independent axes (added 2026-10-11)**: "reuse
+  trained" (above) and "skip the suite" turned out to be two independent
+  toggles, not one -- the user wanted a way to tune/fit normally but skip
+  Phase 9c/9d too (not just the reuse+suite combination above), plus a
+  fourth combination with both on. `--no-suite` (CLI, `store_true`) forces
+  both `run_diagnostic_suite` and `run_sensitivity_analysis` to `False` in
+  `config_from_args`, regardless of `--run-diagnostic-suite`/
+  `--no-run-sensitivity-analysis`'s own value -- a one-flag shorthand for
+  "the suite" as the user thinks of it (Phase 9c + 9d together), not a new
+  mechanism (those two flags already existed and already gated exactly
+  those two phases independently). `--best-params` is sugar for
+  `--reuse-trained --no-suite` combined, computed once in
+  `config_from_args` (`reuse_trained = args.reuse_trained or
+  args.best_params`; `no_suite = args.no_suite or args.best_params`) so the
+  shorthand and the underlying flags stay interchangeable and combinable.
+  Four scripts, one per corner of the 2×2 (reuse × suite), each a ~20-line
+  wrapper injecting its flag into `main.main()`'s argv -- no duplicated
+  logic, all four run the same `run_pipeline`:
+  `main.py` (tune, suite), `train_no_suite.py` (tune, no suite),
+  `suite_plus_sensitivity.py` (reuse, suite), `best_params_no_suite.py`
+  (reuse, no suite). Validated end-to-end with real `--quick` runs for all
+  four combinations, not just unit tests (hyperparameter/CLI-plumbing
+  changes like this have no reasonable unit test; the pipeline either
+  completes correctly or it doesn't).
 - **Environment setup**: run `python setup_validator.py` before doing
   anything else in a new environment; it checks Python version and
   dependencies and attempts to auto-install anything missing. `pyarrow`

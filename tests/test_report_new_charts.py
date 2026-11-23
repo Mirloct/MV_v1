@@ -4,10 +4,23 @@ split-count (clearest/noisiest variables) and per-seed stability (Jaccard heatma
 Data sources / inputs: hand-built ``chart_data`` payloads, the same shape
 ``main.py`` assembles into ``chart_static``.
 Created: 2026-09-28
+Last modified: 2026-11-22
+Changelog:
+- 2026-11-22: Guarded the P99 detector-agreement explanatory copy.
 """
 from __future__ import annotations
 
 import unittest
+
+from src.reporting.report_content import FIGURE_NOTES
+
+
+class OfficialOperatingPointCopyTests(unittest.TestCase):
+    def test_detector_agreement_note_describes_p99_not_legacy_p95(self):
+        note = FIGURE_NOTES["model_agreement"]
+        self.assertIn("P99 x P99", note)
+        self.assertNotIn("top-5%", note)
+
 
 from src.reporting.report_content import build_plotly_figures
 

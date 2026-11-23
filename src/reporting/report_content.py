@@ -26,6 +26,13 @@ Two hard rules for everything below:
   ΔE 24.7 protan / 33.6 normal-vision in light mode, 26.8 / 31.8 in dark --
   both far above the ≥8 / ≥15 floors). Series identity is never carried by
   colour alone: every chart also direct-labels or legends its series.
+
+Data sources / inputs: the run's chart-data payload and model diagnostics.
+Created: 2026-08-22
+Last modified: 2026-11-22
+Changelog:
+- 2026-11-22: Aligned the detector-agreement operating quadrant with the
+  official P99 analyst-dashboard policy.
 """
 
 from __future__ import annotations
@@ -224,7 +231,7 @@ FIGURE_NOTES: dict[str, str] = {
         "por lo que un individuo con puntaje alto en ambos cuenta con "
         "evidencia corroborada de forma independiente. La línea punteada "
         "diagonal marca el acuerdo perfecto; el recuadro naranja señala el "
-        "cuadrante top-5% x top-5%, los candidatos más fuertes. Celdas "
+        "cuadrante P99 x P99 (top-1% por detector), los candidatos más fuertes. Celdas "
         "densas fuera de la diagonal marcan casos donde los dos métodos "
         "realmente discrepan, y vale la pena inspeccionarlos precisamente "
         "porque un detector ve algo que el otro no. El panel lateral "
@@ -918,7 +925,7 @@ def build_plotly_figures(chart_data: dict, log=None) -> list[dict]:
                 sa = np.asarray([ea[i] for i in common], dtype=float)
                 sb = np.asarray([eb[i] for i in common], dtype=float)
                 rho = float(spearmanr(sa, sb).statistic)
-                overlap = int(((pa >= 95.0) & (pb >= 95.0)).sum())
+                overlap = int(((pa >= 99.0) & (pb >= 99.0)).sum())
 
                 # 4x4 quartile confusion matrix -- 0=Q1 (0-25) .. 3=Q4 (75-100).
                 qa = np.clip((pa / 25.0).astype(int), 0, 3)
@@ -958,17 +965,17 @@ def build_plotly_figures(chart_data: dict, log=None) -> list[dict]:
                     hoverinfo="skip",
                     line=dict(dash="dash", width=1.3, color="rgba(235,238,245,0.85)"),
                 ), row=1, col=1)
-                # Top-5% x top-5% quadrant, outlined so it reads against any
+                # Official P99 x P99 quadrant, outlined so it reads against any
                 # density colour underneath it.
                 fig.add_shape(
-                    type="rect", x0=95, x1=100, y0=95, y1=100, row=1, col=1,
+                    type="rect", x0=99, x1=100, y0=99, y1=100, row=1, col=1,
                     line=dict(color="#ff5a36", width=2.2), fillcolor="rgba(0,0,0,0)",
                 )
                 fig.add_annotation(
                     x=0.015, y=0.985, xref="paper", yref="paper", xanchor="left",
                     yanchor="top", showarrow=False, align="left", font=dict(size=11),
                     text=(f"Spearman rho = {rho:.3f}<br>"
-                          f"solapamiento cuadrante top-5%: {overlap} individuos "
+                          f"solapamiento cuadrante P99: {overlap} individuos "
                           f"({100.0 * overlap / n:.1f}% de {n})"),
                 )
                 # Side panel: same population, binned by quartile instead of

@@ -68,7 +68,7 @@ metrics simply degrade to `NaN` and can be skipped.
 | `calibrate_threshold(scores, method="pot"\|"percentile", ...)` | `thresholds.py` | **Alert cut-off fitted on validation scores** (GPD/POT or percentile). |
 | `apply_threshold(scores, threshold)` | `thresholds.py` | 0/1 alert flags. |
 | `build_scored_frame(raw_df, keys, scores, schema)` | `scoring.py` | Attach `anomaly_score` + **raw** features to `(entity_id, period)`. |
-| `export_oot_top_anomalies(scored_df, schema, min_percentile=90.0, ...)` | `oot_report.py` | **The deliverable:** distinct individuals at/above a score percentile (default P90), ID–PERIOD–SCORE–BAND–VARIABLES `.xlsx`. `top_n`/`top_fraction` switch to a fixed headcount instead. |
+| `export_oot_top_anomalies(scored_df, schema, min_percentile=90.0, ...)` | `oot_report.py` | **Control workbook:** distinct individuals at/above P90 of the complete deduplicated OOT population, banded p90/p95/p99. The analyst dashboard separately applies the official P99 queue. |
 | `export_oot_top_decile(scored_df, schema, ...)` | `oot_report.py` | Percentage-based wrapper kept for backwards compatibility. |
 | `plot_embedding(X, scores_or_labels, method=...)` | `visualize.py` | 2D PCA/t-SNE/UMAP scatter coloured by score. |
 | `plot_roc_pr(y_true, scores)` | `visualize.py` | ROC + PR curves side by side. |

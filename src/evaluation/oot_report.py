@@ -1,6 +1,6 @@
-"""The headline deliverable: OOT top-decile anomaly Excel export.
+"""The OOT P90+ control workbook export.
 
-Business requirement (CONTEXT.md Status): export the **top 10% of individuals by
+Business requirement (CONTEXT.md Status): export individuals at or above **P90 by
 anomaly score in the out-of-time (last) month**, sorted descending, laid out as
 **ID - SCORE - VARIABLES**. This module produces exactly that ``.xlsx`` artifact
 under ``reports/`` and returns the table for programmatic use.
@@ -13,6 +13,13 @@ Column layout (hard requirement):
   feature values carried by the scored frame (never the preprocessed/scaled
   matrix). The OOT month itself is constant across the table (it is the single
   last period) and is logged rather than repeated as a column.
+Data sources / inputs: scored panel rows, panel schema, OOT-period count, and
+the configured selection percentile; writes a risk-ranked Excel workbook.
+Created: 2026-08-22
+Last modified: 2026-11-22
+Changelog:
+- 2026-11-22: Clarified that this P90+ workbook is the broad control base;
+  the analyst dashboard applies the separate official P99 operating point.
 """
 
 from __future__ import annotations
@@ -58,11 +65,11 @@ BAND_COL = "percentil"
 
 def _resolve_out_path(
     out_path: str, top_fraction: float, model_name: str, top_n: Optional[int],
-    min_percentile: Optional[float] = None,
+    min_percentile: Optional[float] = 90.0,
 ) -> str:
     """Fold the selection size and ``model_name`` into the default filename.
 
-    ``oot_p90_iforest.xlsx`` for a percentile export, ``oot_top50_iforest.xlsx``
+    ``oot_p90_iforest.xlsx`` for the default percentile export, ``oot_top50_iforest.xlsx``
     for a top-N one, ``oot_top10_iforest.xlsx`` for a top-fraction one.
     """
     if out_path == _DEFAULT_OUT and model_name and model_name != "model":
@@ -337,12 +344,12 @@ def export_oot_top_decile(
 ) -> tuple[str, pd.DataFrame]:
     """Percentage-based export -- thin wrapper kept for backwards compatibility.
 
-    Equivalent to :func:`export_oot_top_anomalies` with ``top_n=None``. New code
-    should call that directly, since the default deliverable is now a fixed-size
-    top-N queue.
+    Equivalent to :func:`export_oot_top_anomalies` with ``min_percentile=None``
+    and ``top_n=None``. The standard control workbook uses the P90 default.
     """
     return export_oot_top_anomalies(
-        scored_df, schema, out_path=out_path, top_n=None, top_fraction=top_fraction,
+        scored_df, schema, out_path=out_path, min_percentile=None, top_n=None,
+        top_fraction=top_fraction,
         model_name=model_name, n_oot_periods=n_oot_periods, score_col=score_col,
     )
 

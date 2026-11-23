@@ -20,7 +20,7 @@ turn into an ignored setting.
 Data sources / inputs: ``configs/pipeline.yaml`` or the path supplied by
 ``--config``; values are applied to ``main.PipelineConfig``.
 Created: 2026-09-25
-Last modified: 2026-10-01
+Last modified: 2026-11-22
 Changelog:
 - 2026-09-25: Made YAML validation reject duplicate/unknown empty keys,
   non-finite or out-of-range grids, and inconsistent backtest origin counts.
@@ -28,6 +28,8 @@ Changelog:
 - 2026-10-01: ``dashboard.identity_column`` (one field) replaced by
   ``dashboard.identity_columns`` (a list) -- the analyst dashboard can now
   show several identification fields per case, not only one.
+- 2026-11-22: Added separate governed rules for the P90+ control workbook and
+  the official P99 analyst dashboard.
 """
 
 from __future__ import annotations
@@ -185,6 +187,13 @@ def _half_floats(value: Any) -> tuple:
     return vals
 
 
+def _percentile(value: Any) -> float:
+    v = _pos_float(value)
+    if not 0.0 < v < 100.0:
+        raise ValueError("expected a percentile strictly between 0 and 100")
+    return v
+
+
 def _strings(value: Any) -> tuple:
     """A column name, or a list of them; blanks are dropped, order preserved, no duplicates."""
     if value is None:
@@ -207,7 +216,9 @@ CONFIG_KEYS: dict[str, tuple[str, Callable[[Any], Any]]] = {
     "diagnostic.stability_refits": ("diagnostic_stability_refits", _pos_int),
     "diagnostic.sensitivity_grid": ("diagnostic_sensitivity_grid", _unit_floats),
     "dashboard.identity_columns": ("analyst_identity_columns", _strings),
+    "dashboard.review_percentile": ("analyst_review_percentile", _percentile),
     "data.identification_columns": ("identification_columns", _strings),
+    "output.oot_min_percentile": ("oot_min_percentile", _percentile),
     # -- Section 9 experiments (src/evaluation/ifvae_experiments.py) ------------
     "experiments.families": ("diagnostic_experiment_families", _families),
     "experiments.vae_fit_budget": ("diagnostic_experiment_vae_fit_budget", _pos_int),

@@ -1,4 +1,11 @@
-"""Report incidents must contain failures, never routine warnings."""
+"""Report incidents and split-count interpretations.
+
+Data sources / inputs: in-memory report contexts.
+Created: 2026-08-30
+Last modified: 2026-11-22
+Changelog:
+- 2026-11-22: Added the equal-cut general-interpretation regression test.
+"""
 
 from __future__ import annotations
 
@@ -94,14 +101,14 @@ class IForestSplitsRecommendationSectionTests(unittest.TestCase):
         self.assertEqual(_iforest_splits_section_md(ctx), "")
         self.assertEqual(_iforest_splits_section_html(ctx), "")
 
-    def test_zero_usage_variable_is_recommended_for_removal(self):
+    def test_zero_usage_variable_is_recommended_for_ablation(self):
         from src.reporting.report import (
             _iforest_splits_section_html, _iforest_splits_section_md,
         )
         ctx = self._ctx()
         for out in (_iforest_splits_section_md(ctx), _iforest_splits_section_html(ctx)):
             self.assertIn("legacy_flag", out)
-            self.assertIn("Candidata a eliminar", out)
+            self.assertIn("Candidata a evaluación de ablación", out)
             self.assertIn("0% de uso", out)
             self.assertIn("1 de las 5", out)   # 1 unused_feature out of n_features_total
 
@@ -150,3 +157,18 @@ class IForestSplitsRecommendationSectionTests(unittest.TestCase):
         # Evidencia, Recomendación) -- 4 unescaped "|" separators per row.
         row_line = next(l for l in out.splitlines() if "weird" in l)
         self.assertEqual(row_line.count("|") - row_line.count("\\|"), 4)
+
+    def test_equal_best_and_worst_cuts_use_a_general_interpretation(self):
+        from src.reporting.report import (
+            _iforest_splits_section_html, _iforest_splits_section_md,
+        )
+
+        ctx = self._ctx(
+            top_clear=[("balance", 4.04)],
+            top_noisy=[("region_code", 4.03)],
+            unused_features=[],
+        )
+        for out in (_iforest_splits_section_html(ctx), _iforest_splits_section_md(ctx)):
+            self.assertIn("mismo número de cortes", out)
+            self.assertIn("Sin separación útil", out)
+            self.assertIn("ablación controlada", out)

@@ -3,7 +3,7 @@
 Wires the project's existing public APIs into a single pipeline:
 
     data -> preprocessing (+ statistical justification) -> OOT split ->
-    Isolation Forest + VAE (tune/fit) -> evaluation -> OOT top-decile Excel ->
+    Isolation Forest + VAE (tune/fit) -> evaluation -> OOT P90+ control Excel ->
     interpretability -> HTML/MD report + technical documentation.
 
 Every phase is wrapped in ``log_phase`` and all runtime output lands in
@@ -18,10 +18,12 @@ Data sources / inputs: configured panel data, reviewed-label files, model
 artifacts, and ``configs/pipeline.yaml``; writes run models, diagnostics, and
 reporting context under the project artifact tree.
 Created: 2026-08-22
-Last modified: 2026-09-26
+Last modified: 2026-11-22
 Changelog:
 - 2026-09-26: Enforced the fixed IF/VAE training contract at dataclass, CLI,
   YAML and full-run entry points.
+- 2026-11-22: Separated the broad P90+ control workbook from the official P99
+  analyst dashboard, report KPI, and recurrence policy.
 """
 
 from __future__ import annotations
@@ -192,6 +194,7 @@ class PipelineConfig:
     # scales with the portfolio and keeps its distributional meaning.
     # `--top-n N` overrides it with a fixed-size queue instead.
     oot_min_percentile: Optional[float] = 90.0
+    analyst_review_percentile: float = 99.0
     top_n: Optional[int] = None
     top_fraction: float = 0.10
     threshold_method: str = "pot"
@@ -846,7 +849,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
     deliverable_tables: dict = {}
     # One representative, explained OOT row per entity and detector.  Unlike
     # ``deliverable_tables`` these are not P90/P95 filtered: the dashboard's
-    # P95 union can contain a VAE-only entity below IF's export threshold (or
+    # P99 union can contain a VAE-only entity below IF's export threshold (or
     # vice versa), and its profile must still show both detectors' variables.
     dashboard_explanation_tables: dict = {}
     analyst_dashboard_path: Optional[str] = None
@@ -2003,24 +2006,24 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 # Headline "flagged for review" count for the report -- read
                 # directly off the exported table's own `percentil` column
                 # rather than recomputed independently, so the number on the
-                # report always matches what a reviewer would get by opening
-                # this exact file and counting P95+ rows themselves. `p95`
-                # and `p99` are both >= the P95 cut-off (bands are cumulative
-                # -- see `_percentile_band_labels`), so summing both bands is
-                # the full P95+ count. Deliberately NOT the calibrated
+                # report always matches what a reviewer gets by opening this
+                # exact control file. The operational dashboard is P99, so
+                # only the p99 band of this broader P90+ workbook is official.
+                # Deliberately NOT the calibrated
                 # `threshold`/`alert` count above: that can degenerate to
                 # zero on real data with no floor, which is the exact bug
                 # this replaces. Denominator is this model's own
                 # `true_oot_entity_scores` (Phase 8, same OOT dedup rule).
-                oot_review_count = int(_table[BAND_COL].isin(("p95", "p99")).sum())
+                oot_review_count = int(_table[BAND_COL].eq("p99").sum())
                 oot_review_rate = (
                     oot_review_count / len(true_oot_entity_scores)
                     if true_oot_entity_scores else None
                 )
                 logger.info(
-                    "[%s] flagged for review (score >= P95, from %s): %d of %d "
+                    "[%s] flagged for review (score >= P%.2f, from %s): %d of %d "
                     "unique OOT individuals.",
-                    name, out_path, oot_review_count, len(true_oot_entity_scores),
+                    name, float(config.analyst_review_percentile), out_path,
+                    oot_review_count, len(true_oot_entity_scores),
                 )
                 # Kept for the single, unified analyst dashboard built after
                 # this loop -- see below. Not built per-model: the dashboard
@@ -2090,7 +2093,8 @@ def run_pipeline(config: PipelineConfig) -> dict:
     # scores for the same individual side by side (an in-memory join on
     # `true_oot_entity_scores`, Phase 8 -- both detectors are always
     # evaluated regardless of `--stack-iforest-into-vae`). The queue is the
-    # P95 union, split into only-IF, only-IF+VAE, and intersection tabs.
+    # Configured-percentile union (P99 officially), split into only-IF,
+    # only-IF+VAE, and intersection tabs.
     with log_phase("Phase 9b: analyst dashboard"):
         try:
             from scipy.stats import rankdata
@@ -2139,7 +2143,9 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 ("iforest", if_scores_by_entity), ("vae", vae_scores_by_entity),
             ):
                 dash_cutoff = (
-                    float(np.percentile(list(dash_scores.values()), 95.0))
+                    float(np.percentile(
+                        list(dash_scores.values()), float(config.analyst_review_percentile)
+                    ))
                     if dash_scores else float("nan")
                 )
                 dash_scored_df = build_scored_frame(
@@ -2161,6 +2167,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 months_present_by_model=months_by_model,
                 entity_records=df,
                 identity_columns=config.analyst_identity_columns,
+                review_percentile=float(config.analyst_review_percentile),
             )
             analyst_dashboard_path = dashboard_path
             _dash_ok = os.path.isfile(dashboard_path) and os.path.getsize(dashboard_path) > 0
@@ -2784,7 +2791,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description=(
             "End-to-end banking-panel anomaly-detection pipeline: data -> "
             "preprocessing -> Isolation Forest + VAE (tune/fit) -> evaluation "
-            "-> OOT top-decile Excel -> interpretability -> HTML/MD report. "
+            "-> OOT P90+ control Excel + P99 analyst dashboard -> interpretability -> HTML/MD report. "
             "Defaults perform a quick CPU run; use --full for the spec-scale run."
         ),
     )
@@ -3079,7 +3086,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--oot-min-percentile", type=float, default=90.0,
                         help="Percentile of the OOT score distribution above which an "
                              "individual is exported in the risk-ranked Excel (default "
-                             "90). Each row is also graded p90/p95/p99. Overridden by "
+                             "90, for the broad control workbook). Ties at the cutoff are retained. Each row is also "
+                             "graded p90/p95/p99. Overridden by "
                              "--top-n when that is set.")
     parser.add_argument("--top-n", type=int, default=None,
                         help="Export a FIXED headcount instead of the percentile cut "

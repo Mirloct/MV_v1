@@ -40,6 +40,14 @@ dashboard:
   # data.identification_columns). Si el valor cambia entre meses, se muestra
   # el del último mes no vacío, por campo.
   identity_columns: [despuestocolaborador]
+  # Cola operativa oficial: casos con score >= P99 en cualquiera de los dos
+  # detectores, con pestañas Solo IF, Solo IF+VAE e Intersección.
+  review_percentile: 99.0
+
+output:
+  # Excel amplio de seguimiento/control. Conserva P90+ y clasifica las filas
+  # en bandas p90/p95/p99. No define la cola operativa oficial del dashboard.
+  oot_min_percentile: 90.0
 
 # ---------------------------------------------------------------------------
 # Apartado 9: experimentos del capítulo diagnóstico. Todo descriptivo (sin

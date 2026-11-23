@@ -341,7 +341,7 @@ it locks in:
 | 4 Tuning | `tune_*(valid_mask=)` | static temporal holdout. IF: `n_estimators=300` fixed, `max_samples` an **absolute integer** (1 024–32 768) + `max_features`, Sobol sweep with anchors, 1-SE + noise-margin selection against the ψ=256 default, objective = AP vs reviewed labels when gate 4.5 authorises them, else `tail_separation`; contamination not searched. VAE: `-ELBO@β=1`/`recon_p50`, KL annealing + early stopping, fingerprinted study |
 | 5 Final fit | `tune_*` refit | winning config refit on train+val |
 | 6 Threshold | `calibrate_threshold` | POT/GPD (or percentile) fitted on **validation**, applied to test |
-| 7 Deliverable | `export_oot_top_anomalies` | distinct individuals at/above P90 of the OOT score (default), graded p90/p95/p99; `--top-n` switches to a fixed headcount |
+| 7 Control workbook | `export_oot_top_anomalies` | distinct individuals at/above P90 of the complete deduplicated OOT score population, banded p90/p95/p99; the analyst dashboard independently uses P99 as its official queue |
 
 **Two hazards that bit us and are now guarded.** A short training window makes a
 column near-constant *in the fit block*, and any scaler fitted there amplifies
@@ -420,7 +420,8 @@ P95 checkpoint, stacking, or the VAE deliverable.
   metric comparison, recall-by-type) when the run actually computed them.
 - **OOT deliverable — the headline business artifact.** Each detector writes
   `artifacts/reports/oot_p90_<model>.xlsx` by default: every individual at or
-  above the **90th percentile** of the OOT score, graded `p90`/`p95`/`p99`
+  above the **90th percentile** of the complete deduplicated OOT score population,
+  retained as a broad control base. The official analyst queue is the P99 union.
   (the highest band it reaches, cut-offs computed over the full de-duplicated
   OOT population, never over the exported subset), sorted by score descending
   (`export_oot_top_anomalies`, `src/evaluation/oot_report.py`). Layout is
@@ -912,11 +913,11 @@ the two Excel OOT deliverables.
 **Selection is now the union of both P95 rankings, not whichever model was
 the primary export.** Phase 8 already computes one maximum OOT score per
 entity for both detectors. Phase 9b converts each distribution to percentile
-ranks and partitions the P95 union into three disjoint tabs:
+ranks and partitions the configured P99 union into three disjoint tabs:
 
-- **Solo IF:** IF ≥ P95 and IF+VAE < P95.
-- **Solo IF+VAE:** IF+VAE ≥ P95 and IF < P95.
-- **Intersección:** both scores ≥ P95.
+- **Solo IF:** IF ≥ P99 and IF+VAE < P99.
+- **Solo IF+VAE:** IF+VAE ≥ P99 and IF < P99.
+- **Intersección:** both scores ≥ P99.
 
 Each row shows both percentiles. Top-variable explanations and monthly
 recurrence are kept per detector: `months_present_by_entity` runs once for
@@ -924,7 +925,7 @@ IF and once for IF+VAE against each detector's own P95 cut-off. Search only
 filters the active tab; the KPIs update with that same partition.
 
 **Full-history download and case workflow.** `main.py` passes the complete raw
-panel into the dashboard; only entities in the P95 union are embedded, but all
+panel into the dashboard; only entities in the P99 union are embedded, but all
 their available periods and original columns are retained. The UTF-8 profile
 download is therefore a complete entity history, not only OOT. Each case has
 exactly three operational states (`Sin revisión`, `En revisión`, `Cerrado`),

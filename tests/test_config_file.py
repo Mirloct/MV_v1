@@ -2,10 +2,11 @@
 
 Data sources / inputs: temporary ``pipeline.yaml`` fixtures and ``main.PipelineConfig``.
 Created: 2026-09-25
-Last modified: 2026-09-25
+Last modified: 2026-11-22
 Changelog:
 - 2026-09-25: Added adversarial range, duplicate-key, unknown-section, and
   cross-field validation coverage so invalid YAML cannot silently disable §9.
+- 2026-11-22: Added governed P99 output-percentile coverage.
 """
 from __future__ import annotations
 
@@ -61,6 +62,30 @@ class TestPrecedence(Base):
         self.assertFalse(cfg.diagnostic_auto_install_suite)
         self.assertEqual(report["sources"]["run_diagnostic_suite"], "file")
         self.assertEqual(report["sources"]["diagnostic_auto_install_suite"], "file")
+
+    def test_oot_percentile_is_governed_by_yaml_and_validated(self):
+        cfg = main.PipelineConfig()
+        report = apply_config_file(cfg, self.write("output:\n  oot_min_percentile: 98.5\n"))
+        self.assertEqual(cfg.oot_min_percentile, 98.5)
+        self.assertEqual(report["sources"]["oot_min_percentile"], "file")
+        for value in (0, 100, -1):
+            with self.assertRaises(ConfigFileError):
+                apply_config_file(
+                    main.PipelineConfig(),
+                    self.write(f"output:\n  oot_min_percentile: {value}\n"),
+                )
+
+    def test_dashboard_review_percentile_is_separate_from_excel_control_cut(self):
+        cfg = main.PipelineConfig()
+        apply_config_file(
+            cfg,
+            self.write(
+                "dashboard:\n  review_percentile: 99\n"
+                "output:\n  oot_min_percentile: 90\n"
+            ),
+        )
+        self.assertEqual(cfg.analyst_review_percentile, 99.0)
+        self.assertEqual(cfg.oot_min_percentile, 90.0)
 
     def test_cli_and_code_values_beat_the_file(self):
         path = self.write("diagnostic:\n  segment_column: region\n  stability_refits: 1\n")

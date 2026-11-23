@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Revisión técnica OOT: control P90+ y operación P99</title>
+  <style>
+    :root{--bg:#f4f6f8;--card:#fff;--ink:#17202a;--muted:#5f6b76;--line:#dce2e8;--accent:#155eef;--ok:#16794b}
+    *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,sans-serif}
+    main{max-width:1100px;margin:auto;padding:32px 20px 64px}h1,h2{line-height:1.2}h1{font-size:30px}h2{margin-top:30px}
+    .lead{color:var(--muted);font-size:17px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+    .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px}.value{font-size:24px;font-weight:750;color:var(--accent)}
+    table{width:100%;border-collapse:collapse;background:var(--card)}th,td{padding:10px;border:1px solid var(--line);text-align:left;vertical-align:top}th{background:#eef3f8}
+    code{background:#edf1f5;padding:2px 5px;border-radius:4px}.ok{color:var(--ok);font-weight:700}.mermaid{background:var(--card);border:1px solid var(--line);padding:18px;border-radius:12px;overflow:auto}
+  </style>
+</head>
+<body><main>
+  <h1>Revisión técnica OOT</h1>
+  <p class="lead">Contrato final: Excel P90+ para seguimiento de control; dashboard de analista, recurrencia, KPI y concordancia operativa en P99.</p>
+  <div class="grid">
+    <div class="card"><div class="value">P90+</div><div>Base amplia exportada a <code>oot_p90_*.xlsx</code>.</div></div>
+    <div class="card"><div class="value">P99</div><div>Cola operativa oficial por detector, incluyendo empates.</div></div>
+    <div class="card"><div class="value">P95</div><div>Checkpoint interno IF→VAE; no es la cola final.</div></div>
+  </div>
+
+  <h2>Flujo vigente</h2>
+  <div class="mermaid">
+flowchart LR
+  A[Scores OOT completos] --> B[Máximo score por entidad]
+  B --> C[Excel de control P90+]
+  B --> D[P99 propio de IF]
+  B --> E[P99 propio de IF+VAE]
+  D --> F[Unión P99 oficial]
+  E --> F
+  F --> G[Tabs: Solo IF / Solo IF+VAE / Intersección]
+  F --> H[KPI y recurrencia P99]
+  C --> I[Seguimiento y análisis posterior]
+  </div>
+
+  <h2>Mejoras del toolkit de variables</h2>
+  <table><tr><th>Indicador</th><th>Interpretación</th><th>Acción</th></tr>
+    <tr><td>Variables usadas / totales</td><td>Cobertura real de variables en las rutas analizadas.</td><td>Investigar baja cobertura antes de concluir.</td></tr>
+    <tr><td>Rango de longitud condicional</td><td>Longitud total de ruta cuando la variable aparece; no es causalidad.</td><td>Contrastar con uso, SHAP y estabilidad.</td></tr>
+    <tr><td>Separación entre extremos</td><td>Brecha entre mejor y peor valor mostrado.</td><td>Si empatan a una decimal, emitir interpretación general.</td></tr>
+    <tr><td>Uso cero</td><td>No apareció en las rutas observadas de esta corrida.</td><td>Evaluar ablación; nunca eliminar automáticamente.</td></tr>
+  </table>
+
+  <h2>Heurística de empate</h2>
+  <p>Cuando el mejor y el peor promedio de cortes coinciden a la precisión reportada, el informe declara que no existe separación útil. El orden se trata como desempate determinista y no como evidencia para priorizar o descartar variables.</p>
+
+  <h2>Controles y límites</h2>
+  <ul>
+    <li>Los percentiles se calculan sobre la población OOT completa deduplicada por entidad.</li>
+    <li>La regla es inclusiva (<code>&gt;=</code>); los empates pueden elevar el volumen sobre el 1% nominal.</li>
+    <li>P99 es una regla relativa de priorización, no una probabilidad de fraude ni un FAR garantizado.</li>
+    <li>La eliminación de variables requiere validación entre semillas/ventanas y una ablación controlada.</li>
+  </ul>
+  <p class="ok">Estado esperado de release: suite completa verde, smoke del flujo, artefactos reconciliados y commit publicado.</p>
+</main><script type="module">import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';mermaid.initialize({startOnLoad:true,theme:'neutral'});</script></body>
+</html>

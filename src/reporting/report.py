@@ -22,6 +22,14 @@ here was removed by explicit decision -- see `docs/decisiones_de_modelado.md`).
 
 Everything is robust to missing pieces: absent model metrics, missing figure
 files, or ``oot_excel=None`` are simply omitted.
+
+Data sources / inputs: the orchestrator's run context and generated artifact
+paths; writes the HTML, Markdown, and technical run documentation.
+Created: 2026-08-22
+Last modified: 2026-11-22
+Changelog:
+- 2026-11-22: Added split-count coverage/spread indicators and a neutral
+  interpretation when best and worst variables have equivalent cut counts.
 """
 
 from __future__ import annotations
@@ -387,7 +395,7 @@ def _iforest_splits_recommendation_rows(block: dict) -> list[tuple[str, str, str
         rows.append((
             str(name),
             "0% de uso: nunca participó en aislar una fila marcada en esta corrida",
-            "Candidata a eliminar",
+            "Candidata a evaluación de ablación",
         ))
     for name, avg_cuts in block.get("top_noisy") or []:
         rows.append((
@@ -403,11 +411,24 @@ def _iforest_splits_recommendation_paragraph(block: dict) -> str:
     unused = block.get("unused_features") or []
     n_total = block.get("n_features_total")
     n_total = "?" if n_total is None else n_total
+    used_values = [
+        float(v) for _, v in (block.get("top_clear") or []) + (block.get("top_noisy") or [])
+    ]
+    equal_cuts = bool(used_values) and round(min(used_values), 1) == round(max(used_values), 1)
+    if equal_cuts:
+        return (
+            "Las variables con mejor y peor posición tienen el mismo número de cortes "
+            "promedio a la precisión reportada. No existe separación útil entre ambos "
+            "extremos en esta corrida: el orden es solo un desempate determinista y no "
+            "sustenta priorizar, descartar ni atribuir mayor capacidad de aislamiento a "
+            "una variable. Revise uso, estabilidad entre semillas/ventanas, SHAP y una "
+            "ablación controlada antes de cambiar el modelo."
+        )
     if unused:
         return (
             f"{len(unused)} de las {n_total} variables del modelo nunca participaron "
             "en aislar ninguna fila marcada en esta corrida: en los datos de esta corrida "
-            "no aportan señal de distinción de outliers. Se sugiere evaluar eliminarlas "
+            "no mostraron señal de distinción de outliers. Se sugiere evaluar una ablación "
             "del conjunto de features -- cruzando esta evidencia con la importancia SHAP "
             "(sección de explicabilidad) y con la estabilidad entre semillas antes de "
             "decidir en producción, ya que esto es evidencia de una sola corrida sobre "
@@ -421,6 +442,25 @@ def _iforest_splits_recommendation_paragraph(block: dict) -> str:
     )
 
 
+def _iforest_splits_indicator_rows(block: dict) -> list[tuple[str, str]]:
+    clear = block.get("top_clear") or []
+    noisy = block.get("top_noisy") or []
+    values = [float(v) for _, v in clear + noisy]
+    n_total = block.get("n_features_total")
+    n_unused = len(block.get("unused_features") or [])
+    n_used = max(0, int(n_total) - n_unused) if n_total is not None else "?"
+    if not values:
+        return []
+    lo, hi = min(values), max(values)
+    equivalent = round(lo, 1) == round(hi, 1)
+    return [
+        ("Filas analizadas", f"{int(block.get('n_rows_analyzed') or 0):,}"),
+        ("Variables usadas / totales", f"{n_used} / {n_total if n_total is not None else '?'}"),
+        ("Rango de longitud condicional", f"{lo:.1f}–{hi:.1f} cortes promedio"),
+        ("Separación entre extremos", "Sin separación útil (empate)" if equivalent else f"{hi - lo:.1f} cortes"),
+    ]
+
+
 def _iforest_splits_section_md(context: dict) -> str:
     """'Which model inputs contribute least to telling outliers apart, and
     should they be dropped' -- built from the same split-count analysis
@@ -432,6 +472,7 @@ def _iforest_splits_section_md(context: dict) -> str:
         "## Variables que menos aportan a distinguir outliers\n",
         f"{_iforest_splits_lead_sentence(block)}\n",
         f"{_iforest_splits_recommendation_paragraph(block)}\n",
+        _md_table(["Indicador", "Valor"], _iforest_splits_indicator_rows(block)),
     ]
     rows = _iforest_splits_recommendation_rows(block)
     if rows:
@@ -1719,12 +1760,14 @@ def _iforest_splits_section_html(context: dict) -> str:
     lead = html.escape(_iforest_splits_lead_sentence(block))
     para = html.escape(_iforest_splits_recommendation_paragraph(block))
     rows = _iforest_splits_recommendation_rows(block)
+    indicators = _iforest_splits_indicator_rows(block)
     table = _html_table(["Variable", "Evidencia", "Recomendación"], rows) if rows else ""
     return (
         "<h2 id='iforest-splits'>Variables que menos aportan a distinguir outliers</h2>"
         "<div class='card'>"
         f"<p class='lead'>{lead}</p>"
         f"<p>{para}</p>"
+        f"{_html_table(['Indicador', 'Valor'], indicators)}"
         f"{table}"
         "</div>"
     )

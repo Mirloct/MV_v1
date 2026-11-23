@@ -1,7 +1,7 @@
 """Evaluation module: OOT split, ground-truth join, metrics, scoring, reporting.
 
 Ties the anomaly detectors to the hidden ground truth and produces the project's
-headline business deliverable -- the out-of-time (OOT) top-decile anomaly Excel
+control deliverable -- the out-of-time (OOT) P90+ anomaly Excel
 export (ID - SCORE - VARIABLES).
 """
 

@@ -16,11 +16,18 @@ view derived from the same OOT block
 categorization is invented over `top_5_variables`.
 
 One dashboard, not one per model: both detector percentiles are shown for
-every individual in the union of both P95 queues. Three tabs make agreement
+every individual in the union of both configured-percentile queues. Three tabs make agreement
 explicit: only IF, only IF+VAE, and their intersection. The detail view embeds
 the selected individual's complete raw history (every available source row
 and column) for an offline CSV download. Case-review state is maintained in
 the browser so this self-contained HTML can be used without a backend.
+Data sources / inputs: detector OOT scores/percentiles, exported explanation
+tables, raw entity history, and the configured review percentile.
+Created: 2026-08-30
+Last modified: 2026-11-22
+Changelog:
+- 2026-11-22: Made the review universe, labels, recurrence, and logs use the
+  configured official percentile (P99 by default).
 """
 
 from __future__ import annotations
@@ -89,6 +96,7 @@ def build_analyst_dashboard(
     oot_records: Optional[pd.DataFrame] = None,
     entity_records: Optional[pd.DataFrame] = None,
     identity_columns: Sequence[str] = ("puesto",),
+    review_percentile: float = 99.0,
 ) -> str:
     """Render the single, unified analyst review-queue dashboard.
 
@@ -123,7 +131,7 @@ def build_analyst_dashboard(
         oot_records: Deprecated backwards-compatible alias for
             ``entity_records``.
         entity_records: Complete raw panel. Every available row and source
-            column for entities in the P95 review union is embedded so the
+            column for entities in the configured-percentile review union is embedded so the
             profile download covers full history, not only OOT.
         identity_columns: Source column(s) displayed below the entity ID in the
             profile, one row per field, in this order. Defaults to a single
@@ -134,6 +142,8 @@ def build_analyst_dashboard(
             silently masking an earlier real value.
         out_path: Destination ``.html``. Defaults to
             ``artifacts/reports/analyst_dashboard.html``.
+        review_percentile: Per-detector percentile defining the official
+            review universe. Defaults to P99; ties are included via ``>=``.
 
     Returns:
         The absolute path written.
@@ -161,11 +171,17 @@ def build_analyst_dashboard(
         return {str(row[entity_col]): row for row in frame.to_dict("records")}
 
     table_rows = {name: _rows_by_entity(frame) for name, frame in model_tables.items()}
+    review_percentile = float(review_percentile)
+    if not 0.0 < review_percentile < 100.0:
+        raise ValueError("review_percentile must be strictly between 0 and 100")
+    review_label = f"P{review_percentile:g}"
     # The review universe is deliberately detector-independent: every entity
-    # at/above P95 in either score distribution appears exactly once.
+    # at/above the configured percentile in either distribution appears once.
     entity_ids = sorted(
-        set(str(eid) for eid, pct in if_percentile_by_entity.items() if float(pct) >= 95.0)
-        | set(str(eid) for eid, pct in vae_percentile_by_entity.items() if float(pct) >= 95.0),
+        set(str(eid) for eid, pct in if_percentile_by_entity.items()
+            if float(pct) >= review_percentile)
+        | set(str(eid) for eid, pct in vae_percentile_by_entity.items()
+            if float(pct) >= review_percentile),
         key=lambda eid: (
             -max(float(if_percentile_by_entity.get(eid, -1)),
                  float(vae_percentile_by_entity.get(eid, -1))),
@@ -229,7 +245,8 @@ def build_analyst_dashboard(
         vae_pctl = float(vae_percentile_by_entity.get(eid, float("nan")))
         if_score = float(if_score_by_entity.get(eid, float("nan")))
         vae_score = float(vae_score_by_entity.get(eid, float("nan")))
-        if_hit, vae_hit = if_pctl >= 95.0, vae_pctl >= 95.0
+        if_hit = if_pctl >= review_percentile
+        vae_hit = vae_pctl >= review_percentile
         tab = "intersection" if if_hit and vae_hit else ("if_only" if if_hit else "vae_only")
         counts[tab] += 1
         if_months = sorted(recurrence["iforest"].get(eid, []))
@@ -600,7 +617,7 @@ function setActiveTab(tab){{
     : (RECURRENT_COUNTS[tab] || 0);
   var pct = N_TOTAL_OOT ? (100*count/N_TOTAL_OOT) : 0;
   var recurrentPct = count ? (100*recurrent/count) : 0;
-  document.getElementById("queueKpiLabel").textContent = TAB_LABELS[tab] + (tab === "reviewed" ? "" : " (≥ P95)");
+  document.getElementById("queueKpiLabel").textContent = TAB_LABELS[tab] + (tab === "reviewed" ? "" : " (≥ {review_label})");
   document.getElementById("queueKpiValue").textContent = count.toLocaleString("es");
   document.getElementById("queueKpiSub").textContent = tab === "reviewed"
     ? pct.toFixed(1)+"% de "+N_TOTAL_OOT.toLocaleString("es")+" individuos únicos OOT con gestión iniciada"
@@ -720,9 +737,9 @@ setActiveTab(ACTIVE_TAB);
         fh.write(html_out)
 
     log.info(
-        "Analyst dashboard [base=%s] -> %s (%d in P95 union of %d unique OOT "
+        "Analyst dashboard [base=%s] -> %s (%d in %s union of %d unique OOT "
         "individuals; tabs=%s; recurrent>=2=%s; %d source columns downloadable)",
-        base_model_name, resolved_out, n_rows, n_total_oot, counts,
+        base_model_name, resolved_out, n_rows, review_label, n_total_oot, counts,
         recurrent_counts, len(record_columns),
     )
     return os.path.abspath(resolved_out)

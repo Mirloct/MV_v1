@@ -277,8 +277,9 @@ artifacts/reports/oot_p90_iforest.xlsx
 artifacts/reports/oot_p90_vae.xlsx
 ```
 
-* **`min_percentile=90.0` by default, fully parameterisable.** Every
-  individual at or above the 90th percentile of the OOT score, so the queue
+* **`min_percentile=90.0` by default, fully parameterisable.** The workbook keeps
+  every individual at or above P90 as a broad control base; the dashboard's
+  official operational queue independently uses P99.
   scales with the portfolio instead of fixing a headcount — "the riskiest
   10%" holds whether the panel has 2,000 or 200,000 customers. Each row also
   carries a `p90`/`p95`/`p99` band, the highest it reaches, computed over the

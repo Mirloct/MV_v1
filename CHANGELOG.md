@@ -1,5 +1,4 @@
 # CHANGELOG.md — Dated project history
-
 This file holds the dated history that used to live inline in `CONTEXT.md`:
 measurements, verification notes, and the reasoning behind changes as they
 were made. `CONTEXT.md` holds only the resulting current contracts/defaults —
@@ -3282,3 +3281,14 @@ Dos scripts nuevos, mismo patrón de ~20 líneas que `suite_plus_sensitivity.py`
 **El cambio.** Nueva función `_oot_rows_by_score_desc(oot_mask, scores)` (`main.py`): posiciones de las filas OOT, ordenadas por score descendente -- así, si el presupuesto sigue truncando, descarta las filas MENOS anómalas, no una porción arbitraria. Aplicada en los dos sitios que llaman a `explain_rows_iforest` (Fase 6d, modo stacked -- el default; y el loop genérico de Fase 9, modo paralelo con `--no-stack-iforest-into-vae`); el camino del VAE queda sin cambios (no lo necesita). La asignación de vuelta usa `df.loc[df.index[priority_idx], "top_5_variables"] = top_vars` en vez de `.loc[mask_booleano]`, para que el orden de `top_vars` (ahora por score, no por posición) se coloque en la fila correcta sin depender de que el índice del DataFrame sea un RangeIndex trivial.
 
 **Pruebas.** 3 pruebas nuevas para `_oot_rows_by_score_desc` (`tests/test_iforest_split_counts.py`): orden correcto, un corte de presupuesto simulado conserva exactamente las N filas de mayor score, máscara vacía no rompe. `py -m pytest -q --ignore=tools` → sin regresiones (ver conteo de la corrida completa más abajo). Corrida real de punta a punta (`best_params_no_suite.py --quick`) después del fix: dashboard regenerado sin el párrafo fijo y con el mecanismo de priorización activo.
+# 2026-11-22 — Excel P90+ de control y dashboard oficial P99
+
+- Se separó explícitamente el Excel amplio de seguimiento (`oot_p90_*`) de la
+  cola operativa oficial del dashboard (unión P99 por detector).
+- Dashboard, recurrencia, KPI principal y gráfico de concordancia usan P99;
+  el checkpoint interno entre capas continúa siendo P95.
+- El análisis de cortes del Isolation Forest ahora muestra cobertura, rango y
+  separación; si los extremos empatan, emite una interpretación neutral y no
+  recomienda eliminar variables sin una ablación controlada.
+- Se añadieron contratos de prueba para P90/P99, empates, configuración y
+  consistencia del dashboard.

@@ -1,4 +1,11 @@
-"""Focused contract tests for the analyst dashboard's review tabs/download."""
+"""Focused contract tests for the analyst dashboard's P99 tabs/download.
+
+Data sources / inputs: synthetic detector tables, percentiles, and entity history.
+Created: 2026-08-30
+Last modified: 2026-11-22
+Changelog:
+- 2026-11-22: Rebased the official review-union assertions from P95 to P99.
+"""
 
 from __future__ import annotations
 
@@ -45,10 +52,10 @@ class AnalystDashboardTests(unittest.TestCase):
             out = Path(tmp) / "dashboard.html"
             build_analyst_dashboard(
                 vae_table, schema, "vae", ["2026-08", "2026-09"],
-                {"only-if": 98.0, "only-vae": 50.0, "both": 97.0},
-                {"only-if": 40.0, "only-vae": 99.0, "both": 98.0},
-                {"only-if": 0.9, "only-vae": 0.2, "both": 0.8},
-                {"only-if": 1.0, "only-vae": 8.0, "both": 7.0},
+                {"only-if": 99.1, "only-vae": 50.0, "both": 99.5, "control-only": 98.0},
+                {"only-if": 40.0, "only-vae": 99.2, "both": 99.6, "control-only": 97.0},
+                {"only-if": 0.9, "only-vae": 0.2, "both": 0.8, "control-only": 0.4},
+                {"only-if": 1.0, "only-vae": 8.0, "both": 7.0, "control-only": 2.0},
                 {"only-vae": ["2026-09"], "both": ["2026-09"]},
                 n_total_oot=3,
                 out_path=str(out),
@@ -62,7 +69,7 @@ class AnalystDashboardTests(unittest.TestCase):
             )
             return out.read_text(encoding="utf-8")
 
-    def test_three_tabs_partition_p95_union(self):
+    def test_three_tabs_partition_p99_union(self):
         html = self._build()
         self.assertIn("Solo IF <span>1</span>", html)
         self.assertIn("Solo IF+VAE <span>1</span>", html)
@@ -70,6 +77,8 @@ class AnalystDashboardTests(unittest.TestCase):
         self.assertEqual(html.count('data-tab="if_only"'), 1)
         self.assertEqual(html.count('data-tab="vae_only"'), 1)
         self.assertEqual(html.count('data-tab="intersection"'), 1)
+        self.assertIn("≥ P99", html)
+        self.assertNotIn('data-id="control-only"', html)
 
     def test_profile_payload_keeps_every_oot_row_and_source_column(self):
         html = self._build()
@@ -151,7 +160,7 @@ class MultipleIdentityColumnsTests(unittest.TestCase):
             out = Path(tmp) / "dashboard.html"
             build_analyst_dashboard(
                 vae_table, schema, "vae", ["2026-09"],
-                {"only-if": 50.0}, {"only-if": 98.0},
+                {"only-if": 50.0}, {"only-if": 99.2},
                 {"only-if": 0.2}, {"only-if": 8.0},
                 {"only-if": ["2026-09"]},
                 n_total_oot=1,

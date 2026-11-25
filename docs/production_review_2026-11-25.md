@@ -5,12 +5,12 @@
 | Task | Owner | Status | Evidence |
 |---|---|---|---|
 | GitHub inventory, PRs, CI, deployments | Lead | Done | No open PRs, no workflow runs; Pages 404, deployments [] |
-| Numeric P99 vs rank boundary, ties, dashboard state | Dashboard worker | Running | docs/dashboard_redteam.md |
-| Source drift and Excel export validation | Export worker | Running | docs/export_redteam.md |
-| Complexity/tautology gate and CI | Quality worker | Running | docs/quality_redteam.md |
-| State machine/stack inventory | Architecture worker | Running | Findings integrated below |
-| Four adversarial integration rounds | Lead | Pending | Commands/results below |
-| Docs, HTML, commit, CI and publication | Lead | Pending | Release evidence below |
+| Numeric P99 vs rank boundary, ties, dashboard state | Dashboard worker | Done | docs/dashboard_redteam.md |
+| Source drift and Excel export validation | Export worker | Done | Four rounds: 2/2/4/11 tests; 24 subcases final |
+| Complexity/tautology gate and CI | Quality worker | Done locally; CI running | Four rounds: 15/17/19/19; max new gate complexity 8 |
+| State machine/stack inventory | Architecture worker | Done | Findings integrated below |
+| Four adversarial integration rounds | Lead | Done locally | Commands/results below |
+| Docs, HTML, commit, CI and publication | Lead | Published; CI running | 2ca90d9, Actions 45708556189 |
 
 Resume from the first incomplete task. Existing P90 Excel control and P99
 operational dashboard contracts remain authoritative.
@@ -153,3 +153,67 @@ storage is local and lacks transactional multi-user case management. Immutable
 run directories, content-bound provenance, locked dependencies and an explicit
 model-health promotion policy remain separate architecture work. No evidence
 supports introducing distributed outbox/pooling into the current static app.
+
+## Executed evidence and trade-offs
+
+- Root suite before the last additions: `py -m pytest -q tests` — 422 passed,
+  45 subtests; 10 pre-existing numerical warnings, 271.51s.
+- Final focused integration at 2ca90d9: 100 tests, 80 subtests passed across
+  policy, reuse, Excel, browser, gate and report modules (12.29s).
+- Numeric review policy tests: 9 passed, including critical-health rejection,
+  constant score ties, nonfinite source rejection and chart agreement.
+- Browser flow `node tests/review_flows.cjs`: first use, daily review, weekly
+  reload, monthly profile remap and widths 390/768/1440 passed; no page errors.
+- Dashboard specialist: four adversarial rounds, 45 tests and 44 subtests;
+  hostile inline history, native second-tab storage events and actual CSV bytes.
+- Quality gate: 93 explicit legacy exceptions; no increases accepted. Dashboard
+  complexity decreased 54→50. New policy helpers and gate functions stay <=10.
+- Legacy model reuse smoke completed (run 0b11ac08fbe9), producing 50 control
+  rows/model and the numeric P99 union. This began before manifest integration.
+- A separate default/no-tune training smoke reproduced critical latent collapse
+  (0/8 active dimensions). The new release gate now rejects that verdict rather
+  than treating it as a successful operational result. Retune/model research is
+  still needed before that candidate can be promoted.
+
+The proposed CSV escaping defect was rejected by real downloaded-byte evidence:
+the original emitter already produced BOM and CRLF correctly. No unnecessary
+escape rewrite was retained. The review did find and fix actual script injection.
+
+Model reuse guard trade-off: an unchanged feature count is insufficient. The
+manifest conservatively binds in-time transformed data, fitted preprocessing,
+ordered features and model checksums. Existing models require retraining once;
+changed training/validation windows require a new contract. Arbitrary future
+inference needs a persisted full bundle, not a relaxation of this guard.
+
+The required analyst artifact now fails closed. Optional diagnostics retain
+their existing explicit availability states. The additional latent-health gate
+is an operational acceptance rule on the existing measured critical verdict,
+not evidence that absence of collapse proves detection quality.
+
+Release: code published as 2ca90d9. New CI run:
+https://github.com/Mirloct/MV_v1/actions/runs/45708556189 . No open issues/PRs were
+returned by GitHub. There is no verified hosted target to redeploy.
+
+## Remaining architecture backlog
+
+1. Persist and load a complete preprocessing/stacking/model/calibration bundle
+   for inference on new windows; current guard deliberately restricts reuse.
+2. Bind data-provenance markers to content and fail closed on marker loss.
+3. Use immutable run-specific directories. Overlapping batch writers are now
+   rejected by an OS-managed artifact lock; immutable publication remains pending.
+4. Establish reviewed operational replay/labels, segment checks and promotion
+   criteria for scientific quality; investigate the default quick-model collapse.
+5. Design shared case persistence with revisions/conflict handling if multiple
+   analysts must write concurrently. Current storage is last-writer-wins.
+6. Pin production dependencies and choose an actual hosting target/operations
+   owner before deploying a production service.
+
+These are explicit remaining limits, not completed work or a production-readiness
+certificate. Safe resume point: verify the CI result, then start backlog item 1
+with an isolated bundle migration and its own replay tests.
+
+Additional release check: `tests/test_run_lock.py` passes real descriptor
+contention and release-on-exception. The serialized `run_pipeline` rejects an
+overlapping writer before entering the pipeline, avoiding conflicting report,
+model and progress outputs. OS locks release after process exit; no stale PID
+deletion heuristic is used.

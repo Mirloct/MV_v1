@@ -50,6 +50,7 @@ warnings.filterwarnings("ignore")
 from src.utils import console_ui, observability, paths
 from src.utils.dependency_check import check_dependencies
 from src.utils.logging_config import log_phase, setup_logging
+from src.utils.run_lock import serialized_artifacts
 
 # --------------------------------------------------------------------------- #
 # Project-relative artifact locations (never hardcode absolute paths).        #
@@ -754,6 +755,7 @@ def _model_metrics(supervised, labels, scores, oot_mask, X, label_types=None) ->
 # --------------------------------------------------------------------------- #
 # Pipeline                                                                    #
 # --------------------------------------------------------------------------- #
+@serialized_artifacts
 def run_pipeline(config: PipelineConfig) -> dict:
     """Run the full anomaly-detection pipeline end to end.
 

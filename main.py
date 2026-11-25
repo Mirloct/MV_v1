@@ -1378,13 +1378,10 @@ def run_pipeline(config: PipelineConfig) -> dict:
             if_detector.save(IFOREST_MODEL)
 
         if_scores = if_detector.score_samples(X_if)
-        # A YAML left by an earlier run must not describe this run's model when
-        # tuning failed or was off: use the params of the detector actually fitted.
-        if_best_params = (
-            (_read_best_params(IFOREST_BEST_PARAMS) if if_tuning_ok else {})
-            or {k: getattr(if_detector, k) for k in
-                ("n_estimators", "max_samples", "max_features", "contamination", "bootstrap")}
-        )
+        # Loaded detector parameters are authoritative for every execution
+        # mode, including reuse after a no-tune run with an older YAML present.
+        from src.utils.reuse_contract import iforest_parameters
+        if_best_params = iforest_parameters(if_detector)
         _add_fig(
             figures,
             "Isolation Forest score distribution",
@@ -1687,7 +1684,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             vae_detector.save(VAE_MODEL)
 
         vae_scores = vae_detector.score_samples(X_vae)
-        vae_best_params = _read_best_params(VAE_BEST_PARAMS) if vae_tuning_ok else {}
+        vae_best_params = vae_detector._arch_config()
         _add_fig(
             figures,
             "VAE reconstruction-error distribution",

@@ -21,11 +21,18 @@ from src.utils.atomic_io import atomic_replace
 
 __all__ = [
     "input_fingerprint", "save_contract", "validate_contract",
-    "validate_if_reusing", "save_if_training",
+    "validate_if_reusing", "save_if_training", "iforest_parameters",
 ]
 
 _RETRAIN = "Retrain the models and save a new reuse contract before reuse."
 _VERSION = 1
+
+
+def iforest_parameters(detector) -> dict:
+    return {
+        name: getattr(detector, name)
+        for name in ("n_estimators", "max_samples", "max_features", "contamination", "bootstrap")
+    }
 
 
 def input_fingerprint(X, feature_names: Sequence[str], preprocessor=None) -> str:

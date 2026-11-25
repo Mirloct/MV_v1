@@ -16,6 +16,7 @@ venv/
 
 # Tooling caches
 .pytest_cache/
+node_modules/
 .ruff_cache/
 .mypy_cache/
 .ipynb_checkpoints/

@@ -40,6 +40,8 @@ multi-user production use; localStorage is browser-local.
 - Scikit-learn leakage: https://scikit-learn.org/stable/common_pitfalls.html
 - MDN storage events: https://developer.mozilla.org/en-US/docs/Web/API/Window/storage_event
 - Radon complexity: https://radon.readthedocs.io/en/stable/api.html
+- pandas copy-on-write: https://pandas.pydata.org/pandas-docs/stable/user_guide/copy_on_write.html
+- Playwright CI runtime: https://playwright.dev/docs/ci
 
 Research retrieval: 2026-11-25. These sources support method choices, not claims
 of fraud detection accuracy or universal production readiness.
@@ -217,3 +219,28 @@ contention and release-on-exception. The serialized `run_pipeline` rejects an
 overlapping writer before entering the pipeline, avoiding conflicting report,
 model and progress outputs. OS locks release after process exit; no stale PID
 deletion heuristic is used.
+
+## Fresh-environment CI findings
+
+The first Linux CI run failed despite the Windows suite passing. Thirty tests
+and ten setup errors traced primarily to pandas' copy-on-write arrays becoming
+read-only, plus one browser test requiring an unavailable machine-local runtime.
+The fix requests independent writable copies only where categorical codes and
+label targets are mutated. It preserves source Series and leaves copy-on-write
+enabled. New drift fixtures exercise object/string/category dtypes, missing and
+unknown levels, empty inputs and conflicting reviewed labels.
+
+CI now installs the pinned Playwright 1.62.1 package and Chromium dependencies,
+then uses the provisioned runtime. The Windows Chrome override remains optional.
+Tests are retained and run, not skipped to hide provisioning errors.
+
+Independent reuse review reproduced stale-YAML stacking drift up to 0.1462 in
+score despite valid file hashes. Actual loaded IF parameters are now the sole
+source for reconstruction; VAE report parameters likewise come from the loaded
+detector. A real fitted/save/load forest regression checks identical stack scores.
+Main orchestrator complexity was reduced from 209 to 205 in this correction.
+
+The final critical-health smoke, run bfb10f471793, accepted the matching reuse
+manifest, detected 0/8 active VAE dimensions and terminated with exit code 1
+and an explicit Phase 7 acceptance diagnostic before operational publication.
+This verifies the negative path; it is not a successful model-quality result.

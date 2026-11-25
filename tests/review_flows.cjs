@@ -19,7 +19,7 @@ async function checkTabs(page) {
 }
 
 async function main() {
-  const browser = await chromium.launch({headless:true, executablePath:process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe'});
+  const browser = await chromium.launch({headless:true, executablePath:process.env.CHROME_PATH || (process.platform==='win32' ? 'C:/Program Files/Google/Chrome/Application/chrome.exe' : undefined)});
   const context = await browser.newContext({acceptDownloads:true});
   const page = await context.newPage();
   const errors=[];

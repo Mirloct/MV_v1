@@ -494,7 +494,7 @@ const {chromium}=require(process.env.PLAYWRIGHT_MODULE || 'C:/Users/Marco/.cache
 const input=JSON.parse(fs.readFileSync(0,'utf8'));
 (async()=>{
   const browser=await chromium.launch({headless:true,
-    executablePath:process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe'});
+    executablePath:process.env.CHROME_PATH || (process.platform==='win32' ? 'C:/Program Files/Google/Chrome/Application/chrome.exe' : undefined)});
   try {
     const context=await browser.newContext({acceptDownloads:true});
     const page=await context.newPage();

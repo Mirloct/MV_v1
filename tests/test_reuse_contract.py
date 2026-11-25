@@ -13,7 +13,7 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 from src.utils.reuse_contract import (
-    input_fingerprint, save_contract, save_if_training,
+    iforest_parameters, input_fingerprint, save_contract, save_if_training,
     validate_contract, validate_if_reusing,
 )
 
@@ -39,6 +39,46 @@ class ReuseContractTests(unittest.TestCase):
         changed = input_fingerprint(self.X, self.names[::-1])
         with self.assertRaisesRegex(ValueError, "fingerprint changed.*Retrain"):
             validate_contract(self.manifest, changed, self.models)
+
+    def test_loaded_forest_parameters_preserve_stacking_despite_stale_yaml(self):
+        import yaml
+        from src.models.iforest import IsolationForestDetector
+        from src.models.stacking import build_stacked_matrix
+
+        expected = {
+            "n_estimators": 17, "max_samples": 32, "max_features": 0.75,
+            "contamination": 0.1, "bootstrap": True,
+        }
+        X = np.random.default_rng(42).normal(size=(120, 4))
+        train = np.arange(len(X)) < 80
+        detector = IsolationForestDetector(random_state=42, n_jobs=1, **expected)
+        detector.fit(X)
+        detector.save(str(self.models["iforest"]))
+        stale_path = self.root / "best_params.yaml"
+        stale_path.write_text(
+            "best_params:\n  n_estimators: 3\n  max_samples: 16\n"
+            "  max_features: 1.0\n  contamination: 0.005\n  bootstrap: false\n",
+            encoding="utf-8",
+        )
+        loaded = IsolationForestDetector.load(str(self.models["iforest"]))
+        self.assertEqual(iforest_parameters(loaded), expected)
+        np.testing.assert_array_equal(detector.score_samples(X), loaded.score_samples(X))
+
+        baseline = IsolationForestDetector(random_state=42, n_jobs=1, **expected).fit(X[train])
+        reused = IsolationForestDetector(
+            random_state=42, n_jobs=1, **iforest_parameters(loaded),
+        ).fit(X[train])
+        baseline_scores = baseline.score_samples(X)
+        reused_scores = reused.score_samples(X)
+        np.testing.assert_array_equal(baseline_scores, reused_scores)
+        original_matrix = build_stacked_matrix(X, baseline_scores, fit_mask=train)
+        reused_matrix = build_stacked_matrix(X, reused_scores, fit_mask=train)
+        np.testing.assert_array_equal(original_matrix.X, reused_matrix.X)
+
+        stale_params = yaml.safe_load(stale_path.read_text(encoding="utf-8"))["best_params"]
+        wrong = IsolationForestDetector(random_state=42, n_jobs=1, **stale_params).fit(X[train])
+        self.assertFalse(np.array_equal(baseline_scores, wrong.score_samples(X)))
+        self.assertEqual(iforest_parameters(loaded), expected)
 
     def test_scaler_changed_matrix_is_rejected(self):
         scaled = StandardScaler().fit_transform(self.X)

@@ -19,6 +19,13 @@ jobs:
           python-version: '3.13'
           cache: pip
       - run: python -m pip install -r requirements-dev.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install browser acceptance runtime
+        run: |
+          npm install --no-save --package-lock=false playwright@1.62.1
+          npx playwright install --with-deps chromium
       - name: Verify vendored diagnostic imports
         run: python -c "import ifvae_diag; import ifvae_diag.progress; import ifvae_diag.contracts; import ifvae_diag.scoring"
       - name: Complexity and test integrity gate
@@ -32,4 +39,6 @@ jobs:
           make chore-lint BASE_REF="$BASE_REF"
       - name: Root tests
         if: ${{ !cancelled() }}
+        env:
+          PLAYWRIGHT_MODULE: ${{ github.workspace }}/node_modules/playwright
         run: make test

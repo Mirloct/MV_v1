@@ -1,7 +1,7 @@
 {
   "main.py::_validate_segment_column": 14,
   "main.py::config_from_args": 69,
-  "main.py::run_pipeline": 209,
+  "main.py::run_pipeline": 205,
   "src/evaluation/event_labels.py::_best_in_directory": 11,
   "src/evaluation/event_labels.py::load_event_labels": 25,
   "src/evaluation/ifvae_contract.py::_section_vae_candidates": 11,

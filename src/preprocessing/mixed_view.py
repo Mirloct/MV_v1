@@ -30,6 +30,8 @@ validation/OOT is UNKNOWN there, never silently a normal category.
 
 from __future__ import annotations
 
+# Last modified: 2026-11-25 — own categorical codes before masked assignment.
+
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -262,7 +264,7 @@ class MixedViewBuilder:
         """Integer indices for one categorical variable (MISSING / UNKNOWN / vocabulary)."""
         lookup = self._lookup[column]
         isna = pd.isna(values).to_numpy()
-        codes = values.astype(str).map(lookup).fillna(UNKNOWN_INDEX).to_numpy(dtype=np.int64)
+        codes = values.astype(str).map(lookup).fillna(UNKNOWN_INDEX).to_numpy(dtype=np.int64, copy=True)
         codes[isna] = MISSING_INDEX
         return codes
 

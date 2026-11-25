@@ -27,8 +27,10 @@ fitted (evaluation, sufficiency gate, optional challengers).
 Data sources / inputs: reviewed-label CSV/parquet files and panel entity/time
 keys; produces an in-memory point-in-time label contract and audit metadata.
 Created: 2026-09-23
-Last modified: 2026-09-25
+Last modified: 2026-11-25
 Changelog:
+- 2026-11-25: Copy target arrays before applying the unlisted-negative policy
+  under pandas copy-on-write.
 - 2026-09-25: Enforced exact-day availability and explicit maturity dates when
   ``as_of`` includes a day; unreadable and future labels continue to fail closed.
 """
@@ -421,7 +423,7 @@ def load_event_labels(
             "No usable label row matches any panel (entity, month); check the entity "
             "normalisation and the codmes format."
         )
-    target = joined["target"].to_numpy(dtype=float)
+    target = joined["target"].to_numpy(dtype=float, copy=True)
     known = matched.copy()
     if spec.unlisted_as_negative:
         unlisted = ~known & ~np.isnan(panel_month)

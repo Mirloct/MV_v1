@@ -1,0 +1,4 @@
+-r requirements.txt
+./tools/if_vae_diagnostic_suite
+radon==6.0.1
+pytest>=8.3,<10

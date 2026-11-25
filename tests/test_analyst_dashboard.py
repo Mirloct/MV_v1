@@ -2,19 +2,23 @@
 
 Data sources / inputs: synthetic detector tables, percentiles, and entity history.
 Created: 2026-08-30
-Last modified: 2026-11-22
+Last modified: 2026-11-25
 Changelog:
 - 2026-11-22: Rebased the official review-union assertions from P95 to P99.
+- 2026-11-25: Exercise raw-score quantiles and executable browser case-state regressions.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from src.data.loader import PanelSchema
@@ -22,7 +26,7 @@ from src.reporting.analyst_dashboard import build_analyst_dashboard
 
 
 class AnalystDashboardTests(unittest.TestCase):
-    def _build(self) -> str:
+    def _build(self, history_text=None) -> str:
         schema = PanelSchema(time_col="period", entity_col="customer_id", target_col=None)
         if_table = pd.DataFrame({
             # Explanation input is intentionally broader than IF's own export:
@@ -48,16 +52,21 @@ class AnalystDashboardTests(unittest.TestCase):
             "free_text": ["before OOT", "first", "second", "third", "kept verbatim"],
             "puesto": ["Analista", "Analista", "Gerente", "Auditor", "Director"],
         })
+        if history_text is not None:
+            raw.loc[0, "free_text"] = history_text
+            raw[history_text] = "source column"
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp) / "dashboard.html"
             build_analyst_dashboard(
                 vae_table, schema, "vae", ["2026-08", "2026-09"],
                 {"only-if": 99.1, "only-vae": 50.0, "both": 99.5, "control-only": 98.0},
                 {"only-if": 40.0, "only-vae": 99.2, "both": 99.6, "control-only": 97.0},
-                {"only-if": 0.9, "only-vae": 0.2, "both": 0.8, "control-only": 0.4},
-                {"only-if": 1.0, "only-vae": 8.0, "both": 7.0, "control-only": 2.0},
+                {**{f"low-{i}": 0.0 for i in range(100)},
+                 "only-if": 0.9, "only-vae": 0.2, "both": 0.8, "control-only": 0.4},
+                {**{f"low-{i}": 0.0 for i in range(100)},
+                 "only-if": 1.0, "only-vae": 8.0, "both": 7.0, "control-only": 2.0},
                 {"only-vae": ["2026-09"], "both": ["2026-09"]},
-                n_total_oot=3,
+                n_total_oot=104,
                 out_path=str(out),
                 model_tables={"iforest": if_table, "vae": vae_table},
                 months_present_by_model={
@@ -264,6 +273,273 @@ class ResponsiveLayoutTests(unittest.TestCase):
         block = media_block.group(1)
         self.assertIn(".tablewrap{flex:none;overflow-x:auto", block)
         self.assertNotIn(".tablewrap{flex:none;overflow:visible", block)
+
+
+class CaseStateTests(unittest.TestCase):
+    def _run(self, scenario, stored=None, html=None, storage_error=False):
+        node = shutil.which("node")
+        if node is None:
+            self.fail("Node.js is required to execute dashboard case-state tests")
+        html = html or AnalystDashboardTests()._build()
+        script = re.search(r"<script>(.*?)</script>", html, re.S).group(1)
+        rows = [dict(id=eid, tab=tab, profile=key, caseStatus="sin_revision")
+                for eid, tab, key in re.findall(
+                    r'<tr data-id="([^"]+)" data-tab="([^"]+)" data-profile="([^"]+)"', html)]
+        harness = r"""
+const fs = require('fs'), vm = require('vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const elements = new Map(), frames = new Map(), listeners = {};
+let nextFrame = 0, stored = input.stored, downloaded = null;
+function element() {
+  return {textContent:'', value:'', style:{}, dataset:{}, disabled:false,
+    classList:{toggle(){}, add(){}, remove(){}}, setAttribute(){},
+    appendChild(){}, click(){}, remove(){}};
+}
+function get(id) { if (!elements.has(id)) elements.set(id, element()); return elements.get(id); }
+const rows = input.rows.map(dataset => Object.assign(element(), {dataset, textContent:dataset.id}));
+const document = {
+  getElementById:get, addEventListener(){}, createElement:element, body:element(),
+  querySelector(selector) {
+    const match = selector.match(/data-(?:profile|case-date)="([^"]+)"/);
+    if (!match) throw Error('Unhandled selector: ' + selector);
+    if (selector.startsWith('tr')) return rows.find(r => r.dataset.profile === match[1]);
+    return get(selector);
+  },
+  querySelectorAll(selector) {
+    if (selector === '.tabbtn') return [];
+    if (selector.startsWith('#priorityTableBody')) return rows;
+    throw Error('Unhandled selector: ' + selector);
+  }
+};
+function flush() { const pending = [...frames.values()]; frames.clear(); pending.forEach(f => f()); }
+const context = vm.createContext({document, window:{location:{pathname:'/dashboard.html'},
+  addEventListener(name,fn){listeners[name]=fn;}},
+  localStorage:{getItem(){if(input.storage_error) throw Error('blocked'); return stored;},
+    setItem(key,value){if(input.storage_error) throw Error('blocked'); stored=value;}},
+  setInterval(){}, setTimeout(){}, requestAnimationFrame(f){frames.set(++nextFrame,f); return nextFrame;},
+  cancelAnimationFrame(id){frames.delete(id);},
+  Blob:class {constructor(parts){downloaded=parts.join('');}},
+  URL:{createObjectURL(){return 'blob:test';}, revokeObjectURL(){}},
+  get, rows, flush, check:require('assert').strict,
+  saved:()=>stored, download:()=>downloaded,
+  external(value,key){stored=value; listeners.storage({key:key===undefined?context.CASE_STORAGE_KEY:key});}});
+vm.runInContext(input.script, context); flush();
+vm.runInContext(input.scenario, context); flush();
+process.stdout.write('ok');
+"""
+        result = subprocess.run(
+            [node, "-e", harness], input=json.dumps(dict(
+                script=script, scenario=scenario, rows=rows, stored=stored,
+                storage_error=storage_error)),
+            capture_output=True, text=True, encoding="utf-8", timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "ok")
+
+    def test_invalid_saved_entries_are_not_reviewed_or_exported(self):
+        for entry in [None, [], "cerrado", {}, {"status": "unknown"},
+                      {"status": "toString"}, {"status": "cerrado", "changed_at": {}}]:
+            with self.subTest(entry=entry):
+                self._run("""
+                    check.equal(refreshCaseSummary(), 0);
+                    check.equal(get('exportCasesBtn').disabled, true);
+                    Object.keys(PROFILES).forEach(k => check.equal(caseFor(k).status, 'sin_revision'));
+                    exportReviewedCases(); check.equal(download(), null);
+                """, json.dumps({"only-if": entry}))
+
+    def test_reviewed_kpis_update_when_resetting_a_case_in_reviewed_tab(self):
+        self._run("""
+            const key = Object.keys(PROFILES).find(k => PROFILES[k].id === 'only-if');
+            changeCaseStatus(key, 'en_revision'); setActiveTab('reviewed'); flush();
+            check.equal(String(get('queueKpiValue').textContent), '1');
+            check.equal(String(get('recurrentKpiValue').textContent), '1');
+            changeCaseStatus(key, 'sin_revision'); flush();
+            check.equal(String(get('queueKpiValue').textContent), '0');
+            check.equal(String(get('recurrentKpiValue').textContent), '0');
+            check.equal(get('exportCasesBtn').disabled, true);
+            check.equal(rows.find(r => r.dataset.profile === key).hidden, true);
+        """)
+
+    def test_corrupt_top_level_storage_recovers_and_persists_changes(self):
+        for stored in ['[]', 'null', '12', '"text"', '{broken']:
+            with self.subTest(stored=stored):
+                self._run("""
+                    const key=Object.keys(PROFILES)[0];
+                    check.equal(refreshCaseSummary(), 0);
+                    changeCaseStatus(key,'cerrado');
+                    CASES=loadCases();
+                    check.equal(caseFor(key).status,'cerrado');
+                    check.equal(JSON.parse(saved())[PROFILES[key].id].status,'cerrado');
+                """, stored)
+
+    def test_storage_failure_is_visible_and_session_state_remains_exportable(self):
+        self._run("""
+            check.match(get('caseStorageStatus').textContent,/cargar/);
+            changeCaseStatus(Object.keys(PROFILES)[0],'cerrado');
+            check.equal(refreshCaseSummary(),1);
+            check.match(get('caseStorageStatus').textContent,/No se pudo guardar/);
+            exportReviewedCases(); check.ok(download().includes('Cerrado'));
+        """, storage_error=True)
+
+    def test_external_storage_updates_sync_modal_rows_counts_and_reset(self):
+        self._run("""
+            const key=Object.keys(PROFILES).find(k=>PROFILES[k].id==='only-if');
+            openProfile(key);setActiveTab('reviewed');
+            external(JSON.stringify({'only-if':{status:'cerrado',changed_at:'2026-11-25T12:00:00Z'}}));
+            flush();check.equal(caseFor(key).status,'cerrado');
+            check.equal(get('mCaseStatus').value,'cerrado');
+            check.equal(String(get('queueKpiValue').textContent),'1');
+            check.equal(rows.find(r=>r.dataset.profile===key).hidden,false);
+            external('{}','unrelated');check.equal(caseFor(key).status,'cerrado');
+            external(null,null);flush();
+            check.equal(get('mCaseStatus').value,'sin_revision');
+            check.equal(String(get('queueKpiValue').textContent),'0');
+        """)
+
+    def test_prototype_named_entity_ids_and_invalid_statuses(self):
+        scores={eid:1.0 for eid in ['__proto__','constructor','toString']}
+        html=OfficialScoreSelectionTests()._build(scores)
+        self._run("""
+            Object.keys(PROFILES).forEach(k=>changeCaseStatus(k,'cerrado'));
+            CASES=loadCases();check.equal(refreshCaseSummary(),3);
+            Object.keys(PROFILES).forEach(k=>{
+                changeCaseStatus(k,'toString');check.equal(caseFor(k).status,'cerrado');
+                changeCaseStatus(k,'sin_revision');
+            });
+            check.equal(refreshCaseSummary(),0);
+        """, html=html)
+
+    def test_malicious_history_stays_inside_single_script_and_round_trips(self):
+        malicious='</script><script>window.injected=true</script><!-- & \\"'
+        html=AnalystDashboardTests()._build(history_text=malicious)
+        self.assertEqual(html.count('<script>'),1)
+        self.assertEqual(html.count('</script>'),1)
+        self.assertNotIn(malicious,html)
+        self._run("""
+            const key=Object.keys(PROFILES).find(k=>PROFILES[k].id==='only-if');
+            check.equal(typeof window.injected,'undefined');
+            check.equal(PROFILES[key].records[0].free_text,"""+json.dumps(malicious)+""");
+            check.ok(RECORD_COLUMNS.includes(PROFILES[key].records[0].free_text));
+        """, html=html)
+
+
+class OfficialScoreSelectionTests(unittest.TestCase):
+    def _build(self, if_scores, vae_scores=None, if_pcts=None, vae_pcts=None,
+               review_percentile=99.0):
+        schema = PanelSchema(time_col="period", entity_col="customer_id", target_col=None)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "dashboard.html"
+            build_analyst_dashboard(
+                pd.DataFrame(), schema, "iforest", ["2026-09"],
+                if_pcts or {}, vae_pcts or {}, if_scores, vae_scores or {}, {},
+                n_total_oot=len(if_scores), out_path=str(out),
+                review_percentile=review_percentile,
+            )
+            return out.read_text(encoding="utf-8")
+
+    def _rows(self, html):
+        return dict(re.findall(r'<tr data-id="([^"]+)" data-tab="([^"]+)"', html))
+
+    def test_500_unique_scores_select_exactly_five_despite_rank_percentiles(self):
+        scores = {str(i): float(i) for i in range(500)}
+        pcts = {str(i): 100 * (i + 1) / 500 for i in range(500)}
+        html = self._build(scores, if_pcts=pcts)
+        self.assertEqual(self._rows(html), {str(i): "if_only" for i in range(495, 500)})
+        self.assertIn('"if_pctl": 99.2', html)
+        self.assertIn("<span class='pval'>99.2</span>", html)
+
+    def test_all_equal_scores_include_every_tie_even_with_low_display_percentiles(self):
+        scores = {str(i): 7.0 for i in range(500)}
+        pcts = {eid: 50.1 for eid in scores}
+        html = self._build(scores, scores, pcts, pcts)
+        self.assertEqual(self._rows(html), {eid: "intersection" for eid in scores})
+
+    def test_exact_boundary_and_ties_are_included_but_next_float_below_is_not(self):
+        scores = {f"low-{i}": 0.0 for i in range(98)}
+        scores.update(below=float(np.nextafter(1.0, 0.0)), boundary=1.0, tied=1.0)
+        self.assertEqual(np.percentile(list(scores.values()), 99), 1.0)
+        html = self._build(scores, if_pcts={eid: 100.0 for eid in scores})
+        self.assertEqual(self._rows(html), {"boundary": "if_only", "tied": "if_only"})
+
+    def test_percentile_fallback_is_per_detector_when_score_map_is_empty(self):
+        html = self._build({"raw": 1.0}, {}, {"raw": 1.0, "phantom": 100.0},
+                           {"raw": 99.0, "fallback": 99.0, "below": 98.999})
+        self.assertEqual(self._rows(html), {"raw": "intersection", "fallback": "vae_only"})
+
+    def test_custom_percentile_uses_full_population_not_explanation_table(self):
+        scores = {str(i): float(i) for i in range(101)}
+        html = self._build(scores, review_percentile=95.0)
+        self.assertEqual(self._rows(html), {str(i): "if_only" for i in range(95, 101)})
+
+    def test_empty_populations_and_non_finite_inputs(self):
+        self.assertEqual(self._rows(self._build({})), {})
+        for invalid in [float('nan'), float('inf'), -float('inf')]:
+            with self.subTest(score=invalid), self.assertRaisesRegex(ValueError, 'finite'):
+                self._build({'invalid':invalid})
+        for invalid in [0, 100, -1, float('nan'), float('inf')]:
+            with self.subTest(percentile=invalid), self.assertRaises(ValueError):
+                self._build({'one':1.0}, review_percentile=invalid)
+
+
+class BrowserDownloadTests(unittest.TestCase):
+    def test_real_browser_download_bytes_and_malicious_history(self):
+        node=shutil.which('node')
+        self.assertIsNotNone(node, 'Node.js is required for browser download verification')
+        malicious='</script><script>window.injected=true</script>'
+        html=AnalystDashboardTests()._build(history_text=malicious)
+        browser_test=r"""
+const fs=require('fs'), assert=require('assert').strict;
+const {pathToFileURL}=require('url');
+const {chromium}=require(process.env.PLAYWRIGHT_MODULE || 'C:/Users/Marco/.cache/codex-runtimes/codex-primary-runtime/dependencies/node/node_modules/playwright');
+const input=JSON.parse(fs.readFileSync(0,'utf8'));
+(async()=>{
+  const browser=await chromium.launch({headless:true,
+    executablePath:process.env.CHROME_PATH || 'C:/Program Files/Google/Chrome/Application/chrome.exe'});
+  try {
+    const context=await browser.newContext({acceptDownloads:true});
+    const page=await context.newPage();
+    const errors=[];page.on('pageerror',e=>errors.push(String(e)));
+    await page.goto(pathToFileURL(input.path).href);
+    assert.equal(await page.evaluate(()=>typeof window.injected),'undefined');
+    const key=await page.evaluate(()=>Object.keys(PROFILES).find(k=>PROFILES[k].id==='only-if'));
+    await page.evaluate(k=>openProfile(k),key);
+    async function bytes(click){
+      const pending=page.waitForEvent('download');await click();
+      return fs.readFileSync(await (await pending).path());
+    }
+    const history=await bytes(()=>page.locator('#downloadBtn').click());
+    assert.equal(history.subarray(0,3).toString('hex'),'efbbbf');
+    const text=history.toString('utf8');
+    assert.equal(text.split('\r\n').length,4);
+    assert.ok(text.includes(input.malicious));
+    assert.ok(!text.includes('\\ufeff'));assert.ok(!text.includes('\\r\\n'));
+    await page.keyboard.press('Escape');
+    await page.evaluate(k=>changeCaseStatus(k,'cerrado'),key);
+    const reviewed=await bytes(()=>page.locator('#exportCasesBtn').click());
+    assert.equal(reviewed.subarray(0,3).toString('hex'),'efbbbf');
+    assert.equal(reviewed.toString('utf8').split('\r\n').length,2);
+    assert.ok(reviewed.toString('utf8').includes('Cerrado'));
+    await page.reload();
+    assert.equal(await page.evaluate(k=>caseFor(k).status,key),'cerrado');
+    const second=await page.context().newPage();
+    await second.goto(pathToFileURL(input.path).href);
+    await second.evaluate(k=>changeCaseStatus(k,'sin_revision'),key);
+    await page.waitForFunction(k=>caseFor(k).status==='sin_revision',key);
+    assert.equal(await page.locator('#reviewedCount').textContent(),'0');
+    await second.close();
+    assert.deepEqual(errors,[]);
+    process.stdout.write('ok');
+  } finally {await browser.close();}
+})().catch(e=>{console.error(e);process.exitCode=1;});
+"""
+        with tempfile.TemporaryDirectory() as tmp:
+            out=Path(tmp)/'dashboard.html'
+            out.write_text(html,encoding='utf-8')
+            result=subprocess.run([node,'-e',browser_test],
+                input=json.dumps(dict(path=str(out),malicious=malicious)),
+                capture_output=True,text=True,encoding='utf-8',timeout=60)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout,'ok')
 
 
 if __name__ == "__main__":

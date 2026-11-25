@@ -18,8 +18,10 @@ Data sources / inputs: configured panel data, reviewed-label files, model
 artifacts, and ``configs/pipeline.yaml``; writes run models, diagnostics, and
 reporting context under the project artifact tree.
 Created: 2026-08-22
-Last modified: 2026-11-22
+Last modified: 2026-11-25
 Changelog:
+- 2026-11-25: Reconciled the report headline with the actual detector union
+  and disclosed split-count fallback cohorts.
 - 2026-09-26: Enforced the fixed IF/VAE training contract at dataclass, CLI,
   YAML and full-run entry points.
 - 2026-11-22: Separated the broad P90+ control workbook from the official P99
@@ -1103,6 +1105,17 @@ def run_pipeline(config: PipelineConfig) -> dict:
             return_pipeline=True,
         )
         n_features = len(feature_names)
+        from src.utils.reuse_contract import (
+            input_fingerprint, validate_if_reusing, save_if_training,
+        )
+        reuse_models = {"iforest": IFOREST_MODEL, "vae": VAE_MODEL}
+        reuse_path = IFOREST_MODEL + ".inputs.json"
+        reuse_fingerprint = input_fingerprint(
+            X[train_mask | val_mask], feature_names,
+            (fitted_preprocessor, config.seed, config.stack_iforest_into_vae,
+             config.vae_categorical_representation),
+        )
+        validate_if_reusing(config.reuse_trained, reuse_path, reuse_fingerprint, reuse_models)
         console_ui.set_stat("Features", f"{n_features:,}")
         logger.info(
             "Preprocessing: %d input cols -> %d features (%d rows)",
@@ -1360,6 +1373,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 random_state=config.seed, **fallback_if_params
             )
             if_detector.fit(X_in)
+            if_detector.save(IFOREST_MODEL)
 
         if_scores = if_detector.score_samples(X_if)
         # A YAML left by an earlier run must not describe this run's model when
@@ -1668,6 +1682,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             # something load-bearing, and left `--no-tune` (a documented mode)
             # silently leaking.
             vae_detector.fit(X_vae_in, valid_mask=valid_local)
+            vae_detector.save(VAE_MODEL)
 
         vae_scores = vae_detector.score_samples(X_vae)
         vae_best_params = _read_best_params(VAE_BEST_PARAMS) if vae_tuning_ok else {}
@@ -1689,6 +1704,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
         except Exception as exc:
             logger.warning("plot_latent_space failed (%s); continuing.", exc)
 
+        verdict = {}
         # -- Posterior-collapse gate ---------------------------------------- #
         # The one VAE failure this pipeline could not previously see. The
         # anomaly score IS the reconstruction error, so a decoder that has
@@ -1733,6 +1749,10 @@ def run_pipeline(config: PipelineConfig) -> dict:
             )
         except Exception as exc:  # noqa: BLE001 - a diagnostic must not break the run
             logger.warning("VAE latent diagnostics failed (%s); continuing.", exc)
+
+    from src.evaluation.model_acceptance import require_acceptable_health
+    require_acceptable_health(verdict)
+    save_if_training(config.reuse_trained, reuse_path, reuse_fingerprint, reuse_models)
 
     # -- Phases 8-10 per model: evaluation, OOT export, interpretability ---- #
     # Each detector carries the matrix it was actually fitted on: under
@@ -2170,6 +2190,17 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 review_percentile=float(config.analyst_review_percentile),
             )
             analyst_dashboard_path = dashboard_path
+            # Operational count uses both full detector populations; the
+            # broader Excel and its optional top-N override are independent.
+            from src.evaluation.review_policy import review_union
+            review_ids = review_union(
+                if_scores_by_entity, vae_scores_by_entity,
+                config.analyst_review_percentile,
+            )
+            oot_review_count = len(review_ids)
+            oot_review_rate = len(review_ids) / max(
+                1, len(set(if_scores_by_entity) | set(vae_scores_by_entity))
+            )
             _dash_ok = os.path.isfile(dashboard_path) and os.path.getsize(dashboard_path) > 0
             observability.check(
                 name="artifact.analyst_dashboard_written", category="artifact",
@@ -2183,11 +2214,13 @@ def run_pipeline(config: PipelineConfig) -> dict:
                                "are unaffected. Check the log for the dashboard-build error.",
                 evidence=dashboard_path,
             )
-        except Exception as exc:  # noqa: BLE001 - never block the Excel deliverable(s)
-            logger.warning(
-                "Analyst dashboard failed (%s); the OOT Excel deliverable(s) above "
-                "are unaffected.", exc,
-            )
+        except Exception as exc:
+            logger.exception("Required analyst dashboard failed in Phase 9b")
+            raise RuntimeError(
+                "Phase 9b failed: the official analyst dashboard could not be built. "
+                "Inspect the preceding exception in artifacts/logs/execution.log; "
+                "the P90 control workbook does not replace the operational queue."
+            ) from exc
 
     # -- Phase 9c: IF-VAE diagnostic suite (on by default) ------------------- #
     # Cross-validates this run's own already-fitted IF+VAE against the
@@ -2496,7 +2529,9 @@ def run_pipeline(config: PipelineConfig) -> dict:
                     # not a signal about the features themselves.
                     per_feature = split_result.get("per_feature") or {}
                     analysis_ran = bool(split_result.get("top_clear") or split_result.get("top_noisy"))
+                    from src.evaluation.review_policy import split_cohort_mode
                     chart_static["iforest_splits"] = {
+                        "selection_mode": split_cohort_mode(oot_mask, scores, threshold_if),
                         "top_clear": split_result.get("top_clear"),
                         "top_noisy": split_result.get("top_noisy"),
                         "n_rows_analyzed": split_result.get("n_rows_analyzed"),
@@ -2620,6 +2655,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             "models": model_specs,
             "figures": figures,
             "chart_data": {**chart_data, "anomaly_rate": anomaly_rate,
+                            "review_percentile": config.analyst_review_percentile,
                             "static": chart_static},
             "oot_excel": oot_excels,
             "diagnostic_suite": diagnostic_suite_result,

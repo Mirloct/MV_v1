@@ -3292,3 +3292,14 @@ Dos scripts nuevos, mismo patrón de ~20 líneas que `suite_plus_sensitivity.py`
   recomienda eliminar variables sin una ablación controlada.
 - Se añadieron contratos de prueba para P90/P99, empates, configuración y
   consistencia del dashboard.
+# 2026-11-25 — Engineering controls and operational coherence
+
+- Created root AGENTS.md/CLAUDE.md, a complexity/test-integrity gate and GitHub CI.
+- Corrected numeric P99 boundaries and report union counts; protected dashboard
+  script payloads, validated stored case states and synchronized browser tabs.
+- Added source-drift checks before control workbook writes and fail-closed model
+  reuse manifests. Default/fallback training now saves its accepted detectors.
+- Required analyst-dashboard failures stop with phase/cause/remedy diagnostics.
+- Documented state machines, deployment inventory, four adversarial rounds and
+  remaining production gaps. Root pytest discovery excludes the independently
+  packaged diagnostic suite; its package must be tested in its own environment.

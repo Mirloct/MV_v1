@@ -16,8 +16,9 @@ Column layout (hard requirement):
 Data sources / inputs: scored panel rows, panel schema, OOT-period count, and
 the configured selection percentile; writes a risk-ranked Excel workbook.
 Created: 2026-08-22
-Last modified: 2026-11-22
+Last modified: 2026-11-25
 Changelog:
+- 2026-11-25: Validate OOT export inputs before workbook creation.
 - 2026-11-22: Clarified that this P90+ workbook is the broad control base;
   the analyst dashboard applies the separate official P99 operating point.
 """
@@ -61,6 +62,48 @@ DEFAULT_TOP_N = 50
 PERCENTILE_BANDS: tuple[float, ...] = (90.0, 95.0, 99.0)
 #: Column added to the export carrying that grade.
 BAND_COL = "percentil"
+
+
+def _validate_export_inputs(
+    scored_df: pd.DataFrame, required: list[str], min_percentile: Optional[float],
+) -> Optional[float]:
+    missing = [col for col in required if col not in scored_df.columns]
+    if missing:
+        raise ValueError(f"OOT export missing required columns: {missing}")
+    if not scored_df.columns.is_unique:
+        raise ValueError("OOT export requires unique column names")
+    return _validate_min_percentile(min_percentile)
+
+
+def _validate_min_percentile(min_percentile: Optional[float]) -> Optional[float]:
+    if min_percentile is None:
+        return None
+    try:
+        if np.ndim(min_percentile) != 0 or isinstance(min_percentile, (bool, np.bool_)):
+            raise ValueError
+        percentile = float(min_percentile)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("min_percentile must be a finite number in [0, 100]") from exc
+    if not np.isfinite(percentile) or not 0 <= percentile <= 100:
+        raise ValueError("min_percentile must be a finite number in [0, 100]")
+    return percentile
+
+
+def _validated_oot_scores(
+    oot: pd.DataFrame, entity_col: str, score_col: str,
+) -> np.ndarray:
+    if oot[entity_col].isna().any():
+        raise ValueError(f"OOT export column {entity_col!r} contains null entity identifiers")
+    try:
+        numeric_scores = pd.to_numeric(oot[score_col], errors="raise")
+        if np.iscomplexobj(numeric_scores):
+            raise ValueError
+        scores = numeric_scores.to_numpy(dtype=float, na_value=np.nan)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"OOT export column {score_col!r} must contain finite numeric scores") from exc
+    if not np.isfinite(scores).all():
+        raise ValueError(f"OOT export column {score_col!r} must contain finite numeric scores")
+    return scores
 
 
 def _resolve_out_path(
@@ -223,6 +266,9 @@ def export_oot_top_anomalies(
     log = setup_logging()
     entity_col = schema.entity_col or "entity_id"
     time_col = schema.time_col or "period"
+    min_percentile = _validate_export_inputs(
+        scored_df, [entity_col, time_col, score_col], min_percentile,
+    )
     out_path = _resolve_out_path(
         out_path, top_fraction, model_name, top_n, min_percentile,
     )
@@ -236,6 +282,8 @@ def export_oot_top_anomalies(
             raise ValueError(
                 f"No rows found for OOT period(s) {list(np.atleast_1d(oot_vals))}"
             )
+
+        oot[score_col] = _validated_oot_scores(oot, entity_col, score_col)
 
         # Deterministic ordering: score descending, ties broken by entity_id
         # ascending, via a stable sort so the result is fully reproducible.

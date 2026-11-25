@@ -24,10 +24,11 @@ the browser so this self-contained HTML can be used without a backend.
 Data sources / inputs: detector OOT scores/percentiles, exported explanation
 tables, raw entity history, and the configured review percentile.
 Created: 2026-08-30
-Last modified: 2026-11-22
+Last modified: 2026-11-25
 Changelog:
 - 2026-11-22: Made the review universe, labels, recurrence, and logs use the
   configured official percentile (P99 by default).
+- 2026-11-25: Use shared raw-score review selection and validate browser case state.
 """
 
 from __future__ import annotations
@@ -40,12 +41,17 @@ from typing import Optional, Sequence
 import pandas as pd
 
 from src.data.loader import PanelSchema
+from src.evaluation.review_policy import review_ids
 from src.utils import paths
 from src.utils.logging_config import setup_logging
 
 __all__ = ["build_analyst_dashboard"]
 
 _SEV_FOR_MONTHS_DEFAULT = "mute"
+
+
+def _script_json(value) -> str:
+    return json.dumps(value, ensure_ascii=False).replace("<", "\\u003c")
 
 
 def _severity_for(count: int, total: int) -> str:
@@ -175,13 +181,15 @@ def build_analyst_dashboard(
     if not 0.0 < review_percentile < 100.0:
         raise ValueError("review_percentile must be strictly between 0 and 100")
     review_label = f"P{review_percentile:g}"
-    # The review universe is deliberately detector-independent: every entity
-    # at/above the configured percentile in either distribution appears once.
+    def _review_ids(scores: dict, percentiles: dict) -> set[str]:
+        if scores:
+            return review_ids(scores, review_percentile)
+        return {eid for eid, pct in percentiles.items() if float(pct) >= review_percentile}
+
+    if_review_ids = _review_ids(if_score_by_entity, if_percentile_by_entity)
+    vae_review_ids = _review_ids(vae_score_by_entity, vae_percentile_by_entity)
     entity_ids = sorted(
-        set(str(eid) for eid, pct in if_percentile_by_entity.items()
-            if float(pct) >= review_percentile)
-        | set(str(eid) for eid, pct in vae_percentile_by_entity.items()
-            if float(pct) >= review_percentile),
+        if_review_ids | vae_review_ids,
         key=lambda eid: (
             -max(float(if_percentile_by_entity.get(eid, -1)),
                  float(vae_percentile_by_entity.get(eid, -1))),
@@ -245,8 +253,8 @@ def build_analyst_dashboard(
         vae_pctl = float(vae_percentile_by_entity.get(eid, float("nan")))
         if_score = float(if_score_by_entity.get(eid, float("nan")))
         vae_score = float(vae_score_by_entity.get(eid, float("nan")))
-        if_hit = if_pctl >= review_percentile
-        vae_hit = vae_pctl >= review_percentile
+        if_hit = eid in if_review_ids
+        vae_hit = eid in vae_review_ids
         tab = "intersection" if if_hit and vae_hit else ("if_only" if if_hit else "vae_only")
         counts[tab] += 1
         if_months = sorted(recurrence["iforest"].get(eid, []))
@@ -390,6 +398,7 @@ def build_analyst_dashboard(
           <button class="tabbtn tab-reviewed" role="tab" data-tab-target="reviewed" onclick="setActiveTab('reviewed')">Casos revisados <span id="reviewedCount">0</span></button>
           <button class="export-cases-btn" id="exportCasesBtn" onclick="exportReviewedCases()" disabled>Exportar casos revisados (.csv)</button>
         </div>
+        <div id="caseStorageStatus" role="status" aria-live="polite"></div>
         <div class="searchbar">
           <input type="search" id="tableSearch" class="search-input"
                  placeholder="Filtrar por ID, banda o variable..." autocomplete="off"
@@ -473,15 +482,15 @@ def build_analyst_dashboard(
 </div>
 
 <script>
-var PROFILES = {json.dumps(profiles, ensure_ascii=False)};
-var MONTH_LABEL = {json.dumps(month_label, ensure_ascii=False)};
-var OOT_MONTHS = {json.dumps(all_periods, ensure_ascii=False)};
+var PROFILES = {_script_json(profiles)};
+var MONTH_LABEL = {_script_json(month_label)};
+var OOT_MONTHS = {_script_json(all_periods)};
 var N_MONTHS = {n_months};
 var N_ROWS_TOTAL = {n_rows};
 var N_TOTAL_OOT = {n_total_oot};
-var COUNTS = {json.dumps(counts)};
-var RECURRENT_COUNTS = {json.dumps(recurrent_counts)};
-var RECORD_COLUMNS = {json.dumps(record_columns, ensure_ascii=False)};
+var COUNTS = {_script_json(counts)};
+var RECURRENT_COUNTS = {_script_json(recurrent_counts)};
+var RECORD_COLUMNS = {_script_json(record_columns)};
 var ACTIVE_TAB = "intersection";
 var ACTIVE_PROFILE = null;
 var TAB_LABELS = {{if_only:"Solo IF", vae_only:"Solo IF+VAE", intersection:"Intersección", reviewed:"Casos revisados"}};
@@ -504,11 +513,30 @@ tick(); setInterval(tick,1000);
 function loadCases(){{
   try{{
     var parsed=JSON.parse(localStorage.getItem(CASE_STORAGE_KEY)||"{{}}");
-    return parsed && typeof parsed==="object" ? parsed : {{}};
-  }}catch(e){{return {{}};}}
+    var cases=Object.create(null);
+    if(parsed && typeof parsed==="object" && !Array.isArray(parsed)){{
+      Object.keys(parsed).forEach(function(eid){{
+        if(validCase(parsed[eid])) cases[eid]=parsed[eid];
+      }});
+    }}
+    return cases;
+  }}catch(e){{
+    document.getElementById("caseStorageStatus").textContent="No se pudo cargar el estado guardado de los casos.";
+    return Object.create(null);
+  }}
+}}
+function validCase(c){{
+  if(!c || typeof c!=="object" || Array.isArray(c)) return false;
+  if(!Object.prototype.hasOwnProperty.call(STATUS_LABELS,c.status)) return false;
+  return c.changed_at==null || (typeof c.changed_at==="string" && !isNaN(Date.parse(c.changed_at)));
 }}
 function saveCases(){{
-  try{{localStorage.setItem(CASE_STORAGE_KEY,JSON.stringify(CASES));}}catch(e){{}}
+  try{{
+    localStorage.setItem(CASE_STORAGE_KEY,JSON.stringify(CASES));
+    document.getElementById("caseStorageStatus").textContent="";
+  }}catch(e){{
+    document.getElementById("caseStorageStatus").textContent="No se pudo guardar el estado. Los cambios solo están en esta sesión; exporte los casos antes de cerrar.";
+  }}
 }}
 function caseFor(profileKey){{
   var r=PROFILES[profileKey];
@@ -540,14 +568,14 @@ function refreshCaseSummary(){{
 }}
 function changeCaseStatus(profileKey,status,event){{
   if(event) event.stopPropagation();
-  if(!STATUS_LABELS[status] || !PROFILES[profileKey]) return;
+  if(!Object.prototype.hasOwnProperty.call(STATUS_LABELS,status) || !PROFILES[profileKey]) return;
   var eid=PROFILES[profileKey].id;
   var current=caseFor(profileKey);
   if(current.status===status) return;
   if(status==="sin_revision") delete CASES[eid];
   else CASES[eid]={{status:status,changed_at:new Date().toISOString()}};
   saveCases();syncCaseUI(profileKey);refreshCaseSummary();
-  filterTable(document.getElementById("tableSearch").value);
+  setActiveTab(ACTIVE_TAB);
 }}
 function changeActiveCaseStatus(status){{
   if(!ACTIVE_PROFILE) return;
@@ -556,6 +584,13 @@ function changeActiveCaseStatus(status){{
 }}
 Object.keys(PROFILES).forEach(syncCaseUI);
 refreshCaseSummary();
+window.addEventListener("storage",function(event){{
+  if(event.storageArea && event.storageArea!==localStorage) return;
+  if(event.key!==CASE_STORAGE_KEY && event.key!==null) return;
+  CASES=loadCases();
+  Object.keys(PROFILES).forEach(syncCaseUI);
+  refreshCaseSummary();setActiveTab(ACTIVE_TAB);
+}});
 
 // Client-side filter: matches the query against every visible cell in the
 // row (ID, banda, percentiles, top-5 variables, meses) -- not just the ID
@@ -711,7 +746,7 @@ function exportReviewedCases(){{
   }});
   if(!rows.length) return;
   rows.sort(function(a,b){{return String(b.changed_at).localeCompare(String(a.changed_at));}});
-  var headers=[{json.dumps(entity_col, ensure_ascii=False)}].concat({json.dumps(list(identity_columns), ensure_ascii=False)},["estado","fecha_cambio_estado","hora_cambio_estado","timestamp_cambio_estado"]);
+  var headers=[{_script_json(entity_col)}].concat({_script_json(list(identity_columns))},["estado","fecha_cambio_estado","hora_cambio_estado","timestamp_cambio_estado"]);
   var lines=[headers.map(csvCell).join(",")];
   rows.forEach(function(r){{
     var idVals=r.identities.map(function(it){{return it && it.value || "";}});

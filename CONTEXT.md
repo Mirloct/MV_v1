@@ -1572,3 +1572,24 @@ Measured on the synthetic generator (`generate_synthetic_panel`):
   working directory** (`cd <tmp> && py <repo>/main.py --quick`; the config file is
   resolved next to `main.py`, not the CWD) — running it in the project root
   rewrites `artifacts/`, so never do that as a side effect.
+# Current engineering review — 2026-11-25
+
+See `docs/production_review_2026-11-25.md` for stack, state-machine diagrams,
+executed checks, sources and residual architecture work. Root `AGENTS.md` is
+the engineering contract; `CLAUDE.md` points to it. CI runs the complexity
+ratchet and root tests. New functions must meet cyclomatic complexity <=10;
+legacy debt is declared in `scripts/complexity_baseline.json`.
+
+The P90+ Excel control base remains unchanged in intent. Dashboard membership
+now compares raw scores against each detector's full-population numeric P99
+(including ties), rather than comparing percentile display ranks. The report
+headline counts the union, not only the last detector's band. Split-count
+fallback cohorts are disclosed and stacked IF/VAE agreement is not described
+as independent evidence.
+
+Trained reuse now requires an `.inputs.json` manifest beside the IF model,
+binding the in-time matrix, feature order, fitted preprocessor and model
+SHA-256 hashes. Existing models without it require one training run. This
+conservative guard rejects changed in-time data even when width is unchanged;
+it does not yet support scoring arbitrary future panels with a persisted
+preprocessing bundle. Synthetic models remain under `_dev/`.

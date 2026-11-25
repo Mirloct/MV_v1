@@ -1,0 +1,35 @@
+name: Quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: pip
+      - run: python -m pip install -r requirements-dev.txt
+      - name: Verify vendored diagnostic imports
+        run: python -c "import ifvae_diag; import ifvae_diag.progress; import ifvae_diag.contracts; import ifvae_diag.scoring"
+      - name: Complexity and test integrity gate
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        shell: bash
+        run: |
+          if [[ -z "$BASE_REF" || "$BASE_REF" =~ ^0+$ ]]; then
+            BASE_REF="$(git rev-parse HEAD^)"
+          fi
+          make chore-lint BASE_REF="$BASE_REF"
+      - name: Root tests
+        if: ${{ !cancelled() }}
+        run: make test

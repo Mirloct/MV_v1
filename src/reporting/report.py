@@ -26,8 +26,9 @@ files, or ``oot_excel=None`` are simply omitted.
 Data sources / inputs: the orchestrator's run context and generated artifact
 paths; writes the HTML, Markdown, and technical run documentation.
 Created: 2026-08-22
-Last modified: 2026-11-22
+Last modified: 2026-11-25
 Changelog:
+- 2026-11-25: Disclosed the fallback sample in the split-count interpretation.
 - 2026-11-22: Added split-count coverage/spread indicators and a neutral
   interpretation when best and worst variables have equivalent cut counts.
 """
@@ -378,11 +379,17 @@ def _iforest_splits_block(context: dict) -> Optional[dict]:
 def _iforest_splits_lead_sentence(block: dict) -> str:
     n_rows = int(block.get("n_rows_analyzed") or 0)
     n_trees = int(block.get("n_trees") or 0)
+    cohort = (
+        "seleccionadas por fallback de mayor score OOT"
+        if block.get("selection_mode") == "top_score_fallback"
+        else "marcadas por el umbral calibrado de esta corrida"
+    )
     return (
-        f"Sobre las {n_rows:,} fila(s) marcadas por el umbral calibrado de esta corrida "
+        f"Sobre las {n_rows:,} fila(s) {cohort} "
         f"y los {n_trees:,} árbol(es) del bosque, cada variable de entrada se clasifica "
-        "por cuántos cortes hace falta atravesar, en promedio, para que ayude a aislar "
-        "una de esas filas (`src.interpretability.split_count_analysis`)."
+        "por la longitud total promedio de las rutas donde participa. Es una "
+        "asociación condicional, no el número de cortes propios ni una contribución "
+        "causal (`src.interpretability.split_count_analysis`)."
     )
 
 

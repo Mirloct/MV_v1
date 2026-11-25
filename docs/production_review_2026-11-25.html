@@ -1,0 +1,36 @@
+<!doctype html><html lang="es"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Arquitectura y robustez del pipeline OOT</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>body{background:#0f1117;color:#e6e8ee;font:16px/1.6 system-ui;margin:0;padding:30px}main{max-width:1000px;margin:auto}section{background:#171a23;border:1px solid #2e3544;border-radius:10px;padding:20px;margin:18px 0}a{color:#8db7ff}pre{overflow:auto}h2{color:#8db7ff}</style>
+<main><h1>Arquitectura y robustez del pipeline OOT</h1><p>Revisión 2026-11-25. Inputs: panel configurado, scores OOT por entidad, modelos locales y estados de revisión del navegador. Created / Last modified: 2026-11-25.</p>
+<section><h2>Cambios</h2><p>Política numérica de P99 con empates; conteos reconciliados entre detectores; validación de deriva de entrada; interpretación científica del fallback; protección de serialización y estado del analista; controles de complejidad y CI.</p><p>El Excel de control conserva P90+. La cola del dashboard utiliza P99 por detector. La concordancia entre IF y VAE apilado no demuestra independencia ni exactitud.</p></section>
+<section><h2>Flujo y fallos</h2><div class="mermaid">
+flowchart TD
+ A[Entrypoint y configuración] --> B[Validar fuente y cortes temporales]
+ B --> C{Train o reuse}
+ C -->|Train| D[Preprocessing y modelos]
+ C -->|Reuse| E[Validar compatibilidad]
+ E -->|Incompatible| X[Error con diagnóstico y remedio]
+ E -->|Compatible| F[Scores OOT]
+ D --> F
+ F --> G[Excel P90 control]
+ F --> H[P99 numérico por detector]
+ H --> I[Unión y pestañas]
+ I --> J[Estado de revisión local]
+ I --> K[Reporte reconciliado]
+ I -->|Fallo requerido| X
+</div></section>
+<section><h2>Estado del analista</h2><div class="mermaid">
+flowchart LR
+ A[Sin revisión] --> B[En revisión]
+ B --> C[Cerrado]
+ C --> B
+ C --> A
+ B --> A
+ B --> D[Persistir por entidad]
+ C --> D
+ D --> E[Recargar y sincronizar pestañas]
+</div></section>
+<section><h2>Stack y publicación</h2><p>Python local, sklearn, PyTorch y Optuna; estudios SQLite locales; dashboard HTML estático; servidor de progreso en 127.0.0.1. No se verificó hosting cloud ni base transaccional de casos. GitHub publica el código y ejecuta CI. Los modelos y datos personales permanecen en artifacts/.</p></section>
+<section><h2>Evidencia y límites</h2><p>El registro completo de comandos, rondas adversariales, alternativas, fuentes, inventario y pendientes está en <a href="production_review_2026-11-25.md">el informe Markdown</a>. La deuda de complejidad heredada se controla con un baseline decreciente; funciones nuevas requieren complejidad ≤10. La calidad predictiva requiere replay operativo con resultados revisados. La persistencia del navegador no sustituye un servicio multiusuario.</p><p>Referencias: <a href="https://numpy.org/doc/stable/reference/generated/numpy.percentile.html">NumPy</a>, <a href="https://scikit-learn.org/stable/common_pitfalls.html">scikit-learn</a>, <a href="https://developer.mozilla.org/en-US/docs/Web/API/Window/storage_event">MDN</a>, <a href="https://radon.readthedocs.io/en/stable/api.html">Radon</a>.</p></section>
+</main><script>mermaid.initialize({startOnLoad:true,theme:'dark'});</script></html>

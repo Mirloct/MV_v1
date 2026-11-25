@@ -678,3 +678,25 @@ raíz del proyecto.
   (datos, preprocesamiento, defaults) que hay que conocer antes de tocar código.
 - `CHANGELOG.md` — el histórico fechado detrás de esas decisiones: mediciones,
   hallazgos y su corrección, en el orden en que ocurrieron.
+# Engineering validation (2026-11-25)
+
+The maintained engineering contract is [AGENTS.md](AGENTS.md).
+Run `python -m pip install -r requirements-dev.txt`, then
+`python scripts/quality_gate.py --base-ref HEAD` and `python -m pytest -q`.
+`make chore-lint` and `make test` provide equivalent commands where Make is available.
+The complexity ceiling is 10 for new functions; explicit legacy exceptions
+must decrease or stay unchanged. CI verifies the same contract.
+
+The Excel control export remains P90+. The official analyst dashboard uses
+the union of each detector's numeric P99 cutoff, including ties. Display
+percentile ranks do not define membership.
+
+`--best-params` / `--reuse-trained` now require the model `.inputs.json`
+manifest. Run training once after upgrading old artifacts. A changed in-time
+matrix, feature order, fitted preprocessor or model checksum rejects reuse with
+a clear retraining message. This conservative check favors reproducible scoring
+over accepting a same-width but semantically incompatible model.
+
+Architecture, state diagrams, stack and release evidence:
+[review](docs/production_review_2026-11-25.md) and
+[HTML](docs/production_review_2026-11-25.html).

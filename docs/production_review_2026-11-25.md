@@ -1,5 +1,11 @@
 # Production review — 2026-11-25
 
+Completion note2026-11-26: the interrupted review's final executable revision
+`7a7987f` passed CI run45710038004. Subsequent report changes and their completed
+validation are recorded in `docs/report_refresh_task_ledger.md`. The running
+statuses below reflect the original review checkpoint, not a currently running
+job. The explicitly listed architecture backlog remains separate work.
+
 ## Plan and resume ledger
 
 | Task | Owner | Status | Evidence |

@@ -592,16 +592,16 @@ prueba exclusivamente para la cola de revisión del negocio.
 **Entregable principal — la cola priorizada por riesgo.** Cada detector escribe
 
 ```
-artifacts/reports/oot_p90_iforest.xlsx
-artifacts/reports/oot_p90_vae.xlsx
+artifacts/reports/oot_p95_iforest.xlsx
+artifacts/reports/oot_p95_vae.xlsx
 ```
 
-por defecto, **todo individuo en o por encima del percentil 90** del puntaje
+por defecto, **todo individuo en o por encima del percentil 95** del puntaje
 en el bloque OOT, con formato **ID – PERÍODO – SCORE – BANDA – VARIABLES** y
 una columna `alert` que marca las filas sobre el umbral calibrado. La columna
 `período` lleva el mes exacto en que la entidad fue alertada (el nombre real
 de esa columna es el que tenga tu panel, p. ej. `codmes`). La banda clasifica
-cada fila en `p90`/`p95`/`p99` — la más alta que alcanza — calculado sobre la
+cada fila exportada por defecto en `p95`/`p99` — la más alta que alcanza — calculado sobre la
 población completa del bloque OOT, no sobre la selección exportada.
 
 Un percentil escala con el tamaño del portafolio en vez de fijar un número; para
@@ -687,7 +687,8 @@ Run `python -m pip install -r requirements-dev.txt`, then
 The complexity ceiling is 10 for new functions; explicit legacy exceptions
 must decrease or stay unchanged. CI verifies the same contract.
 
-The Excel control export remains P90+. The official analyst dashboard uses
+The Excel control export uses P95+. The report adds cumulative P95/P97/P99
+unique-person cards with IF/IF+VAE/intersection breakdown. The official analyst dashboard uses
 the union of each detector's numeric P99 cutoff, including ties. Display
 percentile ranks do not define membership.
 

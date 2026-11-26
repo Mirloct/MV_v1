@@ -483,10 +483,10 @@ feature, by explicit project decision") y `CHANGELOG.md` (entradas
 ### 5.2 Entregable OOT: percentil con banda, período incluido
 
 `export_oot_top_anomalies` cambia su selección por defecto de "top 50 fijo" a
-**todo individuo en o por encima de P90** del bloque OOT completo deduplicado
+**todo individuo en o por encima de P95** del bloque OOT completo deduplicado
 para seguimiento de control; el dashboard operativo oficial usa P99. El Excel incluye una columna
 `percentil` (`p90`/`p95`/`p99`) que clasifica cada fila por la banda más alta
-que alcanza. (El corte por defecto pasó por P95 antes de fijarse en P90 — ver
+que alcanza. (El corte vigente desde 2026-11-26 es P95; sustituye P90 — ver
 `CHANGELOG.md` 2026-08-23.)
 
 **Por qué percentil y no headcount fijo, por defecto.** Un top-N fijo no tiene

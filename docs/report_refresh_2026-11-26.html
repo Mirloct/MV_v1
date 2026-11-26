@@ -1,0 +1,16 @@
+<!doctype html><html lang="es"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lectura del reporte OOT — 2026-11-26</title>
+<style>body{margin:0;background:#f4f6f8;color:#17202a;font:16px/1.55 system-ui}main{max-width:1000px;margin:auto;padding:30px 20px}section{background:white;padding:22px;border:1px solid #dae0e8;border-radius:12px;margin:18px 0}.mermaid{overflow:auto}a{color:#155eef}</style>
+<main><h1>Lectura del reporte OOT</h1><p>Created / Last modified: 2026-11-26. Inputs: scores por entidad de cada detector en el bloque OOT completo y scores de distribución del reporte.</p>
+<section><h2>Salidas y población</h2><div class="mermaid">
+flowchart TD
+ A[Scores OOT completos] --> B[Máximo por persona y detector]
+ B --> C[Excel de control P95+]
+ B --> D[Tarjetas acumulativas P95 P97 P99]
+ B --> E[Unión P99 para analista]
+ D --> F[IF e IF+VAE y ambos sin duplicar personas]
+ E --> G[Pestañas y perfil histórico]
+</div><p>Las tarjetas cuentan personas únicas priorizadas por al menos un detector. El desglose muestra IF, IF+VAE y la intersección. Los cortes incluyen empates y son acumulativos; P99 también pertenece a P97 y P95. El Excel no limita el denominador de estas tarjetas.</p></section>
+<section><h2>Distribución VAE</h2><p>Una cola extrema puede comprimir el cuerpo de la distribución. La vista de detalle mejora la resolución de la zona central y conserva una vista de distribución completa para inspeccionar extremos. Los cambios son visuales: no alteran scores, entrenamiento, calibración ni decisiones P99.</p><p>La vista indica explícitamente el alcance y los casos fuera de detalle. La cola completa sigue disponible para evitar ocultar anomalías relevantes.</p></section>
+<section><h2>Configuración</h2><p><code>output.oot_min_percentile: 95.0</code> define el Excel. <code>dashboard.review_percentile: 99.0</code> define el dashboard. Archivos de control: <code>oot_p95_iforest.xlsx</code> y <code>oot_p95_vae.xlsx</code>.</p><p><a href="report_refresh_task_ledger.md">Plan, evidencia y punto de reanudación</a>. Referencias: <a href="https://plotly.com/python/histograms/">Plotly histogramas</a> y <a href="https://numpy.org/doc/stable/reference/generated/numpy.histogram_bin_edges.html">NumPy bins</a>.</p></section>
+</main><script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script><script>mermaid.initialize({startOnLoad:true,theme:'neutral'});</script></html>

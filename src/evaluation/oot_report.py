@@ -1,23 +1,26 @@
-"""The OOT P90+ control workbook export.
+"""The OOT P95+ control workbook export.
 
-Business requirement (CONTEXT.md Status): export individuals at or above **P90 by
-anomaly score in the out-of-time (last) month**, sorted descending, laid out as
-**ID - SCORE - VARIABLES**. This module produces exactly that ``.xlsx`` artifact
+Business requirement: export individuals at or above **P95 by
+anomaly score in the out-of-time population**, sorted descending, laid out as
+**ID - PERIOD - SCORE - BAND - VARIABLES**. This module produces that ``.xlsx`` artifact
 under ``reports/`` and returns the table for programmatic use.
 
 Column layout (hard requirement):
 
 * column 1  -- the entity identifier (``entity_id``),
-* column 2  -- the anomaly ``SCORE``,
-* columns 3+ -- the individual's VARIABLES: the *original*, human-readable
+* column 2  -- the period of the entity's highest-scoring OOT row,
+* column 3  -- the anomaly ``SCORE``,
+* column 4  -- the percentile band (optional calibrated alert follows),
+* remaining columns -- the individual's VARIABLES: the *original*, human-readable
   feature values carried by the scored frame (never the preprocessed/scaled
-  matrix). The OOT month itself is constant across the table (it is the single
-  last period) and is logged rather than repeated as a column.
+  matrix). Cutoffs use the full OOT population after keeping each entity's
+  highest-scoring row; scores equal to the cutoff are included.
 Data sources / inputs: scored panel rows, panel schema, OOT-period count, and
 the configured selection percentile; writes a risk-ranked Excel workbook.
 Created: 2026-08-22
-Last modified: 2026-11-25
+Last modified: 2026-11-26
 Changelog:
+- 2026-11-26: Default Excel control selection to P95; retain P99 dashboard policy.
 - 2026-11-25: Validate OOT export inputs before workbook creation.
 - 2026-11-22: Clarified that this P90+ workbook is the broad control base;
   the analyst dashboard applies the separate official P99 operating point.
@@ -108,11 +111,11 @@ def _validated_oot_scores(
 
 def _resolve_out_path(
     out_path: str, top_fraction: float, model_name: str, top_n: Optional[int],
-    min_percentile: Optional[float] = 90.0,
+    min_percentile: Optional[float] = 95.0,
 ) -> str:
     """Fold the selection size and ``model_name`` into the default filename.
 
-    ``oot_p90_iforest.xlsx`` for the default percentile export, ``oot_top50_iforest.xlsx``
+    ``oot_p95_iforest.xlsx`` for the default percentile export, ``oot_top50_iforest.xlsx``
     for a top-N one, ``oot_top10_iforest.xlsx`` for a top-fraction one.
     """
     if out_path == _DEFAULT_OUT and model_name and model_name != "model":
@@ -208,7 +211,7 @@ def export_oot_top_anomalies(
     out_path: str = _DEFAULT_OUT,
     top_n: Optional[int] = None,
     top_fraction: float = 0.10,
-    min_percentile: Optional[float] = 90.0,
+    min_percentile: Optional[float] = 95.0,
     model_name: str = "model",
     n_oot_periods: int = 1,
     score_col: str = "anomaly_score",
@@ -221,10 +224,10 @@ def export_oot_top_anomalies(
 
     Selection size -- the first of these that is set wins:
 
-    * ``min_percentile=90.0`` (**the default**) -> every individual at or above
-      the 90th percentile of the OOT score distribution. Percentile rather than
+    * ``min_percentile=95.0`` (**the default**) -> every individual at or above
+      the 95th percentile of the OOT score distribution. Percentile rather than
       a fixed headcount because the queue then scales with the portfolio and
-      the cut has a distributional meaning: "the riskiest 10%" holds whether
+      the cut has a distributional meaning: "the riskiest 5%" holds whether
       the panel has 2,000 customers or 200,000. Each exported row also carries
       a :data:`BAND_COL` grade (``p90``/``p95``/``p99``) so the queue can be
       triaged by urgency.
@@ -244,9 +247,9 @@ def export_oot_top_anomalies(
         schema: Panel schema (for ``entity_col`` / ``time_col``).
         out_path: Destination ``.xlsx``. If left at the default and a
             ``model_name`` is given, it becomes
-            ``artifacts/reports/oot_p90_<model>.xlsx`` (or ``oot_top<N>_...``).
+            ``artifacts/reports/oot_p95_<model>.xlsx`` (or ``oot_top<N>_...``).
         min_percentile: Percentile cut-off on the OOT score distribution
-            (default 90.0). ``None`` falls back to ``top_n``/``top_fraction``.
+            (default 95.0). ``None`` falls back to ``top_n``/``top_fraction``.
         top_n: Number of individuals to export. Used only when
             ``min_percentile`` is None.
         top_fraction: Fraction of OOT individuals to keep when both
@@ -393,7 +396,7 @@ def export_oot_top_decile(
     """Percentage-based export -- thin wrapper kept for backwards compatibility.
 
     Equivalent to :func:`export_oot_top_anomalies` with ``min_percentile=None``
-    and ``top_n=None``. The standard control workbook uses the P90 default.
+    and ``top_n=None``. The standard control workbook uses the P95 default.
     """
     return export_oot_top_anomalies(
         scored_df, schema, out_path=out_path, min_percentile=None, top_n=None,

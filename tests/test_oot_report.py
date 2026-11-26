@@ -1,9 +1,10 @@
-"""Contract tests for the broad P90+ OOT control export and P99 selection.
+"""Contract tests for the P95+ OOT control export and P99 selection.
 
 Data sources / inputs: synthetic scored panel fixtures and temporary Excel files.
 Created: 2026-11-22
-Last modified: 2026-11-25
+Last modified: 2026-11-26
 Changelog:
+- 2026-11-26: Verify P95 defaults, full-population cutoffs, and inclusive ties.
 - 2026-11-25: Added adversarial input drift and percentile boundary coverage.
 - 2026-11-22: Added P90 control default plus explicit P99 population/tie tests.
 """
@@ -107,8 +108,8 @@ class OOTExportTests(unittest.TestCase):
         for frame, percentile, expected in (
             (self.frame(), 0, ["c", "b", "a"]),
             (self.frame(), 100, ["c"]),
-            (self.frame().iloc[:1], 90, ["a"]),
-            (self.frame().assign(anomaly_score=5.0), 90, ["a", "b", "c"]),
+            (self.frame().iloc[:1], 95, ["a"]),
+            (self.frame().assign(anomaly_score=5.0), 95, ["a", "b", "c"]),
         ):
             with self.subTest(percentile=percentile, rows=len(frame)):
                 with tempfile.TemporaryDirectory() as tmp:
@@ -129,6 +130,7 @@ class OOTExportTests(unittest.TestCase):
             _, table = export_oot_top_anomalies(
                 frame, self.schema, out_path=os.path.join(tmp, "oot.xlsx"),
                 n_oot_periods=2,
+                min_percentile=90.0,
             )
         self.assertEqual(list(table["entity_id"]), ["e10", "e09"])
         self.assertEqual(list(table["anomaly_score"]), [10, 9])
@@ -177,10 +179,10 @@ class OOTExportTests(unittest.TestCase):
         self.assertEqual(list(table["risk"]), [3])
         self.assertEqual(list(table.columns[:4]), ["customer", "month", "risk", "percentil"])
 
-    def test_default_path_and_selection_are_p90_control_base(self):
+    def test_default_path_and_selection_are_p95_control_base(self):
         self.assertTrue(
             _resolve_out_path(paths.OOT_REPORT_DEFAULT, 0.10, "iforest", None).endswith(
-                os.path.join("reports", "oot_p90_iforest.xlsx")
+                os.path.join("reports", "oot_p95_iforest.xlsx")
             )
         )
         frame = pd.DataFrame({
@@ -193,8 +195,44 @@ class OOTExportTests(unittest.TestCase):
             _, table = export_oot_top_anomalies(
                 frame, self.schema, out_path=os.path.join(tmp, "oot.xlsx")
             )
-        self.assertEqual(len(table), 10)
-        self.assertEqual(set(table["percentil"]), {"p90", "p95", "p99"})
+        self.assertEqual(len(table), 5)
+        self.assertEqual(list(table["anomaly_score"]), [99, 98, 97, 96, 95])
+        self.assertEqual(list(table["percentil"]), ["p99"] + ["p95"] * 4)
+
+    def test_p95_uses_full_deduplicated_oot_population_and_keeps_cutoff_ties(self):
+        frame = pd.DataFrame({
+            "entity_id": [f"e{i:03d}" for i in range(101)],
+            "period": ["2026-10"] * 101,
+            "anomaly_score": list(range(94)) + [95, 95, 95, 97, 98, 99, 100],
+            "feature": list(range(101)),
+        })
+        duplicates = pd.DataFrame({
+            "entity_id": ["e100"] * 40,
+            "period": ["2026-09"] * 40,
+            "anomaly_score": [-100] * 40,
+            "feature": [-1] * 40,
+        })
+        historical = pd.DataFrame({
+            "entity_id": ["historical"], "period": ["2026-08"],
+            "anomaly_score": [10000], "feature": [-2],
+        })
+        frame = pd.concat([frame, duplicates, historical], ignore_index=True)
+        original = frame.copy(deep=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            path, table = export_oot_top_anomalies(
+                frame, self.schema, out_path=os.path.join(tmp, "oot.xlsx"),
+                n_oot_periods=2, min_percentile=95.0,
+            )
+            reread = pd.read_excel(path)
+        self.assertEqual(list(table["entity_id"]), [
+            "e100", "e099", "e098", "e097", "e094", "e095", "e096",
+        ])
+        self.assertEqual(list(table["anomaly_score"]), [100, 99, 98, 97, 95, 95, 95])
+        self.assertEqual(list(table["percentil"]), ["p99", "p99"] + ["p95"] * 5)
+        self.assertEqual(list(table["feature"]), [100, 99, 98, 97, 94, 95, 96])
+        self.assertEqual(list(table["period"]), ["2026-10"] * 7)
+        pd.testing.assert_frame_equal(reread, table, check_dtype=False)
+        pd.testing.assert_frame_equal(frame, original)
 
     def test_p99_uses_full_deduplicated_population_and_keeps_cutoff_ties(self):
         scores = list(range(98)) + [100, 100]

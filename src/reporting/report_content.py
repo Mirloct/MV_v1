@@ -29,8 +29,9 @@ Two hard rules for everything below:
 
 Data sources / inputs: the run's chart-data payload and model diagnostics.
 Created: 2026-08-22
-Last modified: 2026-11-25
+Last modified: 2026-11-26
 Changelog:
+- 2026-11-26: Added stacked P95 detail and full-tail VAE score views with explicit counts.
 - 2026-11-25: Computed agreement from numeric quantiles and removed the
   unsupported independence claim for stacked detectors.
 - 2026-11-22: Aligned the detector-agreement operating quadrant with the
@@ -779,6 +780,99 @@ def _style_axes(fig) -> None:
     fig.update_yaxes(gridcolor=_AXIS_GRID, zeroline=False, showline=False)
 
 
+def _score_labels_available(labels) -> bool:
+    return labels is not None and len(labels) > 0 and len(set(labels)) > 1
+
+
+def _vae_count_trace(values, edges, name, transformed, go, np):
+    counts, _ = np.histogram(values, bins=edges)
+    bounds = edges
+    if transformed:
+        bounds = np.sign(edges) * np.expm1(np.abs(edges))
+    return go.Bar(
+        x=(edges[:-1] / 2 + edges[1:] / 2).tolist(), y=counts.tolist(),
+        width=np.diff(edges).tolist(), name=name, opacity=0.75,
+        customdata=np.column_stack((bounds[:-1], bounds[1:])).tolist(),
+        marker=dict(cornerradius=_BAR_CORNER_RADIUS),
+        hovertemplate="intervalo de puntaje %{customdata[0]:.6g} a "
+                      "%{customdata[1]:.6g}<br>filas %{y}<extra>%{fullData.name}</extra>",
+    )
+
+
+def _vae_threshold(fig, scores, threshold, upper, np):
+    if not _finite(threshold):
+        return
+    threshold = float(threshold)
+    alerts = int(np.count_nonzero(scores >= threshold))
+    text = f"umbral de alerta {threshold:.6g}<br>({alerts} de {len(scores)} filas)"
+    if scores.min() <= threshold <= upper:
+        fig.add_vline(x=threshold, row=1, col=1,
+                      line=dict(dash="dash", width=2, color="#d03b3b"))
+    else:
+        text += "<br>fuera del detalle"
+    transformed = np.sign(threshold) * np.log1p(abs(threshold))
+    fig.add_vline(x=float(transformed), row=2, col=1,
+                  line=dict(dash="dash", width=2, color="#d03b3b"))
+    fig.add_annotation(x=0, y=0, yshift=-65, xref="paper", yref="paper", text=text,
+                       showarrow=False, xanchor="left", yanchor="top", font=dict(size=10))
+
+
+def _vae_score_figure(model, go, np, make_subplots):
+    raw = np.asarray(model.get("oot_scores", []), dtype=float).reshape(-1)
+    finite = np.isfinite(raw)
+    scores = raw[finite]
+    if not scores.size:
+        return None
+    upper = float(np.quantile(scores, 0.95, method="linear"))
+    detail = scores <= upper
+    signed = bool(np.any(scores < 0))
+    full = np.sign(scores) * np.log1p(np.abs(scores))
+    transform_label = "signo(puntaje) × log1p(|puntaje|)" if signed else "log1p(puntaje)"
+    fig = make_subplots(rows=2, cols=1, vertical_spacing=0.30, subplot_titles=(
+        f"Detalle ≤ P95 ({upper:.6g})<br>{int(detail.sum())} filas<br>"
+        f"fuera del detalle: {int((~detail).sum())}",
+        f"Cola completa: {len(scores)} filas",
+    ))
+    fig.update_annotations(font_size=11)
+    labels = model.get("oot_labels")
+    groups = [(np.ones(len(scores), dtype=bool), "puntajes de vae", "vae")]
+    if _score_labels_available(labels):
+        y = np.asarray(labels, dtype=int)[finite]
+        groups = [(y == 0, "normal", "__neutral__"),
+                  (y == 1, "anomalía conocida", "vae")]
+    series = []
+    for row, values, mask in ((1, scores, detail), (2, full, np.ones(len(scores), dtype=bool))):
+        edges = np.histogram_bin_edges(values[mask], bins=60)
+        for group, name, color in groups:
+            trace = _vae_count_trace(values[mask & group], edges, name, row == 2, go, np)
+            trace.showlegend = row == 1 and len(groups) > 1
+            fig.add_trace(trace, row=row, col=1)
+            series.append(color)
+    _vae_threshold(fig, scores, model.get("threshold"), upper, np)
+    fig.update_layout(_base_layout(
+        go, "VAE: distribución de puntajes", height=700,
+        barmode="overlay", bargap=0.02, margin=dict(l=55, r=20, t=125, b=120),
+    ))
+    fig.update_xaxes(title_text="puntaje original", row=1, col=1)
+    fig.update_xaxes(title_text=transform_label, row=2, col=1)
+    fig.update_xaxes(title_font_size=11, title_standoff=10, automargin=True, nticks=5)
+    fig.update_yaxes(title_text="filas (conteo)")
+    note = (f"Detalle desde el mínimo hasta P95 empírico (interpolación lineal), incluidos empates; "
+            f"{int((~detail).sum())} filas fuera del detalle. Cola completa: {len(scores)} filas "
+            f"finitas de {len(raw)} recibidas; no finitos excluidos: {int((~finite).sum())}. "
+            f"La cola usa {transform_label}; las barras cuentan filas, no densidad. "
+            "El detalle es descriptivo; no cambia el umbral ni la clasificación. "
+            "Intervalos cerrados a la izquierda y abiertos a la derecha, salvo el último.")
+    return fig, note, series
+
+
+def _emit_vae_scores(model, go, np, make_subplots, emit):
+    result = _vae_score_figure(model, go, np, make_subplots)
+    if result is not None:
+        fig, note, series = result
+        emit(fig, "fig-scores-vae", "vae: distribución de puntajes", note, series)
+
+
 def build_plotly_figures(chart_data: dict, log=None) -> list[dict]:
     """Build the report's interactive charts from raw run data.
 
@@ -839,12 +933,15 @@ def build_plotly_figures(chart_data: dict, log=None) -> list[dict]:
     # classic dual-axis error.
     for m in ordered:
         s_raw = models[m].get("oot_scores")
-        if not s_raw:
-            continue
         try:
+            if m == "vae":
+                _emit_vae_scores(models[m], go, np, make_subplots, emit)
+                continue
+            if not s_raw:
+                continue
             s = np.asarray(s_raw, dtype=float)
             y_raw = models[m].get("oot_labels")
-            labelled = bool(y_raw) and len(set(y_raw)) > 1
+            labelled = _score_labels_available(y_raw)
             fig = go.Figure()
             if labelled:
                 y = np.asarray(y_raw, dtype=int)

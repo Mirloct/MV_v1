@@ -273,16 +273,16 @@ threshold is worse than an honest simple one.
 The headline output is a risk-ranked queue:
 
 ```
-artifacts/reports/oot_p90_iforest.xlsx
-artifacts/reports/oot_p90_vae.xlsx
+artifacts/reports/oot_p95_iforest.xlsx
+artifacts/reports/oot_p95_vae.xlsx
 ```
 
-* **`min_percentile=90.0` by default, fully parameterisable.** The workbook keeps
-  every individual at or above P90 as a broad control base; the dashboard's
+* **`min_percentile=95.0` by default, fully parameterisable.** The workbook keeps
+  every individual at or above P95 as a control base; the dashboard's
   official operational queue independently uses P99.
-  scales with the portfolio instead of fixing a headcount — "the riskiest
-  10%" holds whether the panel has 2,000 or 200,000 customers. Each row also
-  carries a `p90`/`p95`/`p99` band, the highest it reaches, computed over the
+  The control queue scales with portfolio size (roughly the highest 5%, with
+  inclusive score ties). Each default exported row carries a `p95`/`p99`
+  band, the highest it reaches, computed over the
   full OOT population before any filtering. `top_n=N` (`--top-n`) switches to
   a fixed headcount instead, for a team that works N cases a month regardless
   of portfolio size; `top_fraction` is the fallback when both are `None`.

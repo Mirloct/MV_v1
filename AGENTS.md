@@ -3,8 +3,9 @@
 Data sources / inputs: repository code, configs/pipeline.yaml, artifact manifests,
 GitHub issues/PRs/CI and cited primary documentation.
 Created: 2026-11-25
-Last modified: 2026-11-25
+Last modified: 2026-11-26
 Changelog: 2026-11-25 — established evidence-driven review and release controls.
+2026-11-26 — control Excel raised to P95; report cards show P95/P97/P99.
 
 ## Required workflow
 
@@ -39,7 +40,8 @@ Changelog: 2026-11-25 — established evidence-driven review and release control
 
 ## Project contracts
 
-- Excel remains P90+ for control. Analyst dashboard is the union of score >=
+- Excel uses P95+ for control. Report cards show cumulative unique-person
+  unions at P95/P97/P99 with detector breakdown. Analyst dashboard is the union of score >=
   each detector's empirical OOT P99. Include ties; percentile ranks are display
   values and must not replace numeric quantile comparisons.
 - Case state is independent of model classification; history downloads include

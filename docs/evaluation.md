@@ -68,7 +68,7 @@ metrics simply degrade to `NaN` and can be skipped.
 | `calibrate_threshold(scores, method="pot"\|"percentile", ...)` | `thresholds.py` | **Alert cut-off fitted on validation scores** (GPD/POT or percentile). |
 | `apply_threshold(scores, threshold)` | `thresholds.py` | 0/1 alert flags. |
 | `build_scored_frame(raw_df, keys, scores, schema)` | `scoring.py` | Attach `anomaly_score` + **raw** features to `(entity_id, period)`. |
-| `export_oot_top_anomalies(scored_df, schema, min_percentile=90.0, ...)` | `oot_report.py` | **Control workbook:** distinct individuals at/above P90 of the complete deduplicated OOT population, banded p90/p95/p99. The analyst dashboard separately applies the official P99 queue. |
+| `export_oot_top_anomalies(scored_df, schema, min_percentile=95.0, ...)` | `oot_report.py` | **Control workbook:** distinct individuals at/above P95 of the complete deduplicated OOT population, banded p95/p99. Report cards count cumulative P95/P97/P99 unions; the analyst dashboard separately applies the official P99 queue. |
 | `export_oot_top_decile(scored_df, schema, ...)` | `oot_report.py` | Percentage-based wrapper kept for backwards compatibility. |
 | `plot_embedding(X, scores_or_labels, method=...)` | `visualize.py` | 2D PCA/t-SNE/UMAP scatter coloured by score. |
 | `plot_roc_pr(y_true, scores)` | `visualize.py` | ROC + PR curves side by side. |
@@ -169,11 +169,11 @@ matter: the deliverable must be readable by a human reviewer, so it carries the
 **original** feature values, not the scaled/encoded model matrix. `scores` must be
 row-aligned with `keys` (the `fit_transform_panel` order); a mismatch raises.
 
-`export_oot_top_anomalies(scored_df, schema, min_percentile=90.0, top_n=None,
+`export_oot_top_anomalies(scored_df, schema, min_percentile=95.0, top_n=None,
 top_fraction=0.10, model_name="model", n_oot_periods=1, score_col="anomaly_score",
-threshold=None)` writes every individual **at or above the 90th percentile of
+threshold=None)` writes every individual **at or above the 95th percentile of
 the OOT-block score** by default — a percentile rather than a fixed headcount
-because the queue then scales with the portfolio ("the riskiest 10%" holds at
+because the queue then scales with the portfolio (approximately the highest 5%, ties included, at
 2,000 customers or 200,000). Sorted by score descending (ties broken by
 `entity_id` ascending, stable sort). Passing `top_n` (or setting
 `min_percentile=None` and leaving `top_fraction`) instead selects a fixed
@@ -202,7 +202,7 @@ Percentile cut-offs (and the band assignment) are computed over the
 exported subset, which would be circular. If `out_path` is left at the
 default and a `model_name` is given, the file becomes
 `artifacts/reports/oot_p<percentile>_<model>.xlsx` (e.g.
-`artifacts/reports/oot_p90_iforest.xlsx`) under the percentile default, or
+`artifacts/reports/oot_p95_iforest.xlsx`) under the percentile default, or
 `oot_top<N>_<model>.xlsx` under the fixed-headcount mode. The `.xlsx` write
 uses the `openpyxl` engine. Output lands under `artifacts/reports/`.
 
@@ -286,7 +286,7 @@ print("rank_stability:", uns["rank_stability"])
 # 5. Human-readable scored frame (RAW features) and the OOT Excel deliverable.
 scored = build_scored_frame(df, keys, scores, schema)
 path, table = export_oot_top_anomalies(scored, schema, model_name="iforest")
-print("risk-ranked Excel:", path)              # -> artifacts/reports/oot_p90_iforest.xlsx
+print("risk-ranked Excel:", path)              # -> artifacts/reports/oot_p95_iforest.xlsx
 
 # 6. Figures -> artifacts/reports/figures/
 plot_embedding(X[oot_mask], scores[oot_mask], method="pca", y=y[oot_mask])

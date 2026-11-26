@@ -57,7 +57,7 @@ Modelo-v0.1/
     ├── logs/               # execution.log + run_events.jsonl
     ├── models/             # iforest.joblib, vae_best.pt, vae/, vae_tuning/
     ├── tuning/             # optuna_*.db, best_params_*.yaml (Optuna outputs)
-    └── reports/            # anomaly_report.{html,md}, model_documentation.md, oot_p90_*.xlsx, feature_attribution.xlsx, flow_visualization.html, analyst_dashboard.html
+    └── reports/            # anomaly_report.{html,md}, model_documentation.md, oot_p95_*.xlsx, feature_attribution.xlsx, flow_visualization.html, analyst_dashboard.html
         └── figures/        # ALL figures, flat (see rule below)
 ```
 
@@ -341,7 +341,7 @@ it locks in:
 | 4 Tuning | `tune_*(valid_mask=)` | static temporal holdout. IF: `n_estimators=300` fixed, `max_samples` an **absolute integer** (1 024–32 768) + `max_features`, Sobol sweep with anchors, 1-SE + noise-margin selection against the ψ=256 default, objective = AP vs reviewed labels when gate 4.5 authorises them, else `tail_separation`; contamination not searched. VAE: `-ELBO@β=1`/`recon_p50`, KL annealing + early stopping, fingerprinted study |
 | 5 Final fit | `tune_*` refit | winning config refit on train+val |
 | 6 Threshold | `calibrate_threshold` | POT/GPD (or percentile) fitted on **validation**, applied to test |
-| 7 Control workbook | `export_oot_top_anomalies` | distinct individuals at/above P90 of the complete deduplicated OOT score population, banded p90/p95/p99; the analyst dashboard independently uses P99 as its official queue |
+| 7 Control workbook | `export_oot_top_anomalies` | distinct individuals at/above P95 of the complete deduplicated OOT score population, banded p95/p99; the analyst dashboard independently uses P99 as its official queue |
 
 **Two hazards that bit us and are now guarded.** A short training window makes a
 column near-constant *in the fit block*, and any scaler fitted there amplifies
@@ -394,8 +394,8 @@ alone would have flagged. "Phase 6d: IF OOT export (validation)"
 the VAE's matrix) answers that directly: when stacking is on, it exports
 the forest's OWN OOT queue (`export_oot_top_anomalies`, same ID-PERIOD-
 SCORE-BAND-VARIABLES layout, same P90/P95/P99 grading, own threshold
-calibrated on validation) to `artifacts/reports/oot_p90_iforest.xlsx`
-*alongside* the VAE's stacked `oot_p90_vae.xlsx` — the P95 checkpoint export
+calibrated on validation) to `artifacts/reports/oot_p95_iforest.xlsx`
+*alongside* the VAE's stacked `oot_p95_vae.xlsx` — the P95 checkpoint export
 right before it is unaffected and still runs. An analyst compares the two
 files' entity sets directly; on the `--quick` synthetic fixture this found
 21 of 50 individuals in the forest's own top-P90 queue that do **not**
@@ -419,9 +419,9 @@ P95 checkpoint, stacking, or the VAE deliverable.
   and the report only shows supervised charts/glossary entries (ROC/PR,
   metric comparison, recall-by-type) when the run actually computed them.
 - **OOT deliverable — the headline business artifact.** Each detector writes
-  `artifacts/reports/oot_p90_<model>.xlsx` by default: every individual at or
-  above the **90th percentile** of the complete deduplicated OOT score population,
-  retained as a broad control base. The official analyst queue is the P99 union.
+  `artifacts/reports/oot_p95_<model>.xlsx` by default: every individual at or
+  above the **95th percentile** of the complete deduplicated OOT score population,
+  retained as a control base. The official analyst queue is the P99 union.
   (the highest band it reaches, cut-offs computed over the full de-duplicated
   OOT population, never over the exported subset), sorted by score descending
   (`export_oot_top_anomalies`, `src/evaluation/oot_report.py`). Layout is
@@ -436,20 +436,11 @@ P95 checkpoint, stacking, or the VAE deliverable.
   `--threshold-method percentile` uses `--threshold-percentile`. Always
   calibrated on validation, applied to test only.
 - **The report's headline "anomalías marcadas para revisión" figure is NOT
-  the `alert`/calibrated-threshold count above.** It is read directly off
-  the just-written OOT export: `int(_table[BAND_COL].isin(("p95",
-  "p99")).sum())` (`main.py` Phase 9) -- count of individuals in that exact
-  file at or above P95, always non-zero when the export has any rows,
-  since it never depends on a POT calibration that can fail to find a
-  usable tail on real, unlabeled data (the calibrated `alert` column can
-  legitimately be 0; this cannot, short of an empty export). Deliberately
-  not the ground-truth positive count either (`n_pos`/`anomaly_rate` from
-  Phase 3) -- that answers "how many are truly anomalous," unknowable in
-  production and the reason this figure previously showed 0 on a real run
-  with no ground-truth file. Falls back to the ground-truth count only if
-  no deliverable model ran at all. Under `--no-stack-iforest-into-vae`
-  (two deliverables), the last one processed in the per-model loop wins
-  (VAE, always last in `models = {"iforest": ..., "vae": ...}`).
+  the `alert`/calibrated-threshold count above.** It counts unique people
+  in the numeric P99 union of both full OOT score populations, matching
+  the operational dashboard independently of Excel filtering. Three report
+  cards additionally show cumulative P95/P97/P99 unions and IF/IF+VAE/both
+  breakdowns. They include score ties and never sum overlapping people twice.
 - **P95 inter-layer checkpoint (distinct from the deliverable above).**
   Immediately after the Isolation Forest fits and before the VAE starts,
   `export_p95_checkpoint` (`src/evaluation/oot_report.py`, `main.py` Phase
@@ -1580,7 +1571,7 @@ the engineering contract; `CLAUDE.md` points to it. CI runs the complexity
 ratchet and root tests. New functions must meet cyclomatic complexity <=10;
 legacy debt is declared in `scripts/complexity_baseline.json`.
 
-The P90+ Excel control base remains unchanged in intent. Dashboard membership
+The control Excel now starts at P95+ (superseding P90 on 2026-11-26). Dashboard membership
 now compares raw scores against each detector's full-population numeric P99
 (including ties), rather than comparing percentile display ranks. The report
 headline counts the union, not only the last detector's band. Split-count
@@ -1593,3 +1584,21 @@ SHA-256 hashes. Existing models without it require one training run. This
 conservative guard rejects changed in-time data even when width is unchanged;
 it does not yet support scoring arbitrary future panels with a persisted
 preprocessing bundle. Synthetic models remain under `_dev/`.
+# Report contract update — 2026-11-26
+
+Control workbooks now default to numeric P95+ (`output.oot_min_percentile: 95`),
+named `oot_p95_iforest.xlsx` and `oot_p95_vae.xlsx`. Analyst membership remains
+the numeric P99 union (`dashboard.review_percentile: 99`). The report adds
+three cumulative unique-person cards at P95/P97/P99 with per-detector and
+intersection counts, calculated from full deduplicated OOT scores before any
+Excel filtering. Cards do not sum overlapping people twice.
+
+VAE distributions provide a minimum-to-P95 linear detail view and a full-tail
+log1p view with count axes and original-score intervals in hover. The plot
+reports observations outside detail and non-finite observations excluded from
+plotting; the complete finite tail stays visible. This is a presentation change,
+not score clipping or threshold/model recalibration.
+
+Evidence/resume point: `docs/report_refresh_task_ledger.md`. Reproducible
+long-tail visual example: `python tools/render_report_refresh_example.py`, then
+`node tests/report_refresh_visuals.cjs` (Chrome/Playwright required).

@@ -1,4 +1,5 @@
 # configs/pipeline.yaml -- EL ÚNICO archivo que se edita para el diagnóstico.
+# Last modified: 2026-11-26 — Excel de control P95; dashboard P99.
 #
 # Precedencia: flag de línea de comandos > valor fijado en código > este archivo > default.
 # Clave desconocida o valor inválido detiene la corrida y lista las claves válidas.
@@ -45,9 +46,9 @@ dashboard:
   review_percentile: 99.0
 
 output:
-  # Excel amplio de seguimiento/control. Conserva P90+ y clasifica las filas
+  # Excel amplio de seguimiento/control. Conserva P95+ y clasifica las filas
   # en bandas p90/p95/p99. No define la cola operativa oficial del dashboard.
-  oot_min_percentile: 90.0
+  oot_min_percentile: 95.0
 
 # ---------------------------------------------------------------------------
 # Apartado 9: experimentos del capítulo diagnóstico. Todo descriptivo (sin

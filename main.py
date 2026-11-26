@@ -3,7 +3,7 @@
 Wires the project's existing public APIs into a single pipeline:
 
     data -> preprocessing (+ statistical justification) -> OOT split ->
-    Isolation Forest + VAE (tune/fit) -> evaluation -> OOT P90+ control Excel ->
+    Isolation Forest + VAE (tune/fit) -> evaluation -> OOT P95+ control Excel ->
     interpretability -> HTML/MD report + technical documentation.
 
 Every phase is wrapped in ``log_phase`` and all runtime output lands in
@@ -18,8 +18,9 @@ Data sources / inputs: configured panel data, reviewed-label files, model
 artifacts, and ``configs/pipeline.yaml``; writes run models, diagnostics, and
 reporting context under the project artifact tree.
 Created: 2026-08-22
-Last modified: 2026-11-25
+Last modified: 2026-11-26
 Changelog:
+- 2026-11-26: Raised the Excel control default to P95; analyst queue stays P99.
 - 2026-11-25: Reconciled the report headline with the actual detector union
   and disclosed split-count fallback cohorts.
 - 2026-09-26: Enforced the fixed IF/VAE training contract at dataclass, CLI,
@@ -196,7 +197,7 @@ class PipelineConfig:
     # triaged. A percentile rather than a fixed headcount because the cut then
     # scales with the portfolio and keeps its distributional meaning.
     # `--top-n N` overrides it with a fixed-size queue instead.
-    oot_min_percentile: Optional[float] = 90.0
+    oot_min_percentile: Optional[float] = 95.0
     analyst_review_percentile: float = 99.0
     top_n: Optional[int] = None
     top_fraction: float = 0.10
@@ -2027,7 +2028,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
                 # rather than recomputed independently, so the number on the
                 # report always matches what a reviewer gets by opening this
                 # exact control file. The operational dashboard is P99, so
-                # only the p99 band of this broader P90+ workbook is official.
+                # only the p99 band of this P95+ control workbook is official.
                 # Deliberately NOT the calibrated
                 # `threshold`/`alert` count above: that can degenerate to
                 # zero on real data with no floor, which is the exact bug
@@ -2218,7 +2219,7 @@ def run_pipeline(config: PipelineConfig) -> dict:
             raise RuntimeError(
                 "Phase 9b failed: the official analyst dashboard could not be built. "
                 "Inspect the preceding exception in artifacts/logs/execution.log; "
-                "the P90 control workbook does not replace the operational queue."
+                "the P95 control workbook does not replace the operational queue."
             ) from exc
 
     # -- Phase 9c: IF-VAE diagnostic suite (on by default) ------------------- #
@@ -2826,7 +2827,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description=(
             "End-to-end banking-panel anomaly-detection pipeline: data -> "
             "preprocessing -> Isolation Forest + VAE (tune/fit) -> evaluation "
-            "-> OOT P90+ control Excel + P99 analyst dashboard -> interpretability -> HTML/MD report. "
+            "-> OOT P95+ control Excel + P99 analyst dashboard -> interpretability -> HTML/MD report. "
             "Defaults perform a quick CPU run; use --full for the spec-scale run."
         ),
     )
@@ -3118,10 +3119,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--p95-percentile", type=float, default=None,
                         help="Percentile of in-time IF scores above which a row is exported "
                              "in the Phase 6c checkpoint gate before the VAE runs (default 95).")
-    parser.add_argument("--oot-min-percentile", type=float, default=90.0,
+    parser.add_argument("--oot-min-percentile", type=float, default=95.0,
                         help="Percentile of the OOT score distribution above which an "
                              "individual is exported in the risk-ranked Excel (default "
-                             "90, for the broad control workbook). Ties at the cutoff are retained. Each row is also "
+                             "95, for the control workbook). Ties at the cutoff are retained. Each row is also "
                              "graded p90/p95/p99. Overridden by "
                              "--top-n when that is set.")
     parser.add_argument("--top-n", type=int, default=None,

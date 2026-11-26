@@ -26,8 +26,9 @@ files, or ``oot_excel=None`` are simply omitted.
 Data sources / inputs: the orchestrator's run context and generated artifact
 paths; writes the HTML, Markdown, and technical run documentation.
 Created: 2026-08-22
-Last modified: 2026-11-25
+Last modified: 2026-11-26
 Changelog:
+- 2026-11-26: Added cumulative unique-person P95/P97/P99 OOT cards.
 - 2026-11-25: Disclosed the fallback sample in the split-count interpretation.
 - 2026-11-22: Added split-count coverage/spread indicators and a neutral
   interpretation when best and worst variables have equivalent cut counts.
@@ -43,6 +44,7 @@ from datetime import datetime
 from typing import Iterable, Optional, Sequence
 
 from src.utils import paths
+from src.reporting.percentile_cards import percentile_cards_html, percentile_cards_markdown
 from src.utils.logging_config import log_phase, setup_logging
 from src.reporting.event_supervision_section import (
     event_supervision_html,
@@ -519,6 +521,7 @@ def _build_markdown(context: dict, out_dir: str) -> str:
     dataset = context.get("dataset") or {}
     parts.append("## Resumen del dataset\n")
     parts.append(_md_kv_table(_kv_rows(dataset), headers=("Campo", "Valor")))
+    parts.append(percentile_cards_markdown(context))
 
     # -- OOT deliverable (headline business output, shown early) ------------- #
     oot_paths = _oot_excel_items(context.get("oot_excel"))
@@ -1885,6 +1888,7 @@ def _build_html(context: dict, log, out_dir: str = paths.REPORTS_DIR) -> str:
     # Hero first, then the supporting KPI groups: one headline number, then
     # the context needed to read it.
     parts.append(_hero_html(dataset))
+    parts.append(percentile_cards_html(context))
     parts.append(_dataset_tiles_html(dataset))
 
     # -- OOT deliverable (headline business output) --------------------------- #
@@ -2114,7 +2118,7 @@ def build_report(
             ``oot_excel``, ``preprocessing`` (flat dict of pipeline settings)
             and ``notes``. ``oot_excel`` accepts either a single path (one
             model) or a ``{model_name: path}`` dict (multiple models, e.g.
-            iForest and VAE both export a top-decile OOT Excel) -- all entries
+            iForest and VAE both export a P95+ OOT control Excel) -- all entries
             are rendered. Missing keys are tolerated and omitted from the
             output.
         out_dir: Directory the report files are written to (created lazily).

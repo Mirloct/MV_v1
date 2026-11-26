@@ -3303,3 +3303,11 @@ Dos scripts nuevos, mismo patrón de ~20 líneas que `suite_plus_sensitivity.py`
 - Documented state machines, deployment inventory, four adversarial rounds and
   remaining production gaps. Root pytest discovery excludes the independently
   packaged diagnostic suite; its package must be tested in its own environment.
+# 2026-11-26 — P95 control exports and readable VAE distribution
+
+- Raised default OOT control workbooks to P95+; analyst dashboard stays P99.
+- Added cumulative unique-person P95/P97/P99 cards with detector/overlap counts.
+- VAE scores show central P95 detail and a complete log1p tail, with explicit
+  out-of-detail and non-finite counts. Neither scores nor thresholds are changed.
+- Added extreme-score, count-conservation, card-union and P95 export tests plus
+  a synthetic report/browser fixture; updated configuration and documentation.
